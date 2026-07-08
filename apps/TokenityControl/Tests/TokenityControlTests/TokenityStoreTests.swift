@@ -238,6 +238,61 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertNotNil(store.chatMetrics.totalSeconds)
     }
 
+    func testReasoningOnlyChatDoesNotShowNotRespondingError() async {
+        let store = TokenityStore(
+            dataTransport: Self.successfulModelTransport,
+            lineStreamTransport: { _ in
+                AsyncThrowingStream { continuation in
+                    continuation.yield("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"checking the plan\"},\"finish_reason\":null}]}")
+                    continuation.yield("data: [DONE]")
+                    continuation.finish()
+                }
+            }
+        )
+        guard let first = store.modelLibraryRows.first else {
+            XCTFail("Expected sample model")
+            return
+        }
+        store.connectionMode = .ring
+        store.createCluster()
+        await store.loadModel(first)
+        store.chatInput = "Continue."
+
+        await store.sendChatMessage()
+
+        XCTAssertEqual(store.chatMessages.last?.role, .assistant)
+        XCTAssertTrue(store.chatMessages.last?.thinking.contains("checking the plan") ?? false)
+        XCTAssertFalse(store.chatMessages.last?.content.contains("not responding yet") ?? true)
+        XCTAssertTrue(store.chatMessages.last?.content.contains("did not finish a final answer") ?? false)
+    }
+
+    func testPartialReasoningIsPreservedWhenChatStreamFails() async {
+        let store = TokenityStore(
+            dataTransport: Self.successfulModelTransport,
+            lineStreamTransport: { _ in
+                AsyncThrowingStream { continuation in
+                    continuation.yield("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"partial thought\"},\"finish_reason\":null}]}")
+                    continuation.finish(throwing: URLError(.timedOut))
+                }
+            }
+        )
+        guard let first = store.modelLibraryRows.first else {
+            XCTFail("Expected sample model")
+            return
+        }
+        store.connectionMode = .ring
+        store.createCluster()
+        await store.loadModel(first)
+        store.chatInput = "Continue."
+
+        await store.sendChatMessage()
+
+        XCTAssertEqual(store.chatMessages.last?.role, .assistant)
+        XCTAssertTrue(store.chatMessages.last?.thinking.contains("partial thought") ?? false)
+        XCTAssertFalse(store.chatMessages.last?.content.contains("not responding yet") ?? true)
+        XCTAssertTrue(store.chatMessages.last?.content.contains("did not finish a final answer") ?? false)
+    }
+
     private static func successfulModelTransport(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         let path = request.url?.path ?? ""
         let payload: String

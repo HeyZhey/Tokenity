@@ -391,8 +391,14 @@ final class TokenityStore: ObservableObject {
             )
             finishChatMetrics(start: start, firstTokenAt: firstTokenAt, tokenEstimate: tokenEstimate)
         } catch {
-            chatMessages[assistantIndex].thinking = ""
-            chatMessages[assistantIndex].content = "The loaded model is not responding yet. Confirm the model is loaded on the cluster, then try again."
+            if assistantMessageHasVisibleOutput(at: assistantIndex) {
+                if chatMessages[assistantIndex].content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    chatMessages[assistantIndex].content = "The model returned reasoning but did not finish a final answer. Try again if you need the final response."
+                }
+            } else {
+                chatMessages[assistantIndex].thinking = ""
+                chatMessages[assistantIndex].content = "The loaded model is not responding yet. Confirm the model is loaded on the cluster, then try again."
+            }
             appendLog("Chat request could not complete: \(userFacingMessage(for: error))")
         }
 
@@ -847,6 +853,7 @@ final class TokenityStore: ObservableObject {
 
         chatMessages[assistantIndex].thinking = "Waiting for first response..."
         var didReceiveContent = false
+        var didReceiveThinking = false
 
         for try await line in lineStreamTransport(request) {
             guard line.hasPrefix("data:") else { continue }
@@ -858,6 +865,9 @@ final class TokenityStore: ObservableObject {
             let thinking = delta?.reasoningContent ?? delta?.reasoning
             if let thinking, !thinking.isEmpty {
                 chatMessages[assistantIndex].thinking = appendToken(thinking, to: chatMessages[assistantIndex].thinking)
+                if firstTokenAt == nil { firstTokenAt = Date() }
+                tokenEstimate += estimateTokens(thinking)
+                didReceiveThinking = true
             }
             if let content = delta?.content, !content.isEmpty {
                 if firstTokenAt == nil { firstTokenAt = Date() }
@@ -866,9 +876,22 @@ final class TokenityStore: ObservableObject {
                 didReceiveContent = true
             }
         }
+        if !didReceiveContent && didReceiveThinking {
+            chatMessages[assistantIndex].content = "The model returned reasoning but did not finish a final answer. Try again if you need the final response."
+            return
+        }
         if !didReceiveContent {
             throw TokenityTransportError.noChatContent
         }
+    }
+
+    private func assistantMessageHasVisibleOutput(at index: Int) -> Bool {
+        guard chatMessages.indices.contains(index) else { return false }
+        let message = chatMessages[index]
+        let content = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        let thinking = message.thinking.trimmingCharacters(in: .whitespacesAndNewlines)
+        let placeholders: Set<String> = ["Preparing response...", "Waiting for first response..."]
+        return !content.isEmpty || (!thinking.isEmpty && !placeholders.contains(thinking))
     }
 
     private func appendAssistantContent(_ rawToken: String, assistantIndex: Int) {
