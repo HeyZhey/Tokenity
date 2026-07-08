@@ -8,7 +8,7 @@ This is the known-good local baseline after rebooting Mac A and Mac B.
 - Active app bundle: `/Users/zxc/Documents/Tokenity/apps/TokenityControl/.build/arm64-apple-macosx/debug/TokenityControl.app`
 - Legacy UI path to avoid: `/Users/zxc/Documents/MLX-Distributed/apps/TokenityControl`
 - `/Users/zxc/Documents/MLX-Distributed` is not currently a git repository.
-- No references to old Mac B IP `192.168.5.61` were found.
+- No references to the retired Mac B LAN address were found.
 
 ## Machines
 
@@ -112,4 +112,3 @@ ssh apple@192.168.5.23 'curl --noproxy "*" -sS -X POST http://127.0.0.1:9100/v1/
 - RDMA model Load now refreshes node info first and blocks early when `rdma_enabled` is false.
 - NodeAgent `rdma_errors` are surfaced in the UI readiness/load message.
 - Standard Network load path remains unaffected.
-
