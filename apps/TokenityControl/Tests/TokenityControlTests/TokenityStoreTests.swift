@@ -244,6 +244,45 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertNotNil(store.chatMetrics.totalSeconds)
     }
 
+    func testChatFallsBackToNonStreamingWhenStreamFailsBeforeFirstToken() async throws {
+        var fallbackRequest: URLRequest?
+        let suiteName = "TokenityStoreTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = TokenityStore(
+            dataTransport: { request in
+                if request.url?.path == "/v1/chat/completions" {
+                    fallbackRequest = request
+                }
+                return try await Self.successfulModelTransport(request)
+            },
+            lineStreamTransport: { _ in
+                AsyncThrowingStream { continuation in
+                    continuation.finish(throwing: URLError(.networkConnectionLost))
+                }
+            },
+            userDefaults: defaults
+        )
+        guard let first = store.modelLibraryRows.first else {
+            XCTFail("Expected sample model")
+            return
+        }
+        store.connectionMode = .ring
+        store.createCluster()
+        await store.loadModel(first)
+        store.chatInput = "Recover this answer."
+
+        await store.sendChatMessage()
+
+        XCTAssertEqual(store.chatMessages.last?.role, .assistant)
+        XCTAssertEqual(store.chatMessages.last?.content, "OK")
+        XCTAssertFalse(store.chatMessages.last?.content.contains("not responding yet") ?? true)
+        XCTAssertNotNil(store.chatMetrics.firstTokenSeconds)
+        let body = try XCTUnwrap(fallbackRequest?.httpBody)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual(object["stream"] as? Bool, false)
+    }
+
     func testReasoningOnlyChatDoesNotShowNotRespondingError() async {
         let suiteName = "TokenityStoreTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!

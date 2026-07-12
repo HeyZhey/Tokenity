@@ -517,18 +517,40 @@ final class TokenityStore: ObservableObject {
                 tokenEstimate: &tokenEstimate
             )
             finishChatMetrics(start: start, firstTokenAt: firstTokenAt, tokenEstimate: tokenEstimate)
-        } catch {
+        } catch let streamingError {
+            if !assistantMessageHasVisibleOutput(at: assistantIndex) {
+                do {
+                    chatMessages[assistantIndex].thinking = "Retrying without streaming..."
+                    try await completeClusterChat(
+                        serviceModelName: serviceModelName,
+                        configuration: configuration,
+                        assistantIndex: assistantIndex,
+                        firstTokenAt: &firstTokenAt,
+                        tokenEstimate: &tokenEstimate
+                    )
+                    finishChatMetrics(start: start, firstTokenAt: firstTokenAt, tokenEstimate: tokenEstimate)
+                    appendLog("Streaming chat connection failed, then recovered with a non-streaming response: \(userFacingMessage(for: streamingError))")
+                    return
+                } catch let fallbackError {
+                    chatMessages[userIndex].includeInContext = false
+                    chatMessages[assistantIndex].includeInContext = false
+                    chatMessages[assistantIndex].thinking = ""
+                    let detail = userFacingMessage(for: fallbackError)
+                    chatMessages[assistantIndex].content = "The model request could not complete. \(detail)"
+                    appendLog("Chat streaming failed: \(userFacingMessage(for: streamingError))")
+                    appendLog("Chat fallback failed: \(detail)")
+                    return
+                }
+            }
+
             chatMessages[userIndex].includeInContext = false
             chatMessages[assistantIndex].includeInContext = false
             if assistantMessageHasVisibleOutput(at: assistantIndex) {
                 if chatMessages[assistantIndex].content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     chatMessages[assistantIndex].content = "The model returned reasoning but did not finish a final answer. Try again if you need the final response."
                 }
-            } else {
-                chatMessages[assistantIndex].thinking = ""
-                chatMessages[assistantIndex].content = "The loaded model is not responding yet. Confirm the model is loaded on the cluster, then try again."
             }
-            appendLog("Chat request could not complete: \(userFacingMessage(for: error))")
+            appendLog("Chat request could not complete: \(userFacingMessage(for: streamingError))")
         }
 
     }
@@ -958,6 +980,11 @@ final class TokenityStore: ObservableObject {
         if let localized = (error as? LocalizedError)?.errorDescription {
             return localized
         }
+        let bridgedMessage = (error as NSError).localizedDescription
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !bridgedMessage.isEmpty {
+            return bridgedMessage
+        }
         return "The cluster service is not reachable."
     }
 
@@ -976,16 +1003,12 @@ final class TokenityStore: ObservableObject {
         }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        request.timeoutInterval = 600
         request.addValue("application/json", forHTTPHeaderField: "Content-Type")
-        let history = chatMessages
-            .dropLast()
-            .filter { $0.includeInContext && !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            .suffix(10)
-            .map { OpenAIChatRequest.Message(role: $0.role.rawValue, content: $0.content) }
         request.httpBody = try JSONEncoder().encode(
             OpenAIChatRequest(
                 model: serviceModelName,
-                messages: Array(history),
+                messages: chatRequestMessages(),
                 stream: true,
                 maxTokens: configuration.maximumOutputTokens,
                 temperature: configuration.temperature,
@@ -1043,6 +1066,70 @@ final class TokenityStore: ObservableObject {
         if !didReceiveContent {
             throw TokenityTransportError.noChatContent
         }
+    }
+
+    private func completeClusterChat(
+        serviceModelName: String,
+        configuration: ModelRuntimeConfiguration,
+        assistantIndex: Int,
+        firstTokenAt: inout Date?,
+        tokenEstimate: inout Int
+    ) async throws {
+        guard let url = modelServiceURL(path: "/v1/chat/completions") else {
+            throw TokenityTransportError.missingModelService
+        }
+        var request = try jsonRequest(
+            url: url,
+            body: OpenAIChatRequest(
+                model: serviceModelName,
+                messages: chatRequestMessages(),
+                stream: false,
+                maxTokens: configuration.maximumOutputTokens,
+                temperature: configuration.temperature,
+                topP: configuration.topP,
+                topK: configuration.topK,
+                minP: configuration.minP
+            )
+        )
+        request.timeoutInterval = 600
+        let (data, response) = try await dataTransport(request)
+        try validate(response, data: data)
+        let decoded = try JSONDecoder().decode(OpenAIChatResponse.self, from: data)
+        guard let message = decoded.choices.first?.message else {
+            throw TokenityTransportError.noChatContent
+        }
+
+        let reasoning = message.reasoningContent ?? message.reasoning ?? ""
+        let content = message.content ?? ""
+        guard !reasoning.isEmpty || !content.isEmpty else {
+            throw TokenityTransportError.noChatContent
+        }
+
+        firstTokenAt = firstTokenAt ?? Date()
+        chatMessages[assistantIndex].thinking = reasoning
+        chatMessages[assistantIndex].content = ""
+        if !content.isEmpty {
+            appendAssistantContent(content, assistantIndex: assistantIndex)
+        }
+        if !reasoning.isEmpty {
+            tokenEstimate += estimateTokens(reasoning)
+        }
+        if !content.isEmpty {
+            tokenEstimate += estimateTokens(content)
+        }
+
+        if chatMessages[assistantIndex].content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            chatMessages[assistantIndex].content = "The model returned reasoning but did not finish a final answer. Try again if you need the final response."
+        }
+        chatScrollRevision += 1
+    }
+
+    private func chatRequestMessages() -> [OpenAIChatRequest.Message] {
+        chatMessages
+            .dropLast()
+            .filter { $0.includeInContext && !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .suffix(10)
+            .map { OpenAIChatRequest.Message(role: $0.role.rawValue, content: $0.content) }
     }
 
     private func assistantMessageHasVisibleOutput(at index: Int) -> Bool {
