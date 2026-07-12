@@ -57,7 +57,8 @@ code from being mistaken for current source.
 
 ## Scope of Stability
 
-This baseline consolidates the known-working UI/backend deployment source. It
-does not declare all product bugs fixed. In particular, chat-history semantics,
-state recovery after app/NodeAgent restart, installer service identity and
+This baseline consolidates the known-working UI/backend deployment source.
+Model-specific runtime and generation settings are available from the Models
+page, and non-conversational UI messages are excluded from model context.
+State recovery after app/NodeAgent restart, installer service identity and
 authentication remain explicit follow-up work.

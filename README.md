@@ -53,6 +53,15 @@ app bundle build):
 ./scripts/verify-stable-baseline.sh
 ```
 
+## Model Configuration
+
+Each model row in the Models page has a Configure action. Settings are saved
+per model and applied to later loads and chat requests. The default maximum
+output is `32768` tokens so reasoning models have room to finish their final
+answer. Configurable settings include the API identifier, sampling controls,
+prefill step size, prompt cache size, prompt/decode concurrency, and tokenizer
+remote-code trust.
+
 ## Safety Notes
 
 - SSH passwords are never stored in source, config, or logs.

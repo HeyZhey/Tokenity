@@ -57,6 +57,13 @@ class StartRequest(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8000
     dry_run: bool = True
+    api_identifier: Optional[str] = None
+    max_tokens: int = Field(default=32_768, ge=1, le=262_144)
+    prompt_cache_size: int = Field(default=4, ge=1, le=64)
+    prefill_step_size: int = Field(default=2_048, ge=128, le=8_192)
+    decode_concurrency: int = Field(default=1, ge=1, le=8)
+    prompt_concurrency: int = Field(default=1, ge=1, le=8)
+    trust_remote_code: bool = False
 
 
 class StopRequest(BaseModel):
@@ -149,6 +156,13 @@ def create_app(
                     starting_port=request.starting_port,
                     host=request.host,
                     port=request.port,
+                    api_identifier=request.api_identifier,
+                    max_tokens=request.max_tokens,
+                    prompt_cache_size=request.prompt_cache_size,
+                    prefill_step_size=request.prefill_step_size,
+                    decode_concurrency=request.decode_concurrency,
+                    prompt_concurrency=request.prompt_concurrency,
+                    trust_remote_code=request.trust_remote_code,
                 )
                 return {"dry_run": True, "launch_plan": plan.to_dict()}
             hostfile_path = _write_hostfile("distributed-openai", request, nodes)
@@ -161,6 +175,13 @@ def create_app(
                 host=request.host,
                 port=request.port,
                 hostfile_path=str(hostfile_path),
+                api_identifier=request.api_identifier,
+                max_tokens=request.max_tokens,
+                prompt_cache_size=request.prompt_cache_size,
+                prefill_step_size=request.prefill_step_size,
+                decode_concurrency=request.decode_concurrency,
+                prompt_concurrency=request.prompt_concurrency,
+                trust_remote_code=request.trust_remote_code,
             )
         except HostfileError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

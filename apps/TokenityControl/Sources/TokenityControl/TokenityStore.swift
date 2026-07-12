@@ -79,10 +79,15 @@ final class TokenityStore: ObservableObject {
     @Published var modelLoadMessage = "No model loaded"
     @Published var chatInput = ""
     @Published var chatMessages: [ChatMessage] = [
-        ChatMessage(role: .assistant, content: "Create a cluster, load a model, then send a prompt to measure first response and total generation time.")
+        ChatMessage(
+            role: .assistant,
+            content: "Create a cluster, load a model, then send a prompt to measure first response and total generation time.",
+            includeInContext: false
+        )
     ]
     @Published var chatMetrics = ChatMetrics.empty
     @Published var isChatRunning = false
+    @Published private(set) var modelConfigurations: [String: ModelRuntimeConfiguration] = [:]
     @Published var logs: [String] = [
         "Tokenity Control opened.",
         "No cluster is running."
@@ -90,16 +95,24 @@ final class TokenityStore: ObservableObject {
 
     private let dataTransport: DataTransport
     private let lineStreamTransport: LineStreamTransport
+    private let userDefaults: UserDefaults
+    private let modelConfigurationsKey = "TokenityModelRuntimeConfigurations.v1"
     private let mlxStartingPort = 30020
     private var loadedBackendRole: String?
     private var loadedServiceModelName: String?
 
     init(
         dataTransport: @escaping DataTransport = TokenityStore.liveData(for:),
-        lineStreamTransport: @escaping LineStreamTransport = TokenityStore.liveLineStream(for:)
+        lineStreamTransport: @escaping LineStreamTransport = TokenityStore.liveLineStream(for:),
+        userDefaults: UserDefaults = .standard
     ) {
         self.dataTransport = dataTransport
         self.lineStreamTransport = lineStreamTransport
+        self.userDefaults = userDefaults
+        if let data = userDefaults.data(forKey: modelConfigurationsKey),
+           let decoded = try? JSONDecoder().decode([String: ModelRuntimeConfiguration].self, from: data) {
+            modelConfigurations = decoded
+        }
         rebuildLaunchPreview()
     }
 
@@ -133,6 +146,18 @@ final class TokenityStore: ObservableObject {
 
     var canEditCluster: Bool {
         phase == .stopped || phase == .failed
+    }
+
+    func modelConfiguration(for modelID: String) -> ModelRuntimeConfiguration {
+        modelConfigurations[modelID, default: .default]
+    }
+
+    func updateModelConfiguration(_ configuration: ModelRuntimeConfiguration, for modelID: String) {
+        modelConfigurations[modelID] = configuration.validated()
+        if let encoded = try? JSONEncoder().encode(modelConfigurations) {
+            userDefaults.set(encoded, forKey: modelConfigurationsKey)
+        }
+        appendLog("Updated runtime configuration for \(modelID).")
     }
 
     var modelLibraryRows: [ModelLibraryRow] {
@@ -305,14 +330,16 @@ final class TokenityStore: ObservableObject {
         modelPath = row.representativePath
         modelLoadMessage = "Loading \(row.displayName)..."
         appendLog("Loading model: \(row.displayName).")
+        let configuration = modelConfiguration(for: row.id)
 
         do {
             if let role = loadedBackendRole {
                 try await stopBackendRole(role)
             }
             let role = backendRole
-            try await startBackendModel(row, role: role)
-            let serviceModelName = try await waitForModelService(modelName: row.displayName, role: role)
+            try await startBackendModel(row, role: role, configuration: configuration)
+            let expectedServiceName = configuration.normalizedAPIIdentifier ?? row.displayName
+            let serviceModelName = try await waitForModelService(modelName: expectedServiceName, role: role)
 
             states = modelLoadStates
             for key in states.keys where key != row.id {
@@ -368,9 +395,11 @@ final class TokenityStore: ObservableObject {
             return
         }
         let serviceModelName = loadedServiceModelName ?? modelName
+        let configuration = modelConfiguration(for: modelName)
 
         chatInput = ""
         chatMessages.append(ChatMessage(role: .user, content: prompt))
+        let userIndex = chatMessages.count - 1
         chatMessages.append(ChatMessage(role: .assistant, content: "", thinking: "Preparing response..."))
         let assistantIndex = chatMessages.count - 1
         isChatRunning = true
@@ -384,6 +413,8 @@ final class TokenityStore: ObservableObject {
             try await streamClusterChat(
                 serviceModelName: serviceModelName,
                 prompt: prompt,
+                configuration: configuration,
+                userIndex: userIndex,
                 assistantIndex: assistantIndex,
                 start: start,
                 firstTokenAt: &firstTokenAt,
@@ -391,6 +422,8 @@ final class TokenityStore: ObservableObject {
             )
             finishChatMetrics(start: start, firstTokenAt: firstTokenAt, tokenEstimate: tokenEstimate)
         } catch {
+            chatMessages[userIndex].includeInContext = false
+            chatMessages[assistantIndex].includeInContext = false
             if assistantMessageHasVisibleOutput(at: assistantIndex) {
                 if chatMessages[assistantIndex].content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     chatMessages[assistantIndex].content = "The model returned reasoning but did not finish a final answer. Try again if you need the final response."
@@ -605,7 +638,11 @@ final class TokenityStore: ObservableObject {
         }
     }
 
-    private func startBackendModel(_ row: ModelLibraryRow, role: String) async throws {
+    private func startBackendModel(
+        _ row: ModelLibraryRow,
+        role: String,
+        configuration: ModelRuntimeConfiguration
+    ) async throws {
         guard let baseURL = clusterControlBaseURL() else { throw TokenityTransportError.missingClusterControl }
         let requestBody = AgentStartModelRequest(
             model: row.representativePath,
@@ -614,7 +651,14 @@ final class TokenityStore: ObservableObject {
             startingPort: mlxStartingPort,
             host: "0.0.0.0",
             port: 8000,
-            dryRun: false
+            dryRun: false,
+            apiIdentifier: configuration.normalizedAPIIdentifier,
+            maxTokens: configuration.maximumOutputTokens,
+            promptCacheSize: configuration.promptCacheSize,
+            prefillStepSize: configuration.prefillStepSize,
+            decodeConcurrency: configuration.decodeConcurrency,
+            promptConcurrency: configuration.promptConcurrency,
+            trustRemoteCode: configuration.trustRemoteCode
         )
         var request = try jsonRequest(url: baseURL.appendingPathComponent(backendStartPath), body: requestBody)
         request.timeoutInterval = 30
@@ -826,6 +870,8 @@ final class TokenityStore: ObservableObject {
     private func streamClusterChat(
         serviceModelName: String,
         prompt: String,
+        configuration: ModelRuntimeConfiguration,
+        userIndex: Int,
         assistantIndex: Int,
         start: Date,
         firstTokenAt: inout Date?,
@@ -839,7 +885,7 @@ final class TokenityStore: ObservableObject {
         request.addValue("application/json", forHTTPHeaderField: "Content-Type")
         let history = chatMessages
             .dropLast()
-            .filter { !$0.content.isEmpty }
+            .filter { $0.includeInContext && !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             .suffix(10)
             .map { OpenAIChatRequest.Message(role: $0.role.rawValue, content: $0.content) }
         request.httpBody = try JSONEncoder().encode(
@@ -847,13 +893,18 @@ final class TokenityStore: ObservableObject {
                 model: serviceModelName,
                 messages: Array(history),
                 stream: true,
-                maxTokens: nil
+                maxTokens: configuration.maximumOutputTokens,
+                temperature: configuration.temperature,
+                topP: configuration.topP,
+                topK: configuration.topK,
+                minP: configuration.minP
             )
         )
 
         chatMessages[assistantIndex].thinking = "Waiting for first response..."
         var didReceiveContent = false
         var didReceiveThinking = false
+        var finishReason: String?
 
         for try await line in lineStreamTransport(request) {
             guard line.hasPrefix("data:") else { continue }
@@ -861,7 +912,11 @@ final class TokenityStore: ObservableObject {
             if payload == "[DONE]" { break }
             guard let data = payload.data(using: .utf8) else { continue }
             let chunk = try JSONDecoder().decode(OpenAIChatChunk.self, from: data)
-            let delta = chunk.choices.first?.delta
+            let choice = chunk.choices.first
+            let delta = choice?.delta
+            if let reason = choice?.finishReason {
+                finishReason = reason
+            }
             let thinking = delta?.reasoningContent ?? delta?.reasoning
             if let thinking, !thinking.isEmpty {
                 chatMessages[assistantIndex].thinking = appendToken(thinking, to: chatMessages[assistantIndex].thinking)
@@ -871,13 +926,22 @@ final class TokenityStore: ObservableObject {
             }
             if let content = delta?.content, !content.isEmpty {
                 if firstTokenAt == nil { firstTokenAt = Date() }
+                let contentBefore = chatMessages[assistantIndex].content
+                let thinkingBefore = chatMessages[assistantIndex].thinking
                 appendAssistantContent(content, assistantIndex: assistantIndex)
                 tokenEstimate += estimateTokens(content)
-                didReceiveContent = true
+                didReceiveContent = didReceiveContent || chatMessages[assistantIndex].content != contentBefore
+                didReceiveThinking = didReceiveThinking || chatMessages[assistantIndex].thinking != thinkingBefore
             }
         }
         if !didReceiveContent && didReceiveThinking {
-            chatMessages[assistantIndex].content = "The model returned reasoning but did not finish a final answer. Try again if you need the final response."
+            chatMessages[userIndex].includeInContext = false
+            chatMessages[assistantIndex].includeInContext = false
+            if finishReason == "length" {
+                chatMessages[assistantIndex].content = "The model reached the configured maximum output length while reasoning. Increase Max Output Tokens in Model Configuration and try again."
+            } else {
+                chatMessages[assistantIndex].content = "The model returned reasoning but did not finish a final answer. Try again if you need the final response."
+            }
             return
         }
         if !didReceiveContent {

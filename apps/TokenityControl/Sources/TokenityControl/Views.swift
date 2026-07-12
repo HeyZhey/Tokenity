@@ -618,6 +618,7 @@ private struct ChatBubble: View {
 struct ModelsPage: View {
     @EnvironmentObject private var store: TokenityStore
     @Environment(\.tokenityTheme) private var theme
+    @State private var configurationTarget: ModelLibraryRow?
 
     var body: some View {
         PageScaffold(title: "Models") {
@@ -669,12 +670,22 @@ struct ModelsPage: View {
                             row: row,
                             selectedNodeCount: store.selectedNodes.count,
                             clusterIsReady: store.phase == .running,
+                            configurationAction: { configurationTarget = row },
                             loadAction: { Task { await store.loadModel(row) } },
                             stopAction: { Task { await store.stopModel(row) } }
                         )
                     }
                 }
             }
+        }
+        .sheet(item: $configurationTarget) { row in
+            ModelConfigurationSheet(
+                row: row,
+                initialConfiguration: store.modelConfiguration(for: row.id),
+                saveAction: { configuration in
+                    store.updateModelConfiguration(configuration, for: row.id)
+                }
+            )
         }
     }
 }
@@ -683,6 +694,7 @@ private struct ModelLoadRow: View {
     let row: ModelLibraryRow
     let selectedNodeCount: Int
     let clusterIsReady: Bool
+    let configurationAction: () -> Void
     let loadAction: () -> Void
     let stopAction: () -> Void
 
@@ -709,6 +721,13 @@ private struct ModelLoadRow: View {
             }
 
             Spacer(minLength: 0)
+
+            Button {
+                configurationAction()
+            } label: {
+                Label("Configure", systemImage: "slider.horizontal.3")
+            }
+            .help(row.loadState == .loaded ? "Changes take effect the next time this model is loaded" : "Configure model runtime and generation")
 
             switch row.loadState {
             case .loaded:
@@ -756,6 +775,139 @@ private struct ModelLoadRow: View {
         case .loaded: return theme.success
         case .loading: return theme.warning
         case .notLoaded: return theme.danger
+        }
+    }
+}
+
+private struct ModelConfigurationSheet: View {
+    let row: ModelLibraryRow
+    let saveAction: (ModelRuntimeConfiguration) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var draft: ModelRuntimeConfiguration
+
+    init(
+        row: ModelLibraryRow,
+        initialConfiguration: ModelRuntimeConfiguration,
+        saveAction: @escaping (ModelRuntimeConfiguration) -> Void
+    ) {
+        self.row = row
+        self.saveAction = saveAction
+        _draft = State(initialValue: initialConfiguration)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Model Identity") {
+                    LabeledContent("Model") {
+                        Text(row.displayName)
+                            .textSelection(.enabled)
+                    }
+                    LabeledContent("API Identifier") {
+                        TextField(row.displayName, text: $draft.apiIdentifier)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(minWidth: 280)
+                    }
+                    Text("Leave the identifier empty to serve the model using its folder name.")
+                        .font(.tokenityText(11))
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("Generation") {
+                    integerField(
+                        "Max Output Tokens",
+                        value: $draft.maximumOutputTokens,
+                        range: 1...262_144,
+                        help: "Maximum reasoning and answer tokens for each chat completion."
+                    )
+                    decimalField("Temperature", value: $draft.temperature, range: 0...2)
+                    decimalField("Top P", value: $draft.topP, range: 0...1)
+                    integerField("Top K", value: $draft.topK, range: 0...1_000)
+                    decimalField("Min P", value: $draft.minP, range: 0...1)
+                }
+
+                Section("Distributed Runtime") {
+                    integerField(
+                        "Prefill Step Size",
+                        value: $draft.prefillStepSize,
+                        range: 128...8_192,
+                        help: "Number of prompt tokens evaluated per prefill step."
+                    )
+                    integerField(
+                        "Prompt Cache Entries",
+                        value: $draft.promptCacheSize,
+                        range: 1...64,
+                        help: "Number of recent prompt caches retained by the model server."
+                    )
+                    integerField("Decode Concurrency", value: $draft.decodeConcurrency, range: 1...8)
+                    integerField("Prompt Concurrency", value: $draft.promptConcurrency, range: 1...8)
+                    Toggle("Trust tokenizer remote code", isOn: $draft.trustRemoteCode)
+                }
+
+                Section {
+                    Text("Runtime changes take effect the next time the model is loaded. Generation settings are used for new chat requests.")
+                        .font(.tokenityText(11))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .formStyle(.grouped)
+            .navigationTitle("Configure \(row.displayName)")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        saveAction(draft.validated())
+                        dismiss()
+                    }
+                    .keyboardShortcut(.defaultAction)
+                }
+            }
+        }
+        .frame(width: 620, height: 680)
+    }
+
+    @ViewBuilder
+    private func integerField(
+        _ label: String,
+        value: Binding<Int>,
+        range: ClosedRange<Int>,
+        help: String? = nil
+    ) -> some View {
+        LabeledContent(label) {
+            HStack(spacing: 8) {
+                if let help {
+                    Image(systemName: "questionmark.circle")
+                        .foregroundStyle(.secondary)
+                        .help(help)
+                }
+                TextField("", value: value, format: .number)
+                    .multilineTextAlignment(.trailing)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 120)
+                Stepper("", value: value, in: range)
+                    .labelsHidden()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func decimalField(
+        _ label: String,
+        value: Binding<Double>,
+        range: ClosedRange<Double>
+    ) -> some View {
+        LabeledContent(label) {
+            HStack(spacing: 8) {
+                Slider(value: value, in: range)
+                    .frame(width: 220)
+                TextField("", value: value, format: .number.precision(.fractionLength(0...3)))
+                    .multilineTextAlignment(.trailing)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 90)
+            }
         }
     }
 }

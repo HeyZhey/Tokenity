@@ -267,14 +267,23 @@ class TokenityDistributedRuntime:
         *,
         model: str,
         state: ReadinessState,
-        max_tokens: int = 512,
+        max_tokens: int = 32_768,
         trust_remote_code: bool = False,
+        api_identifier: str | None = None,
+        prompt_cache_size: int = 4,
+        prefill_step_size: int = 2_048,
+        decode_concurrency: int = 1,
+        prompt_concurrency: int = 1,
     ) -> None:
         self.model = model
-        self.model_id = Path(model).name or model
+        self.model_id = (api_identifier or "").strip() or Path(model).name or model
         self.state = state
         self.max_tokens = max_tokens
         self.trust_remote_code = trust_remote_code
+        self.prompt_cache_size = prompt_cache_size
+        self.prefill_step_size = prefill_step_size
+        self.decode_concurrency = decode_concurrency
+        self.prompt_concurrency = prompt_concurrency
         self._symbols: _MLXServerSymbols | None = None
         self._provider: Any = None
         self._generator: Any = None
@@ -498,10 +507,10 @@ class TokenityDistributedRuntime:
             min_p=0.0,
             max_tokens=self.max_tokens,
             chat_template_args={},
-            decode_concurrency=1,
-            prompt_concurrency=1,
-            prefill_step_size=2048,
-            prompt_cache_size=4,
+            decode_concurrency=self.decode_concurrency,
+            prompt_concurrency=self.prompt_concurrency,
+            prefill_step_size=self.prefill_step_size,
+            prompt_cache_size=self.prompt_cache_size,
             prompt_cache_bytes=None,
             pipeline=False,
             allowed_origins=["*"],
@@ -699,6 +708,12 @@ def serve(
     port: int,
     require_mlx: bool = False,
     trust_remote_code: bool = False,
+    api_identifier: str | None = None,
+    max_tokens: int = 32_768,
+    prompt_cache_size: int = 4,
+    prefill_step_size: int = 2_048,
+    decode_concurrency: int = 1,
+    prompt_concurrency: int = 1,
 ) -> None:
     import uvicorn
 
@@ -709,6 +724,12 @@ def serve(
             model=model,
             state=state,
             trust_remote_code=trust_remote_code,
+            api_identifier=api_identifier,
+            max_tokens=max_tokens,
+            prompt_cache_size=prompt_cache_size,
+            prefill_step_size=prefill_step_size,
+            decode_concurrency=decode_concurrency,
+            prompt_concurrency=prompt_concurrency,
         )
         runtime.start()
     except Exception as exc:  # pragma: no cover - depends on target MLX runtime

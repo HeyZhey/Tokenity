@@ -58,10 +58,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
     distributed = subparsers.add_parser("distributed-openai", help="Tokenity distributed OpenAI server.")
     distributed_sub = distributed.add_subparsers(dest="distributed_command")
-    distributed_serve = distributed_sub.add_parser("serve", help="Run the distributed OpenAI server skeleton.")
+    distributed_serve = distributed_sub.add_parser("serve", help="Run the distributed OpenAI-compatible model server.")
     distributed_serve.add_argument("--model", required=True)
     distributed_serve.add_argument("--host", default="127.0.0.1")
     distributed_serve.add_argument("--port", type=int, default=8000)
+    distributed_serve.add_argument("--api-identifier")
+    distributed_serve.add_argument("--max-tokens", type=int, default=32_768)
+    distributed_serve.add_argument("--prompt-cache-size", type=int, default=4)
+    distributed_serve.add_argument("--prefill-step-size", type=int, default=2_048)
+    distributed_serve.add_argument("--decode-concurrency", type=int, default=1)
+    distributed_serve.add_argument("--prompt-concurrency", type=int, default=1)
     distributed_serve.add_argument(
         "--require-mlx",
         action="store_true",
@@ -152,6 +158,12 @@ def _run_distributed_serve(args: argparse.Namespace) -> int:
         port=args.port,
         require_mlx=args.require_mlx,
         trust_remote_code=args.trust_remote_code,
+        api_identifier=args.api_identifier,
+        max_tokens=args.max_tokens,
+        prompt_cache_size=args.prompt_cache_size,
+        prefill_step_size=args.prefill_step_size,
+        decode_concurrency=args.decode_concurrency,
+        prompt_concurrency=args.prompt_concurrency,
     )
     return 0
 

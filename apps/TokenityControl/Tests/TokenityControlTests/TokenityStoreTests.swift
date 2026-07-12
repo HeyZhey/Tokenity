@@ -293,6 +293,122 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertTrue(store.chatMessages.last?.content.contains("did not finish a final answer") ?? false)
     }
 
+    func testChatRequestExcludesWelcomeMessageAndUsesModelConfiguration() async throws {
+        var streamedRequest: URLRequest?
+        let suiteName = "TokenityStoreTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = TokenityStore(
+            dataTransport: Self.successfulModelTransport,
+            lineStreamTransport: { request in
+                streamedRequest = request
+                return AsyncThrowingStream { continuation in
+                    continuation.yield("data: {\"choices\":[{\"delta\":{\"content\":\"Configured.\"},\"finish_reason\":null}]}")
+                    continuation.yield("data: [DONE]")
+                    continuation.finish()
+                }
+            },
+            userDefaults: defaults
+        )
+        guard let first = store.modelLibraryRows.first else {
+            XCTFail("Expected sample model")
+            return
+        }
+        var configuration = store.modelConfiguration(for: first.id)
+        configuration.maximumOutputTokens = 65_536
+        configuration.temperature = 0.25
+        configuration.topP = 0.9
+        configuration.topK = 40
+        configuration.minP = 0.05
+        store.updateModelConfiguration(configuration, for: first.id)
+        store.connectionMode = .ring
+        store.createCluster()
+        await store.loadModel(first)
+        store.chatInput = "Use the configured request."
+
+        await store.sendChatMessage()
+
+        let body = try XCTUnwrap(streamedRequest?.httpBody)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let messages = try XCTUnwrap(object["messages"] as? [[String: Any]])
+        XCTAssertEqual(messages.count, 1)
+        XCTAssertEqual(messages.first?["role"] as? String, "user")
+        XCTAssertEqual(messages.first?["content"] as? String, "Use the configured request.")
+        XCTAssertEqual(object["max_tokens"] as? Int, 65_536)
+        XCTAssertEqual(object["temperature"] as? Double, 0.25)
+        XCTAssertEqual(object["top_p"] as? Double, 0.9)
+        XCTAssertEqual(object["top_k"] as? Int, 40)
+        XCTAssertEqual(object["min_p"] as? Double, 0.05)
+    }
+
+    func testReasoningLengthLimitUsesAccurateMessageAndExcludesFailedTurn() async throws {
+        var streamedRequests: [URLRequest] = []
+        var requestCount = 0
+        let suiteName = "TokenityStoreTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = TokenityStore(
+            dataTransport: Self.successfulModelTransport,
+            lineStreamTransport: { request in
+                streamedRequests.append(request)
+                requestCount += 1
+                return AsyncThrowingStream { continuation in
+                    if requestCount == 1 {
+                        continuation.yield("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"long thought\"},\"finish_reason\":null}]}")
+                        continuation.yield("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}")
+                    } else {
+                        continuation.yield("data: {\"choices\":[{\"delta\":{\"content\":\"Recovered.\"},\"finish_reason\":null}]}")
+                    }
+                    continuation.yield("data: [DONE]")
+                    continuation.finish()
+                }
+            },
+            userDefaults: defaults
+        )
+        guard let first = store.modelLibraryRows.first else {
+            XCTFail("Expected sample model")
+            return
+        }
+        store.connectionMode = .ring
+        store.createCluster()
+        await store.loadModel(first)
+        store.chatInput = "First turn"
+        await store.sendChatMessage()
+
+        XCTAssertTrue(store.chatMessages.last?.content.contains("maximum output length") ?? false)
+        XCTAssertEqual(store.chatMessages.suffix(2).map(\.includeInContext), [false, false])
+
+        store.chatInput = "Second turn"
+        await store.sendChatMessage()
+
+        let secondBody = try XCTUnwrap(streamedRequests.last?.httpBody)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: secondBody) as? [String: Any])
+        let messages = try XCTUnwrap(object["messages"] as? [[String: Any]])
+        XCTAssertEqual(messages.count, 1)
+        XCTAssertEqual(messages.first?["content"] as? String, "Second turn")
+    }
+
+    func testModelConfigurationPersistsAndValidatesValues() {
+        let suiteName = "TokenityStoreTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = TokenityStore(userDefaults: defaults)
+        let modelID = "Qwen"
+        var configuration = ModelRuntimeConfiguration.default
+        configuration.apiIdentifier = "  tokenity/qwen  "
+        configuration.maximumOutputTokens = 999_999
+        configuration.temperature = 3
+        configuration.prefillStepSize = 64
+        store.updateModelConfiguration(configuration, for: modelID)
+
+        let restored = TokenityStore(userDefaults: defaults).modelConfiguration(for: modelID)
+        XCTAssertEqual(restored.apiIdentifier, "tokenity/qwen")
+        XCTAssertEqual(restored.maximumOutputTokens, 262_144)
+        XCTAssertEqual(restored.temperature, 2)
+        XCTAssertEqual(restored.prefillStepSize, 128)
+    }
+
     private static func successfulModelTransport(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         let path = request.url?.path ?? ""
         let payload: String

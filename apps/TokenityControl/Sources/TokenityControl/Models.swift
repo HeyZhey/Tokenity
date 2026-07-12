@@ -355,6 +355,42 @@ struct ModelLibraryRow: Identifiable, Hashable {
     var representativePath: String
 }
 
+struct ModelRuntimeConfiguration: Codable, Hashable {
+    var apiIdentifier: String = ""
+    var maximumOutputTokens: Int = 32_768
+    var temperature: Double = 0
+    var topP: Double = 1
+    var topK: Int = 0
+    var minP: Double = 0
+    var promptCacheSize: Int = 4
+    var prefillStepSize: Int = 2_048
+    var decodeConcurrency: Int = 1
+    var promptConcurrency: Int = 1
+    var trustRemoteCode: Bool = false
+
+    static let `default` = ModelRuntimeConfiguration()
+
+    var normalizedAPIIdentifier: String? {
+        let value = apiIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    func validated() -> ModelRuntimeConfiguration {
+        var copy = self
+        copy.apiIdentifier = apiIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+        copy.maximumOutputTokens = min(max(maximumOutputTokens, 1), 262_144)
+        copy.temperature = min(max(temperature, 0), 2)
+        copy.topP = min(max(topP, 0), 1)
+        copy.topK = min(max(topK, 0), 1_000)
+        copy.minP = min(max(minP, 0), 1)
+        copy.promptCacheSize = min(max(promptCacheSize, 1), 64)
+        copy.prefillStepSize = min(max(prefillStepSize, 128), 8_192)
+        copy.decodeConcurrency = min(max(decodeConcurrency, 1), 8)
+        copy.promptConcurrency = min(max(promptConcurrency, 1), 8)
+        return copy
+    }
+}
+
 enum ChatRole: String, Codable, Hashable {
     case user
     case assistant
@@ -366,19 +402,22 @@ struct ChatMessage: Identifiable, Hashable {
     var content: String
     var thinking: String
     var createdAt: Date
+    var includeInContext: Bool
 
     init(
         id: UUID = UUID(),
         role: ChatRole,
         content: String,
         thinking: String = "",
-        createdAt: Date = Date()
+        createdAt: Date = Date(),
+        includeInContext: Bool = true
     ) {
         self.id = id
         self.role = role
         self.content = content
         self.thinking = thinking
         self.createdAt = createdAt
+        self.includeInContext = includeInContext
     }
 }
 
@@ -400,10 +439,17 @@ struct OpenAIChatRequest: Encodable {
     var messages: [Message]
     var stream: Bool
     var maxTokens: Int?
+    var temperature: Double? = nil
+    var topP: Double? = nil
+    var topK: Int? = nil
+    var minP: Double? = nil
 
     enum CodingKeys: String, CodingKey {
-        case model, messages, stream
+        case model, messages, stream, temperature
         case maxTokens = "max_tokens"
+        case topP = "top_p"
+        case topK = "top_k"
+        case minP = "min_p"
     }
 }
 
@@ -438,12 +484,26 @@ struct AgentStartModelRequest: Encodable {
     var host: String
     var port: Int
     var dryRun: Bool
+    var apiIdentifier: String?
+    var maxTokens: Int
+    var promptCacheSize: Int
+    var prefillStepSize: Int
+    var decodeConcurrency: Int
+    var promptConcurrency: Int
+    var trustRemoteCode: Bool
 
     enum CodingKeys: String, CodingKey {
         case model, nodes, host, port
         case connectionMode = "connection_mode"
         case startingPort = "starting_port"
         case dryRun = "dry_run"
+        case apiIdentifier = "api_identifier"
+        case maxTokens = "max_tokens"
+        case promptCacheSize = "prompt_cache_size"
+        case prefillStepSize = "prefill_step_size"
+        case decodeConcurrency = "decode_concurrency"
+        case promptConcurrency = "prompt_concurrency"
+        case trustRemoteCode = "trust_remote_code"
     }
 }
 

@@ -59,6 +59,31 @@ def test_distributed_plan_uses_runtime_python_for_tokenity_server():
     assert plan.command[plan.command.index("--backend") + 1] == "ring"
 
 
+def test_distributed_plan_forwards_model_runtime_configuration():
+    plan = build_distributed_openai_launch_plan(
+        nodes=[ClusterNode(id="local", ssh="127.0.0.1", lan_ip="127.0.0.1")],
+        connection_mode=ConnectionMode.RING,
+        model="/Users/Shared/TokenityModels/Qwen",
+        python="/Users/Shared/TokenityRuntime/current/.venv/bin/python",
+        api_identifier="tokenity/qwen",
+        max_tokens=65_536,
+        prompt_cache_size=8,
+        prefill_step_size=4_096,
+        decode_concurrency=2,
+        prompt_concurrency=3,
+        trust_remote_code=True,
+    )
+
+    command = plan.command
+    assert command[command.index("--api-identifier") + 1] == "tokenity/qwen"
+    assert command[command.index("--max-tokens") + 1] == "65536"
+    assert command[command.index("--prompt-cache-size") + 1] == "8"
+    assert command[command.index("--prefill-step-size") + 1] == "4096"
+    assert command[command.index("--decode-concurrency") + 1] == "2"
+    assert command[command.index("--prompt-concurrency") + 1] == "3"
+    assert "--trust-remote-code" in command
+
+
 def test_distributed_plan_can_wrap_launcher_in_local_ssh(monkeypatch):
     monkeypatch.setenv("TOKENITY_MLX_LAUNCH_VIA_LOCAL_SSH", "1")
 

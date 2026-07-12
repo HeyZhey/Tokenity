@@ -86,6 +86,13 @@ def build_distributed_openai_launch_plan(
     host: str = "0.0.0.0",
     port: int = 8000,
     hostfile_path: str = "<generated-hostfile>",
+    api_identifier: str | None = None,
+    max_tokens: int = 32_768,
+    prompt_cache_size: int = 4,
+    prefill_step_size: int = 2_048,
+    decode_concurrency: int = 1,
+    prompt_concurrency: int = 1,
+    trust_remote_code: bool = False,
 ) -> LaunchPlan:
     hostfile = build_hostfile(nodes, connection_mode)
     backend = _mlx_backend(connection_mode)
@@ -129,7 +136,21 @@ def build_distributed_openai_launch_plan(
         host,
         "--port",
         str(port),
+        "--max-tokens",
+        str(max_tokens),
+        "--prompt-cache-size",
+        str(prompt_cache_size),
+        "--prefill-step-size",
+        str(prefill_step_size),
+        "--decode-concurrency",
+        str(decode_concurrency),
+        "--prompt-concurrency",
+        str(prompt_concurrency),
     ]
+    if api_identifier:
+        command.extend(["--api-identifier", api_identifier])
+    if trust_remote_code:
+        command.append("--trust-remote-code")
     return LaunchPlan(
         role="distributed-openai",
         backend="Tokenity distributed OpenAI server",
