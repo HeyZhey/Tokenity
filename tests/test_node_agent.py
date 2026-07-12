@@ -3,13 +3,14 @@ from __future__ import annotations
 import subprocess
 import sys
 import time
+import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from tokenity.mlx.rdma_probe import RDMAProbeResult
-from tokenity.node_agent.agent import create_app
-from tokenity.process.supervisor import RoleSupervisor
+from tokenity.node_agent.agent import RankStartRequest, _rank_command_and_environment, create_app
+from tokenity.process.supervisor import RoleStatus, RoleSupervisor
 
 
 def fake_rdma_probe():
@@ -261,7 +262,7 @@ def test_model_scan(tmp_path: Path):
     assert payload["size_bytes"] >= 384
 
 
-def test_official_dry_run_blocks_bad_jaccl():
+def test_legacy_official_backend_is_disabled_because_it_requires_ssh():
     client = TestClient(create_app(rdma_probe_fn=fake_rdma_probe))
     response = client.post(
         "/v1/node/start-official-mlx-lm",
@@ -269,14 +270,15 @@ def test_official_dry_run_blocks_bad_jaccl():
             "model": "/Users/Shared/TokenityModels/Qwen",
             "connection_mode": "jaccl",
             "nodes": [
-                {"id": "mac-a", "ssh": "127.0.0.1"},
-                {"id": "mac-b", "ssh": "probriefing@192.168.5.75"},
+                {"id": "mac-a", "agent_url": "http://192.168.5.23:9100", "rdma_ip": "192.168.0.1", "rdma_devices": ["rdma_en4"]},
+                {"id": "mac-b", "agent_url": "http://192.168.5.75:9100", "rdma_ip": "192.168.0.2", "rdma_devices": ["rdma_en5"]},
             ],
         },
     )
 
-    assert response.status_code == 400
-    assert "JACCL readiness failed" in response.json()["detail"]
+    assert response.status_code == 410
+    assert "requires SSH" in response.json()["detail"]
+    assert "start-distributed-openai" in response.json()["detail"]
 
 
 def test_distributed_dry_run_forwards_runtime_configuration():
@@ -286,7 +288,13 @@ def test_distributed_dry_run_forwards_runtime_configuration():
         json={
             "model": "/Users/Shared/TokenityModels/Qwen",
             "connection_mode": "ring",
-            "nodes": [{"id": "local", "ssh": "127.0.0.1", "lan_ip": "127.0.0.1"}],
+            "nodes": [
+                {
+                    "id": "local",
+                    "agent_url": "http://127.0.0.1:9100",
+                    "lan_ip": "127.0.0.1",
+                }
+            ],
             "api_identifier": "tokenity/qwen",
             "max_tokens": 65_536,
             "prompt_cache_size": 8,
@@ -299,7 +307,9 @@ def test_distributed_dry_run_forwards_runtime_configuration():
     )
 
     assert response.status_code == 200
-    command = response.json()["launch_plan"]["command"]
+    plan = response.json()["launch_plan"]
+    assert plan["transport"] == "http"
+    command = plan["ranks"][0]["command"]
     assert command[command.index("--api-identifier") + 1] == "tokenity/qwen"
     assert command[command.index("--max-tokens") + 1] == "65536"
     assert command[command.index("--prompt-cache-size") + 1] == "8"
@@ -307,6 +317,195 @@ def test_distributed_dry_run_forwards_runtime_configuration():
     assert command[command.index("--decode-concurrency") + 1] == "2"
     assert command[command.index("--prompt-concurrency") + 1] == "3"
     assert "--trust-remote-code" in command
+
+
+def test_cluster_payload_rejects_legacy_ssh_fields():
+    client = TestClient(create_app(rdma_probe_fn=fake_rdma_probe))
+    response = client.post(
+        "/v1/node/start-distributed-openai",
+        json={
+            "model": "/models/qwen",
+            "dry_run": True,
+            "nodes": [{"id": "mac-b", "ssh": "user@example", "lan_ip": "192.168.5.75"}],
+        },
+    )
+
+    assert response.status_code == 422
+    assert "ssh" in response.text
+
+
+def test_cluster_payload_rejects_credentials_in_agent_url():
+    client = TestClient(create_app(rdma_probe_fn=fake_rdma_probe))
+    response = client.post(
+        "/v1/node/start-distributed-openai",
+        json={
+            "model": "/models/qwen",
+            "dry_run": True,
+            "nodes": [
+                {
+                    "id": "mac-b",
+                    "agent_url": "http://user:password@192.168.5.75:9100",
+                    "lan_ip": "192.168.5.75",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    assert "must not contain a username or password" in response.json()["detail"]
+
+
+def test_rank_environment_matches_mlx_jaccl_contract(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("tokenity.node_agent.agent.tempfile.gettempdir", lambda: str(tmp_path))
+    request = RankStartRequest(
+        cluster_id="cluster-test",
+        model="/models/qwen",
+        rank=1,
+        world_size=2,
+        coordinator=False,
+        connection_mode="jaccl",
+        python="/runtime/bin/python",
+        coordinator_ip="192.168.0.1",
+        starting_port=30_020,
+        rdma_matrix=[[None, "rdma_en4"], ["rdma_en5", None]],
+    )
+
+    command, env = _rank_command_and_environment(request)
+
+    assert command[:4] == ["/runtime/bin/python", "-m", "tokenity", "distributed-openai"]
+    assert env["MLX_RANK"] == "1"
+    assert env["MLX_JACCL_COORDINATOR"] == "192.168.0.1:30020"
+    assert json.loads(Path(env["MLX_IBV_DEVICES"]).read_text()) == [
+        [None, "rdma_en4"],
+        ["rdma_en5", None],
+    ]
+
+
+class _FakeSupervisor:
+    def __init__(self):
+        self.starts = []
+        self.stops = []
+
+    def start(self, role, command, env=None, cwd=None, start_new_session=True):
+        self.starts.append((role, command, env or {}, cwd, start_new_session))
+        return RoleStatus(role=role, state="running", pid=123, command=command)
+
+    def stop(self, role, timeout=10):
+        self.stops.append((role, timeout))
+        return RoleStatus(role=role, state="stopped")
+
+    def status(self, role=None):
+        if role is None:
+            return []
+        return RoleStatus(role=role, state="running", pid=123)
+
+
+def test_distributed_start_fans_out_worker_rank_over_http():
+    supervisor = _FakeSupervisor()
+    posts = []
+
+    def post_json(url, payload, timeout):
+        posts.append((url, payload, timeout))
+        return {"status": {"state": "running"}}
+
+    client = TestClient(
+        create_app(
+            rdma_probe_fn=fake_rdma_probe,
+            supervisor=supervisor,
+            post_json_fn=post_json,
+            rank_ready_fn=lambda pid, port, timeout: True,
+            rank_stabilize_fn=lambda seconds: None,
+            rank_connected_fn=lambda pid, request, timeout: True,
+        )
+    )
+    response = client.post(
+        "/v1/node/start-distributed-openai",
+        json={
+            "model": "/models/qwen",
+            "connection_mode": "jaccl",
+            "starting_port": 30_020,
+            "dry_run": False,
+            "nodes": [
+                {
+                    "id": "mac-a",
+                    "agent_url": "http://192.168.5.23:9100",
+                    "lan_ip": "192.168.5.23",
+                    "rdma_ip": "192.168.0.1",
+                    "rdma_devices": ["rdma_en4"],
+                },
+                {
+                    "id": "mac-b",
+                    "agent_url": "http://192.168.5.75:9100",
+                    "lan_ip": "192.168.5.75",
+                    "rdma_ip": "192.168.0.2",
+                    "rdma_devices": ["rdma_en5"],
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["launch_plan"]["transport"] == "http"
+    assert supervisor.starts[0][0] == "distributed-openai"
+    assert supervisor.starts[0][2]["MLX_RANK"] == "0"
+    assert posts[0][0] == "http://192.168.5.75:9100/v1/node/start-distributed-rank"
+    assert posts[0][1]["rank"] == 1
+    assert "ssh" not in posts[0][1]
+
+    stop = client.post(
+        "/v1/node/stop-role",
+        json={"role": "distributed-openai", "timeout": 5},
+    )
+    assert stop.status_code == 200
+    assert posts[-1][0] == "http://192.168.5.75:9100/v1/node/stop-role"
+    assert posts[-1][1]["role"] == "distributed-openai-rank"
+
+
+def test_remote_rank_rejects_a_caller_selected_python_executable():
+    client = TestClient(create_app(rdma_probe_fn=fake_rdma_probe))
+    response = client.post(
+        "/v1/node/start-distributed-rank",
+        json={
+            "cluster_id": "cluster-test",
+            "model": "/models/qwen",
+            "rank": 1,
+            "world_size": 2,
+            "connection_mode": "jaccl",
+            "python": "/tmp/untrusted-python",
+            "coordinator_ip": "192.168.0.1",
+            "rdma_matrix": [[None, "rdma_en4"], ["rdma_en5", None]],
+        },
+    )
+
+    assert response.status_code == 400
+    assert "installed Python runtime" in response.json()["detail"]
+
+
+def test_remote_rank_rolls_back_when_the_data_plane_does_not_connect():
+    supervisor = _FakeSupervisor()
+    client = TestClient(
+        create_app(
+            rdma_probe_fn=fake_rdma_probe,
+            supervisor=supervisor,
+            rank_connected_fn=lambda pid, request, timeout: False,
+        )
+    )
+    response = client.post(
+        "/v1/node/start-distributed-rank",
+        json={
+            "cluster_id": "cluster-test",
+            "model": "/models/qwen",
+            "rank": 1,
+            "world_size": 2,
+            "connection_mode": "jaccl",
+            "python": sys.executable,
+            "coordinator_ip": "192.168.0.1",
+            "rdma_matrix": [[None, "rdma_en4"], ["rdma_en5", None]],
+        },
+    )
+
+    assert response.status_code == 504
+    assert supervisor.stops == [("distributed-openai-rank", 5)]
 
 
 def test_distributed_runtime_configuration_is_validated():

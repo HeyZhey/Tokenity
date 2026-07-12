@@ -29,8 +29,16 @@ class RoleSupervisor:
         self._processes: dict[str, subprocess.Popen[bytes]] = {}
         self._commands: dict[str, list[str]] = {}
         self._logs: dict[str, Path] = {}
+        self._new_sessions: dict[str, bool] = {}
 
-    def start(self, role: str, command: list[str], env: dict[str, str] | None = None) -> RoleStatus:
+    def start(
+        self,
+        role: str,
+        command: list[str],
+        env: dict[str, str] | None = None,
+        cwd: str | Path | None = None,
+        start_new_session: bool = True,
+    ) -> RoleStatus:
         existing = self._processes.get(role)
         if existing and existing.poll() is None:
             return self.status(role)
@@ -47,7 +55,8 @@ class RoleSupervisor:
             stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE,
             env=merged_env,
-            start_new_session=True,
+            cwd=str(cwd) if cwd is not None else None,
+            start_new_session=start_new_session,
         )
         threading.Thread(
             target=_copy_process_output,
@@ -57,6 +66,7 @@ class RoleSupervisor:
         self._processes[role] = process
         self._commands[role] = command
         self._logs[role] = log_path
+        self._new_sessions[role] = start_new_session
         return self.status(role)
 
     def stop(self, role: str, timeout: float = 10.0) -> RoleStatus:
@@ -68,13 +78,19 @@ class RoleSupervisor:
             _terminate_related_processes(command, signal.SIGKILL)
             return self.status(role)  # type: ignore[return-value]
 
-        _terminate_process_group(process, signal.SIGTERM)
+        if self._new_sessions.get(role, True):
+            _terminate_process_group(process, signal.SIGTERM)
+        else:
+            process.terminate()
         _terminate_related_processes(command, signal.SIGTERM)
         deadline = time.monotonic() + timeout
         while process.poll() is None and time.monotonic() < deadline:
             time.sleep(0.1)
         if process.poll() is None:
-            _terminate_process_group(process, signal.SIGKILL)
+            if self._new_sessions.get(role, True):
+                _terminate_process_group(process, signal.SIGKILL)
+            else:
+                process.kill()
         _terminate_related_processes(command, signal.SIGKILL)
         return self.status(role)
 

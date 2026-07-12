@@ -24,7 +24,9 @@ The DMG contains a macOS installer package. The package installs:
 - `/Users/Shared/TokenityModels`
 - `/Library/LaunchDaemons/ai.tokenity.node-agent.plist`
 
-The postinstall script starts NodeAgent on port `9100`.
+The postinstall script starts NodeAgent on port `9100` as a launchd-managed
+service for the current console user. This is the supported multi-Mac runtime;
+the app and Agents coordinate ranks over HTTP and do not configure SSH.
 
 For the current known Mac A and Mac B LAN addresses, the postinstall script also installs and starts Thunderbolt keepalive:
 
@@ -37,17 +39,11 @@ Other Macs still get the UI, backend code, runtime, and NodeAgent. They do not g
 
 The local development machine currently does not have `/Users/Shared/TokenityRuntime`.
 
-By default, `package-tokenity-dmg.sh` fetches the verified runtime from:
-
-```text
-apple@192.168.5.23:/Users/Shared/TokenityRuntime/
-```
-
-Override this with:
+By default, `package-tokenity-dmg.sh` uses the local shared runtime or its local
+build cache. Override the local source with:
 
 ```bash
 TOKENITY_RUNTIME_SOURCE=/path/to/TokenityRuntime ./scripts/package-tokenity-dmg.sh
-TOKENITY_RUNTIME_REMOTE=user@host:/Users/Shared/TokenityRuntime/ ./scripts/package-tokenity-dmg.sh
 ```
 
 Runtime cache and temporary build outputs are under `/Users/zxc/Documents/Tokenity/dist`, which is git-ignored.
@@ -68,11 +64,7 @@ To build a very large offline installer that includes model weights:
 TOKENITY_INCLUDE_MODEL=1 ./scripts/package-tokenity-dmg.sh
 ```
 
-By default that copies from Mac A:
-
-```text
-apple@192.168.5.23:/Users/Shared/TokenityModels/Qwen3.5-122B-A10B-4bit/
-```
+Set `TOKENITY_MODEL_SOURCE` when the weights are in another local directory.
 
 ## Signing Note
 
@@ -105,4 +97,3 @@ After installing on a Mac:
 ```bash
 curl --noproxy "*" -sS http://127.0.0.1:9100/v1/node/info
 ```
-

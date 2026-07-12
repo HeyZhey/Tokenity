@@ -10,19 +10,19 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import List, Literal, Optional
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import ProxyHandler, Request, build_opener
 
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from tokenity import __version__
-from tokenity.mlx.hostfile import ClusterNode, ConnectionMode, HostfileError
-from tokenity.mlx.launcher import (
-    build_distributed_openai_launch_plan,
-    build_official_mlx_lm_launch_plan,
-)
+from tokenity.mlx.hostfile import ClusterNode, ConnectionMode, HostfileError, build_hostfile
 from tokenity.mlx.rdma_probe import RDMAProbeResult, probe_rdma
 from tokenity.process.supervisor import RoleSupervisor
 
@@ -31,8 +31,10 @@ DEFAULT_MODEL_ROOT = "/Users/Shared/TokenityModels"
 
 
 class ClusterNodePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     id: str
-    ssh: str
+    agent_url: Optional[str] = None
     lan_ip: Optional[str] = None
     rdma_ip: Optional[str] = None
     rdma_devices: List[str] = Field(default_factory=list)
@@ -41,7 +43,7 @@ class ClusterNodePayload(BaseModel):
     def to_cluster_node(self) -> ClusterNode:
         return ClusterNode(
             id=self.id,
-            ssh=self.ssh,
+            agent_url=self.agent_url,
             lan_ip=self.lan_ip,
             rdma_ip=self.rdma_ip,
             rdma_devices=self.rdma_devices,
@@ -50,6 +52,8 @@ class ClusterNodePayload(BaseModel):
 
 
 class StartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     model: str
     nodes: List[ClusterNodePayload] = Field(default_factory=list)
     connection_mode: ConnectionMode = ConnectionMode.RING
@@ -68,17 +72,59 @@ class StartRequest(BaseModel):
 
 
 class StopRequest(BaseModel):
-    role: Literal["official-mlx-lm", "distributed-openai", "single-node-openai", "node-agent"]
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal[
+        "official-mlx-lm",
+        "distributed-openai",
+        "distributed-openai-rank",
+        "single-node-openai",
+        "node-agent",
+    ]
     timeout: float = 10.0
+
+
+class RankStartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cluster_id: str = Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    model: str
+    rank: int = Field(ge=0)
+    world_size: int = Field(ge=1)
+    coordinator: bool = False
+    connection_mode: ConnectionMode = ConnectionMode.RING
+    python: str
+    coordinator_ip: Optional[str] = None
+    starting_port: int = Field(default=29_500, ge=1, le=65_535)
+    ring_hosts: List[List[str]] = Field(default_factory=list)
+    rdma_matrix: List[List[Optional[str]]] = Field(default_factory=list)
+    host: str = "0.0.0.0"
+    port: int = 8_000
+    api_identifier: Optional[str] = None
+    max_tokens: int = Field(default=32_768, ge=1, le=262_144)
+    prompt_cache_size: int = Field(default=4, ge=1, le=64)
+    prefill_step_size: int = Field(default=2_048, ge=128, le=8_192)
+    decode_concurrency: int = Field(default=1, ge=1, le=8)
+    prompt_concurrency: int = Field(default=1, ge=1, le=8)
+    trust_remote_code: bool = False
 
 
 def create_app(
     *,
     rdma_probe_fn=probe_rdma,
     supervisor: RoleSupervisor | None = None,
+    post_json_fn=None,
+    rank_ready_fn=None,
+    rank_stabilize_fn=None,
+    rank_connected_fn=None,
 ) -> FastAPI:
     app = FastAPI(title="Tokenity Node Agent", version=__version__)
     roles = supervisor or RoleSupervisor()
+    post_json = post_json_fn or _post_json
+    wait_for_rank = rank_ready_fn or _wait_for_listening_port
+    stabilize_rank = rank_stabilize_fn or time.sleep
+    wait_for_rank_connection = rank_connected_fn or _wait_for_rank_connection
+    distributed_workers: list[str] = []
 
     @app.get("/v1/node/info")
     def node_info() -> dict[str, object]:
@@ -115,83 +161,129 @@ def create_app(
 
     @app.post("/v1/node/start-official-mlx-lm")
     def start_official(request: StartRequest) -> dict[str, object]:
-        nodes = _request_nodes(request)
-        try:
-            if request.dry_run:
-                plan = build_official_mlx_lm_launch_plan(
-                    nodes=nodes,
-                    connection_mode=request.connection_mode,
-                    model=request.model,
-                    python=request.python,
-                    starting_port=request.starting_port,
-                    host=request.host,
-                    port=request.port,
-                )
-                return {"dry_run": True, "launch_plan": plan.to_dict()}
-            hostfile_path = _write_hostfile("official-mlx-lm", request, nodes)
-            plan = build_official_mlx_lm_launch_plan(
-                nodes=nodes,
-                connection_mode=request.connection_mode,
-                model=request.model,
-                python=request.python,
-                starting_port=request.starting_port,
-                host=request.host,
-                port=request.port,
-                hostfile_path=str(hostfile_path),
-            )
-        except HostfileError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        status = roles.start("official-mlx-lm", plan.command)
-        return {"dry_run": False, "launch_plan": plan.to_dict(), "status": status.__dict__}
+        del request
+        raise HTTPException(
+            status_code=410,
+            detail=(
+                "The legacy mlx.launch backend is disabled because it requires SSH. "
+                "Use /v1/node/start-distributed-openai for HTTP Node Agent orchestration."
+            ),
+        )
 
     @app.post("/v1/node/start-distributed-openai")
     def start_distributed(request: StartRequest) -> dict[str, object]:
+        if not request.dry_run and Path(request.python).resolve() != Path(sys.executable).resolve():
+            raise HTTPException(
+                status_code=400,
+                detail="Cluster startup must use the coordinator Agent's installed Python runtime.",
+            )
         nodes = _request_nodes(request)
         try:
-            if request.dry_run:
-                plan = build_distributed_openai_launch_plan(
-                    nodes=nodes,
-                    connection_mode=request.connection_mode,
-                    model=request.model,
-                    python=request.python,
-                    starting_port=request.starting_port,
-                    host=request.host,
-                    port=request.port,
-                    api_identifier=request.api_identifier,
-                    max_tokens=request.max_tokens,
-                    prompt_cache_size=request.prompt_cache_size,
-                    prefill_step_size=request.prefill_step_size,
-                    decode_concurrency=request.decode_concurrency,
-                    prompt_concurrency=request.prompt_concurrency,
-                    trust_remote_code=request.trust_remote_code,
-                )
-                return {"dry_run": True, "launch_plan": plan.to_dict()}
-            hostfile_path = _write_hostfile("distributed-openai", request, nodes)
-            plan = build_distributed_openai_launch_plan(
-                nodes=nodes,
-                connection_mode=request.connection_mode,
-                model=request.model,
-                python=request.python,
-                starting_port=request.starting_port,
-                host=request.host,
-                port=request.port,
-                hostfile_path=str(hostfile_path),
-                api_identifier=request.api_identifier,
-                max_tokens=request.max_tokens,
-                prompt_cache_size=request.prompt_cache_size,
-                prefill_step_size=request.prefill_step_size,
-                decode_concurrency=request.decode_concurrency,
-                prompt_concurrency=request.prompt_concurrency,
-                trust_remote_code=request.trust_remote_code,
-            )
+            rank_requests = _http_rank_requests(request, nodes)
         except HostfileError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        status = roles.start("distributed-openai", plan.command)
-        return {"dry_run": False, "launch_plan": plan.to_dict(), "status": status.__dict__}
+
+        plan = _http_launch_plan(nodes, rank_requests)
+        if request.dry_run:
+            return {"dry_run": True, "launch_plan": plan}
+
+        local_request = rank_requests[0]
+        local_command, local_env = _rank_command_and_environment(local_request)
+        local_status = roles.start(
+            "distributed-openai",
+            local_command,
+            env=local_env,
+            cwd=_distributed_code_root(),
+        )
+        if request.connection_mode != ConnectionMode.RING:
+            if local_status.pid is None or not wait_for_rank(local_status.pid, request.starting_port, 45.0):
+                roles.stop("distributed-openai", timeout=5)
+                raise HTTPException(
+                    status_code=504,
+                    detail="Coordinator rank did not open the JACCL port before the startup deadline.",
+                )
+            stabilize_rank(3.0)
+        started_workers: list[str] = []
+        try:
+            for node, rank_request in zip(nodes[1:], rank_requests[1:]):
+                agent_url = _agent_url(node)
+                post_json(
+                    f"{agent_url}/v1/node/start-distributed-rank",
+                    rank_request.model_dump(mode="json"),
+                    25.0,
+                )
+                started_workers.append(agent_url)
+        except Exception as exc:
+            for agent_url in started_workers:
+                try:
+                    post_json(
+                        f"{agent_url}/v1/node/stop-role",
+                        {"role": "distributed-openai-rank", "timeout": 5},
+                        8.0,
+                    )
+                except Exception:
+                    pass
+            roles.stop("distributed-openai", timeout=5)
+            raise HTTPException(status_code=502, detail=f"Could not start worker rank over HTTP: {exc}") from exc
+
+        distributed_workers[:] = started_workers
+        return {
+            "dry_run": False,
+            "launch_plan": plan,
+            "status": local_status.__dict__,
+            "workers": started_workers,
+        }
+
+    @app.post("/v1/node/start-distributed-rank")
+    def start_distributed_rank(request: RankStartRequest) -> dict[str, object]:
+        if request.rank >= request.world_size:
+            raise HTTPException(status_code=400, detail="Rank must be smaller than world size.")
+        if request.coordinator:
+            raise HTTPException(status_code=400, detail="Remote rank endpoint cannot start the coordinator role.")
+        if Path(request.python).resolve() != Path(sys.executable).resolve():
+            raise HTTPException(
+                status_code=400,
+                detail="Remote ranks must use the Node Agent's installed Python runtime.",
+            )
+        try:
+            command, env = _rank_command_and_environment(request)
+        except HostfileError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        status = roles.start(
+            "distributed-openai-rank",
+            command,
+            env=env,
+            cwd=_distributed_code_root(),
+        )
+        if status.pid is None or not wait_for_rank_connection(status.pid, request, 20.0):
+            failed = roles.status("distributed-openai-rank")
+            roles.stop("distributed-openai-rank", timeout=5)
+            message = getattr(failed, "message", None) or getattr(failed, "log_tail", None)
+            raise HTTPException(
+                status_code=504,
+                detail=message or "Worker rank could not establish its MLX data-plane connection.",
+            )
+        return {"status": status.__dict__, "rank": request.rank, "cluster_id": request.cluster_id}
 
     @app.post("/v1/node/stop-role")
     def stop_role(request: StopRequest) -> dict[str, object]:
-        return {"status": roles.stop(request.role, timeout=request.timeout).__dict__}
+        worker_results: list[dict[str, object]] = []
+        if request.role == "distributed-openai":
+            for agent_url in list(distributed_workers):
+                try:
+                    result = post_json(
+                        f"{agent_url}/v1/node/stop-role",
+                        {"role": "distributed-openai-rank", "timeout": request.timeout},
+                        request.timeout + 3,
+                    )
+                    worker_results.append({"agent_url": agent_url, "result": result})
+                except Exception as exc:
+                    worker_results.append({"agent_url": agent_url, "error": str(exc)})
+            distributed_workers.clear()
+        return {
+            "status": roles.stop(request.role, timeout=request.timeout).__dict__,
+            "workers": worker_results,
+        }
 
     return app
 
@@ -274,18 +366,275 @@ def _directory_size(path: Path) -> int:
 def _request_nodes(request: StartRequest) -> list[ClusterNode]:
     if request.nodes:
         return [node.to_cluster_node() for node in request.nodes]
-    return [ClusterNode(id="local", ssh="127.0.0.1", lan_ip="127.0.0.1")]
+    return [
+        ClusterNode(
+            id="local",
+            agent_url="http://127.0.0.1:9100",
+            lan_ip="127.0.0.1",
+        )
+    ]
 
 
-def _write_hostfile(role: str, request: StartRequest, nodes: list[ClusterNode]) -> Path:
-    from tokenity.mlx.hostfile import build_hostfile
+def _agent_url(node: ClusterNode) -> str:
+    if node.agent_url:
+        url = node.agent_url.rstrip("/")
+    elif node.lan_ip:
+        url = f"http://{node.lan_ip}:9100"
+    else:
+        raise HostfileError(f"{node.id}: missing Node Agent URL.")
+    parsed = urlsplit(url)
+    if parsed.scheme != "http" or not parsed.hostname:
+        raise HostfileError(f"{node.id}: Agent URL must use http:// with a valid host.")
+    if parsed.username or parsed.password:
+        raise HostfileError(f"{node.id}: Agent URL must not contain a username or password.")
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise HostfileError(f"{node.id}: Agent URL must be an HTTP origin without a path, query, or fragment.")
+    return url
 
-    base = Path(tempfile.gettempdir()) / "tokenity-hostfiles"
-    base.mkdir(parents=True, exist_ok=True)
-    path = base / f"{role}-{uuid.uuid4().hex}.json"
+
+def _http_rank_requests(request: StartRequest, nodes: list[ClusterNode]) -> list[RankStartRequest]:
+    if not nodes:
+        raise HostfileError("At least one node is required.")
+    for node in nodes:
+        _agent_url(node)
+
     hostfile = build_hostfile(nodes, request.connection_mode)
-    path.write_text(json.dumps(hostfile, indent=2), encoding="utf-8")
+    world_size = len(nodes)
+    ring_hosts: list[list[str]] = []
+    rdma_matrix: list[list[str | None]] = []
+    coordinator_ip: str | None = None
+
+    if request.connection_mode == ConnectionMode.RING:
+        port = request.starting_port
+        for node in nodes:
+            data_ip = node.lan_ip or node.rdma_ip
+            if not data_ip:
+                raise HostfileError(f"{node.id}: missing standard-network IP.")
+            ring_hosts.append([f"{data_ip}:{port}"])
+            port += 1
+    else:
+        if not hostfile[0]["ips"]:
+            raise HostfileError("Rank 0 needs a Thunderbolt/RDMA coordinator IP.")
+        coordinator_ip = str(hostfile[0]["ips"][0])
+        rdma_matrix = [list(row["rdma"]) for row in hostfile]
+
+    cluster_id = uuid.uuid4().hex
+    return [
+        RankStartRequest(
+            cluster_id=cluster_id,
+            model=request.model,
+            rank=rank,
+            world_size=world_size,
+            coordinator=rank == 0,
+            connection_mode=request.connection_mode,
+            python=request.python,
+            coordinator_ip=coordinator_ip,
+            starting_port=request.starting_port,
+            ring_hosts=ring_hosts,
+            rdma_matrix=rdma_matrix,
+            host=request.host,
+            port=request.port,
+            api_identifier=request.api_identifier,
+            max_tokens=request.max_tokens,
+            prompt_cache_size=request.prompt_cache_size,
+            prefill_step_size=request.prefill_step_size,
+            decode_concurrency=request.decode_concurrency,
+            prompt_concurrency=request.prompt_concurrency,
+            trust_remote_code=request.trust_remote_code,
+        )
+        for rank in range(world_size)
+    ]
+
+
+def _http_launch_plan(
+    nodes: list[ClusterNode],
+    rank_requests: list[RankStartRequest],
+) -> dict[str, object]:
+    return {
+        "role": "distributed-openai",
+        "backend": "Tokenity distributed OpenAI server",
+        "experimental": False,
+        "transport": "http",
+        "ranks": [
+            {
+                "rank": rank_request.rank,
+                "agent_url": _agent_url(node),
+                "endpoint": "/v1/node/start-distributed-rank",
+                "command": _rank_process_command(rank_request),
+                "connection_mode": rank_request.connection_mode.value,
+            }
+            for node, rank_request in zip(nodes, rank_requests)
+        ],
+        "warnings": [
+            "Rank lifecycle uses typed Node Agent HTTP requests; no SSH credentials are required."
+        ],
+    }
+
+
+def _rank_command_and_environment(request: RankStartRequest) -> tuple[list[str], dict[str, str]]:
+    if request.rank >= request.world_size:
+        raise HostfileError("Rank must be smaller than world size.")
+
+    env = {
+        "PATH": _distributed_path(request.python),
+        "PYTHONPATH": _distributed_code_root(),
+        "MLX_METAL_FAST_SYNCH": os.environ.get("MLX_METAL_FAST_SYNCH", "1"),
+        "TOKENITY_MLX_LOAD_EVAL_CHUNK_SIZE": os.environ.get("TOKENITY_MLX_LOAD_EVAL_CHUNK_SIZE", "1"),
+        "TOKENITY_MLX_LOAD_EVAL_LOG_INTERVAL": os.environ.get("TOKENITY_MLX_LOAD_EVAL_LOG_INTERVAL", "100"),
+        "TOKENITY_MLX_LOAD_EVAL_SLEEP_SECONDS": os.environ.get("TOKENITY_MLX_LOAD_EVAL_SLEEP_SECONDS", "0.05"),
+        "TOKENITY_MLX_LOAD_POST_BARRIER": os.environ.get("TOKENITY_MLX_LOAD_POST_BARRIER", "0"),
+        "TOKENITY_MLX_DISTRIBUTED_INIT_RANK0_DELAY_SECONDS": os.environ.get(
+            "TOKENITY_MLX_DISTRIBUTED_INIT_RANK0_DELAY_SECONDS", "0"
+        ),
+        "MLX_RANK": str(request.rank),
+    }
+
+    if request.connection_mode == ConnectionMode.RING:
+        if request.world_size > 1 and len(request.ring_hosts) != request.world_size:
+            raise HostfileError("Ring host list length must equal world size.")
+        content = json.dumps(request.ring_hosts) if request.world_size > 1 else ""
+        env["MLX_HOSTFILE"] = str(
+            _write_rank_environment_file(request.cluster_id, "ring-hosts", content)
+        )
+    else:
+        if not request.coordinator_ip:
+            raise HostfileError("JACCL coordinator IP is required.")
+        if len(request.rdma_matrix) != request.world_size or any(
+            len(row) != request.world_size for row in request.rdma_matrix
+        ):
+            raise HostfileError("RDMA matrix dimensions must equal world size.")
+        env["MLX_JACCL_COORDINATOR"] = f"{request.coordinator_ip}:{request.starting_port}"
+        env["MLX_IBV_DEVICES"] = str(
+            _write_rank_environment_file(
+                request.cluster_id,
+                "rdma-devices",
+                json.dumps(request.rdma_matrix),
+            )
+        )
+        if request.connection_mode == ConnectionMode.JACCL_RING:
+            env["MLX_JACCL_RING"] = "1"
+
+    return _rank_process_command(request), env
+
+
+def _rank_process_command(request: RankStartRequest) -> list[str]:
+    return _rank_command(request)
+
+
+def _rank_command(request: RankStartRequest) -> list[str]:
+    command = [
+        request.python,
+        "-m",
+        "tokenity",
+        "distributed-openai",
+        "serve",
+        "--model",
+        request.model,
+        "--host",
+        request.host,
+        "--port",
+        str(request.port),
+        "--max-tokens",
+        str(request.max_tokens),
+        "--prompt-cache-size",
+        str(request.prompt_cache_size),
+        "--prefill-step-size",
+        str(request.prefill_step_size),
+        "--decode-concurrency",
+        str(request.decode_concurrency),
+        "--prompt-concurrency",
+        str(request.prompt_concurrency),
+    ]
+    if request.api_identifier:
+        command.extend(["--api-identifier", request.api_identifier])
+    if request.trust_remote_code:
+        command.append("--trust-remote-code")
+    return command
+
+
+def _write_rank_environment_file(cluster_id: str, name: str, content: str) -> Path:
+    base = Path(tempfile.gettempdir()) / "tokenity-rank-env"
+    base.mkdir(parents=True, exist_ok=True)
+    path = base / f"{cluster_id}-{name}.json"
+    path.write_text(content, encoding="utf-8")
     return path
+
+
+def _distributed_path(python: str) -> str:
+    existing = os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+    items = [str(Path(python).parent), *existing.split(os.pathsep)]
+    return os.pathsep.join(dict.fromkeys(item for item in items if item))
+
+
+def _distributed_code_root() -> str:
+    return os.environ.get("TOKENITY_CODE_ROOT") or "/Users/Shared/TokenityCode"
+
+
+def _post_json(url: str, payload: dict[str, object], timeout: float) -> dict[str, object]:
+    request = Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    opener = build_opener(ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            data = response.read()
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            decoded_error = json.loads(body)
+        except json.JSONDecodeError:
+            decoded_error = None
+        detail = decoded_error.get("detail") if isinstance(decoded_error, dict) else body
+        raise RuntimeError(f"Node Agent returned HTTP {exc.code}: {detail}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Node Agent is unreachable: {exc.reason}") from exc
+    decoded = json.loads(data) if data else {}
+    if not isinstance(decoded, dict):
+        raise RuntimeError("Node Agent returned an invalid JSON response.")
+    return decoded
+
+
+def _wait_for_listening_port(pid: int, port: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = subprocess.run(
+            ["lsof", "-nP", "-a", "-p", str(pid), f"-iTCP:{port}", "-sTCP:LISTEN"],
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout:
+            return True
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        time.sleep(0.1)
+    return False
+
+
+def _wait_for_rank_connection(pid: int, request: RankStartRequest, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if request.connection_mode == ConnectionMode.RING:
+            network_filter = "-iTCP"
+        else:
+            network_filter = f"-iTCP@{request.coordinator_ip}:{request.starting_port}"
+        result = subprocess.run(
+            ["lsof", "-nP", "-a", "-p", str(pid), network_filter, "-sTCP:ESTABLISHED"],
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout:
+            return True
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        time.sleep(0.1)
+    return False
 
 
 def _package_version(name: str) -> str | None:

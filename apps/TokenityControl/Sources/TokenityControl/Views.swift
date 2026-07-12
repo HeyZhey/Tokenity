@@ -215,7 +215,7 @@ struct ClusterPage: View {
                                 detail: store.backendMode.detail
                             ) {
                                 Picker("Inference backend", selection: $store.backendMode) {
-                                    ForEach(BackendMode.allCases) { mode in
+                                    ForEach(BackendMode.userSelectableCases) { mode in
                                         Text(mode.shortName).tag(mode)
                                     }
                                 }
@@ -482,7 +482,7 @@ struct NetworkPage: View {
                             HStack(spacing: 12) {
                                 Text(node.identityDetail)
                                     .lineLimit(1)
-                                Text(node.ssh)
+                                Text(node.agentURL)
                                     .foregroundStyle(.secondary)
                                     .lineLimit(1)
                                     .truncationMode(.middle)

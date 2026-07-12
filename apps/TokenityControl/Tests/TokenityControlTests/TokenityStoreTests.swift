@@ -13,6 +13,40 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertFalse(AppSection.allCases.contains { $0.title == "Nodes" })
     }
 
+    func testClusterModelRequestUsesAgentHTTPURLsWithoutSSHFields() throws {
+        let request = AgentStartModelRequest(
+            model: "/models/qwen",
+            nodes: [
+                AgentClusterNodeRequest(
+                    id: "mac-b",
+                    agentURL: "http://192.168.5.75:9100",
+                    lanIP: "192.168.5.75",
+                    rdmaIP: "192.168.0.2",
+                    rdmaDevices: ["rdma_en5"]
+                )
+            ],
+            connectionMode: "jaccl",
+            startingPort: 30_020,
+            host: "0.0.0.0",
+            port: 8_000,
+            dryRun: false,
+            maxTokens: 131_072,
+            promptCacheSize: 4,
+            prefillStepSize: 2_048,
+            decodeConcurrency: 1,
+            promptConcurrency: 1,
+            trustRemoteCode: false
+        )
+
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any]
+        )
+        let nodes = try XCTUnwrap(object["nodes"] as? [[String: Any]])
+
+        XCTAssertEqual(nodes.first?["agent_url"] as? String, "http://192.168.5.75:9100")
+        XCTAssertNil(nodes.first?["ssh"])
+    }
+
     func testClusterSelectionCanChangeBeforeCreation() {
         let store = TokenityStore()
         let macC = store.nodes.first { $0.id == "mac-c" }

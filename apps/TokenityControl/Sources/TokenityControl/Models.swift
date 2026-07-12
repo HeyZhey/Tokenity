@@ -53,6 +53,8 @@ enum BackendMode: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
+    static let userSelectableCases: [BackendMode] = [.distributed, .singleNode]
+
     var shortName: String {
         switch self {
         case .official: return "Official MLX-LM"
@@ -251,20 +253,19 @@ struct TokenityNode: Identifiable, Hashable {
     var memory: MemoryStats
     var models: [ModelEntry]
     var isOnline: Bool
-    var ssh: String
 
     var displayName: String {
-        if agentURL.contains("192.168.5.23") || ssh.contains("192.168.5.23") || (user == "apple" && hostname.localizedCaseInsensitiveContains("Mac")) {
+        if agentURL.contains("192.168.5.23") || (user == "apple" && hostname.localizedCaseInsensitiveContains("Mac")) {
             return "Mango"
         }
-        if agentURL.contains("192.168.5.75") || ssh.contains("192.168.5.75") {
+        if agentURL.contains("192.168.5.75") {
             return "Kiwi"
         }
         if agentURL.contains("127.0.0.1") {
             return "Apple"
         }
         let names = ["Mango", "Kiwi", "Apple", "Lime", "Pear", "Plum", "Berry"]
-        let key = [id, agentURL, ssh, hostname].joined(separator: "|")
+        let key = [id, agentURL, hostname].joined(separator: "|")
         let index = key.unicodeScalars.reduce(0) { value, scalar in
             (value * 31 + Int(scalar.value)) % names.count
         }
@@ -326,8 +327,7 @@ struct TokenityNode: Identifiable, Hashable {
             roles: [],
             memory: .unknown,
             models: [ModelEntry(id: "Qwen3.5-122B-A10B-4bit", path: "/Users/Shared/TokenityModels/Qwen3.5-122B-A10B-4bit")],
-            isOnline: false,
-            ssh: "127.0.0.1"
+            isOnline: false
         ),
         TokenityNode(
             id: "mac-b",
@@ -350,8 +350,7 @@ struct TokenityNode: Identifiable, Hashable {
             roles: [],
             memory: .unknown,
             models: [ModelEntry(id: "Qwen3.5-122B-A10B-4bit", path: "/Users/Shared/TokenityModels/Qwen3.5-122B-A10B-4bit")],
-            isOnline: false,
-            ssh: "probriefing@192.168.5.75"
+            isOnline: false
         ),
         TokenityNode(
             id: "mac-c",
@@ -368,8 +367,7 @@ struct TokenityNode: Identifiable, Hashable {
             roles: [],
             memory: .unknown,
             models: [ModelEntry(id: "Qwen3.5-122B-A10B-4bit", path: "/Users/Shared/TokenityModels/Qwen3.5-122B-A10B-4bit")],
-            isOnline: false,
-            ssh: "127.0.0.1"
+            isOnline: false
         )
     ]
 }
@@ -543,13 +541,14 @@ struct OpenAIModelsResponse: Decodable {
 
 struct AgentClusterNodeRequest: Encodable {
     var id: String
-    var ssh: String
+    var agentURL: String
     var lanIP: String?
     var rdmaIP: String?
     var rdmaDevices: [String]
 
     enum CodingKeys: String, CodingKey {
-        case id, ssh
+        case id
+        case agentURL = "agent_url"
         case lanIP = "lan_ip"
         case rdmaIP = "rdma_ip"
         case rdmaDevices = "rdma_devices"

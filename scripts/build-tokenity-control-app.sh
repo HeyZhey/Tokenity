@@ -57,6 +57,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
   <string>14.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Tokenity connects to Node Agents on your local network to coordinate distributed inference.</string>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
 </dict>

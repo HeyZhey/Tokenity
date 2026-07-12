@@ -16,7 +16,7 @@
 </p>
 
 Tokenity combines a native SwiftUI application, lightweight Python node agents,
-MLX distributed launch orchestration, and an OpenAI-compatible inference server.
+HTTP-based MLX rank orchestration, and an OpenAI-compatible inference server.
 It is designed for local clusters where a model is too large for one Mac but can
 fit across the combined unified memory of several machines.
 
@@ -29,7 +29,7 @@ fit across the combined unified memory of several machines.
 ## Highlights
 
 - Native macOS control app built with SwiftUI.
-- Multi-Mac model loading through `mlx.launch` and MLX distributed ranks.
+- Multi-Mac model loading through typed Node Agent HTTP commands; no SSH setup or password is required.
 - Thunderbolt RDMA/JACCL, regular-network, and RDMA-with-fallback launch modes.
 - Live readiness phases for distributed initialization, model loading, and generation.
 - Model inventory with format, quantization, size, architecture, and shard metadata.
@@ -44,19 +44,19 @@ fit across the combined unified memory of several machines.
 
 ```mermaid
 flowchart LR
-    UI["TokenityControl\nSwiftUI app"] -->|"control :9100"| A["Coordinator Mac\nNode Agent"]
-    A --> SUP["Process supervisor"]
-    SUP --> LAUNCH["mlx.launch"]
-    LAUNCH --> R0["MLX rank 0\nCoordinator"]
-    LAUNCH --> R1["MLX rank 1\nWorker Mac"]
+    UI["TokenityControl\nSwiftUI app"] -->|"HTTP control :9100"| A["Coordinator Mac\nNode Agent"]
+    A -->|"typed HTTP rank start :9100"| B["Worker Mac\nNode Agent"]
+    A --> R0["MLX rank 0\nCoordinator"]
+    B --> R1["MLX rank 1\nWorker"]
     R0 <-->|"Thunderbolt RDMA / JACCL"| R1
     CLIENT["Cherry Studio / Msty\nOpenAI SDK / curl"] -->|"OpenAI API :8000"| R0
 ```
 
-The SwiftUI app talks to the coordinator's Node Agent. The agent builds the
-hostfile, starts and supervises the distributed process, and exposes status to
-the UI. Rank 0 hosts Tokenity's OpenAI-compatible server while MLX distributes
-model work across the selected Macs.
+The SwiftUI app talks to the coordinator's Node Agent. The coordinator starts
+its local rank and asks every worker Agent to start a strictly typed rank over
+HTTP. Each Agent supervises only its local process. Rank 0 hosts Tokenity's
+OpenAI-compatible server while MLX moves tensors over its ring or JACCL/RDMA
+data plane. SSH is not part of product startup or inference.
 
 ## Repository layout
 
@@ -84,13 +84,12 @@ Tokenity/
 
 ### Inference Macs
 
-- Apple-silicon Macs reachable over SSH.
+- Apple-silicon Macs on the same trusted local network.
 - A shared Tokenity/MLX runtime containing compatible `mlx`, `mlx-lm`, and
   distributed backend dependencies.
 - The model available at the same path on every selected machine.
 - Node Agent reachable on TCP port `9100`.
-- For JACCL: a configured Thunderbolt link, RDMA devices, peer IPs, and
-  passwordless SSH between ranks.
+- For JACCL: a configured Thunderbolt link, RDMA devices, and peer IPs.
 
 Tokenity's Python package intentionally does not install MLX-LM itself because
 the validated cluster uses a separately managed shared runtime.
@@ -133,8 +132,8 @@ Or build only:
 ./scripts/build-tokenity-control-app.sh
 ```
 
-Start a Node Agent manually on each participating Mac when it is not already
-managed by the installer:
+Install Tokenity on every participating Mac so launchd manages its Node Agent.
+For single-Mac development only, an Agent can also be started manually:
 
 ```bash
 tokenity node-agent --host 0.0.0.0 --port 9100
@@ -151,12 +150,11 @@ tokenity node-agent --host 0.0.0.0 --port 9100
 7. Select **Load** and wait until the model state becomes **Loaded**.
 8. Use **Chat**, or open **API Access** to connect another application.
 
-Advanced Cluster settings expose the other backends and connection modes:
+Cluster settings expose these backends and connection modes:
 
 | Setting | Purpose |
 | --- | --- |
 | Tokenity Distributed | Tokenity-managed distributed MLX inference; recommended. |
-| Official MLX-LM | Compatibility path for the upstream server; experimental. |
 | Single Mac | Runs Tokenity on one selected Mac. |
 | Thunderbolt RDMA | Dedicated high-throughput JACCL link; recommended for the validated two-Mac topology. |
 | Standard Network | Regular network transport when RDMA is unavailable. |
@@ -235,9 +233,6 @@ See [External API](docs/external-api.md) for Cherry Studio and Msty notes.
 tokenity --version
 tokenity node-agent --host 0.0.0.0 --port 9100
 tokenity rdma-probe --pretty
-tokenity hostfile --connection jaccl --nodes-json nodes.json --pretty
-tokenity distributed-openai launch-plan --model /path/to/model \
-  --connection jaccl --nodes-json nodes.json --pretty
 tokenity distributed-openai serve --model /path/to/model \
   --host 0.0.0.0 --port 8000
 ```
@@ -294,13 +289,14 @@ tokenity rdma-probe --pretty
 ```
 
 Then verify the configured Thunderbolt interfaces are active, the peer RDMA IP
-is reachable, the expected `rdma_en*` device is active, and SSH works over the
-rank address. A stale distributed process may also keep queue-pair resources
+is reachable, the expected `rdma_en*` device is active, and every Node Agent is
+reachable over HTTP. A stale distributed process may also keep queue-pair resources
 busy; stop the existing model role before launching it again.
 
 ## Documentation
 
 - [Stable baseline](docs/stable-baseline.md)
+- [HTTP Node Agent protocol](docs/http-node-agent.md)
 - [External API](docs/external-api.md)
 - [Current RDMA + Qwen operations](docs/current-usage-rdma-qwen.md)
 - [Installer DMG](docs/installer-dmg.md)
@@ -311,10 +307,11 @@ contain machine-specific examples. Adapt those values to your own cluster.
 
 ## Security and project status
 
-- SSH passwords are not stored in source, configuration, or logs.
+- Product startup and inference never request or store SSH credentials.
+- Node Agents expose typed lifecycle endpoints, not an arbitrary shell command endpoint.
 - RDMA launch is blocked when required node/device metadata is missing.
 - The external API is intended for a trusted local network.
-- Official MLX-LM server mode remains experimental.
+- The legacy `mlx.launch` HTTP endpoint is disabled because it requires SSH for remote ranks.
 - Automatic node discovery and a generic topology editor are not complete yet;
   the current UI includes the validated sample topology as its initial configuration.
 

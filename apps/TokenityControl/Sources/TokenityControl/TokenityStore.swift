@@ -295,8 +295,7 @@ final class TokenityStore: ObservableObject {
                 roles: decoded.processRoles,
                 memory: decoded.memory ?? .unknown,
                 models: [],
-                isOnline: true,
-                ssh: "127.0.0.1"
+                isOnline: true
             )
             upsert(node)
             appendLog("Refreshed this Mac: \(decoded.hostname)")
@@ -763,8 +762,9 @@ final class TokenityStore: ObservableObject {
         guard let baseURL = clusterControlBaseURL() else { throw TokenityTransportError.missingClusterControl }
         let requestBody = AgentStartModelRequest(
             model: row.representativePath,
-            nodes: selectedNodes.map(agentNodePayload(for:)),
-            connectionMode: connectionMode.cliValue,
+            nodes: (backendMode == .singleNode ? Array(selectedNodes.prefix(1)) : selectedNodes)
+                .map(agentNodePayload(for:)),
+            connectionMode: backendMode == .singleNode ? ConnectionMode.ring.cliValue : connectionMode.cliValue,
             startingPort: mlxStartingPort,
             host: "0.0.0.0",
             port: 8000,
@@ -777,7 +777,7 @@ final class TokenityStore: ObservableObject {
             trustRemoteCode: configuration.trustRemoteCode
         )
         var request = try jsonRequest(url: baseURL.appendingPathComponent(backendStartPath), body: requestBody)
-        request.timeoutInterval = 30
+        request.timeoutInterval = 40
         let (data, response) = try await dataTransport(request)
         try validate(response, data: data)
     }
@@ -902,25 +902,11 @@ final class TokenityStore: ObservableObject {
     private func agentNodePayload(for node: TokenityNode) -> AgentClusterNodeRequest {
         AgentClusterNodeRequest(
             id: node.id,
-            ssh: launchSSH(for: node),
+            agentURL: node.agentURL,
             lanIP: node.primaryIP == "unknown" ? nil : node.primaryIP,
             rdmaIP: node.rdma.thunderboltIP,
             rdmaDevices: node.rdma.rdmaDevices
         )
-    }
-
-    private func launchSSH(for node: TokenityNode) -> String {
-        guard
-            connectionMode != .ring,
-            node.ssh != "127.0.0.1",
-            let rdmaIP = node.rdma.thunderboltIP,
-            !rdmaIP.isEmpty
-        else { return node.ssh }
-
-        if let atIndex = node.ssh.firstIndex(of: "@") {
-            return "\(node.ssh[..<atIndex])@\(rdmaIP)"
-        }
-        return node.ssh
     }
 
     private func clusterControlBaseURL() -> URL? {

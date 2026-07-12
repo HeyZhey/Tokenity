@@ -17,8 +17,8 @@ It is a Git worktree on branch `stable-baseline`, forked from Tokenity commit
 - The current SwiftUI app from `Tokenity/apps/TokenityControl`.
 - The distributed MLX-LM/OpenAI runtime that loaded
   `Qwen3.5-122B-A10B-4bit` across Mango and Kiwi.
-- The matching launcher environment, local-SSH wrapper, NodeAgent memory
-  reporting, child-rank failure detection, and process cleanup behavior.
+- HTTP Node Agent rank orchestration, NodeAgent memory reporting, child-rank
+  failure detection, and distributed process cleanup behavior.
 - The current DMG/pkg builder, now sourcing both UI and backend from this one
   repository.
 
@@ -60,5 +60,5 @@ code from being mistaken for current source.
 This baseline consolidates the known-working UI/backend deployment source.
 Model-specific runtime and generation settings are available from the Models
 page, and non-conversational UI messages are excluded from model context.
-State recovery after app/NodeAgent restart, installer service identity and
-authentication remain explicit follow-up work.
+State recovery after app/NodeAgent restart and Agent/API authentication remain
+explicit follow-up work. Product rank startup no longer uses SSH.

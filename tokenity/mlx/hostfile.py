@@ -18,7 +18,8 @@ class HostfileError(ValueError):
 @dataclass
 class ClusterNode:
     id: str
-    ssh: str
+    ssh: str = "127.0.0.1"
+    agent_url: str | None = None
     lan_ip: str | None = None
     rdma_ip: str | None = None
     rdma_devices: list[str] = field(default_factory=list)
@@ -29,6 +30,7 @@ class ClusterNode:
         return cls(
             id=str(payload.get("id") or payload.get("node_id") or payload.get("hostname") or "node"),
             ssh=str(payload.get("ssh") or payload.get("agent_url") or "127.0.0.1"),
+            agent_url=payload.get("agent_url"),
             lan_ip=payload.get("lan_ip") or payload.get("ip"),
             rdma_ip=payload.get("rdma_ip") or payload.get("thunderbolt_ip"),
             rdma_devices=list(payload.get("rdma_devices") or []),

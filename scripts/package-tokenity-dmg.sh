@@ -11,7 +11,6 @@ SCRIPTS_DIR="$WORK_DIR/scripts"
 DMG_ROOT="$WORK_DIR/dmg-root"
 RUNTIME_CACHE="$DIST_DIR/runtime-cache/TokenityRuntime"
 RUNTIME_SOURCE="${TOKENITY_RUNTIME_SOURCE:-/Users/Shared/TokenityRuntime}"
-RUNTIME_REMOTE="${TOKENITY_RUNTIME_REMOTE:-apple@192.168.5.23:/Users/Shared/TokenityRuntime/}"
 PKG_PATH="$DIST_DIR/Tokenity-${VERSION}.pkg"
 DMG_PATH="$DIST_DIR/Tokenity-${VERSION}.dmg"
 BACKEND_SOURCE="$ROOT/tokenity/serving/distributed_openai.py"
@@ -79,23 +78,25 @@ copy_dir "$ROOT/" "$PAYLOAD_DIR/Users/Shared/TokenityCode"
 echo "Preparing Tokenity runtime..."
 if [[ -d "$RUNTIME_SOURCE" ]]; then
   copy_runtime_dir "$RUNTIME_SOURCE/" "$RUNTIME_CACHE"
+elif [[ -d "$RUNTIME_CACHE/current/.venv" ]]; then
+  echo "Using the cached Tokenity runtime at $RUNTIME_CACHE."
 else
-  mkdir -p "$RUNTIME_CACHE"
-  rsync -a --delete --delete-excluded "${runtime_excludes[@]}" "$RUNTIME_REMOTE" "$RUNTIME_CACHE/"
+  echo "Tokenity runtime not found. Set TOKENITY_RUNTIME_SOURCE to a local directory." >&2
+  exit 1
 fi
 copy_runtime_dir "$RUNTIME_CACHE/" "$PAYLOAD_DIR/Users/Shared/TokenityRuntime"
 
 if [[ "${TOKENITY_INCLUDE_MODEL:-0}" == "1" ]]; then
   MODEL_NAME="${TOKENITY_MODEL_NAME:-Qwen3.5-122B-A10B-4bit}"
   MODEL_SOURCE="${TOKENITY_MODEL_SOURCE:-/Users/Shared/TokenityModels/${MODEL_NAME}}"
-  MODEL_REMOTE="${TOKENITY_MODEL_REMOTE:-apple@192.168.5.23:/Users/Shared/TokenityModels/${MODEL_NAME}/}"
   MODEL_DEST="$PAYLOAD_DIR/Users/Shared/TokenityModels/$MODEL_NAME"
   echo "Copying model payload. This can produce a very large DMG..."
   mkdir -p "$MODEL_DEST"
   if [[ -e "$MODEL_SOURCE" ]]; then
     rsync -aL --delete --exclude ".DS_Store" "$MODEL_SOURCE/" "$MODEL_DEST/"
   else
-    rsync -aL --delete --exclude ".DS_Store" "$MODEL_REMOTE" "$MODEL_DEST/"
+    echo "Model not found. Set TOKENITY_MODEL_SOURCE to a local directory." >&2
+    exit 1
   fi
 else
   echo "Skipping model weights. Set TOKENITY_INCLUDE_MODEL=1 to build a large offline model DMG."
@@ -132,6 +133,8 @@ cat > "$PAYLOAD_DIR/Library/LaunchDaemons/ai.tokenity.node-agent.plist" <<'PLIST
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
   <key>StandardOutPath</key>
   <string>/Users/Shared/TokenityLogs/node-agent.log</string>
   <key>StandardErrorPath</key>
@@ -148,9 +151,16 @@ NODE_AGENT_PLIST="/Library/LaunchDaemons/ai.tokenity.node-agent.plist"
 TB_PLIST="/Library/LaunchDaemons/ai.tokenity.thunderbolt-keepalive.plist"
 TB_SCRIPT="/usr/local/bin/tokenity-tb-keepalive"
 PYTHON="/Users/Shared/TokenityRuntime/current/.venv/bin/python"
+AGENT_USER="$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || true)"
+
+if [[ -n "$AGENT_USER" && "$AGENT_USER" != "root" && "$AGENT_USER" != "loginwindow" ]]; then
+  /usr/libexec/PlistBuddy -c "Add :UserName string $AGENT_USER" "$NODE_AGENT_PLIST" 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c "Set :UserName $AGENT_USER" "$NODE_AGENT_PLIST"
+fi
 
 /bin/mkdir -p /Users/Shared/TokenityLogs /Users/Shared/TokenityModels /usr/local/bin
 /usr/sbin/chown -R root:wheel /Applications/TokenityControl.app "$NODE_AGENT_PLIST" 2>/dev/null || true
+/usr/sbin/chown -R "$AGENT_USER":staff /Users/Shared/TokenityLogs 2>/dev/null || true
 /bin/chmod 644 "$NODE_AGENT_PLIST"
 /bin/chmod -R a+rX /Users/Shared/TokenityCode /Users/Shared/TokenityRuntime /Users/Shared/TokenityModels 2>/dev/null || true
 
