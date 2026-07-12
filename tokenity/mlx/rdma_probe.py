@@ -10,7 +10,7 @@ from typing import Callable, Iterable, Sequence
 CommandRunner = Callable[[Sequence[str]], "CommandResult"]
 
 
-@dataclass(slots=True)
+@dataclass
 class CommandResult:
     command: tuple[str, ...]
     returncode: int
@@ -23,14 +23,14 @@ class CommandResult:
         return self.error is None and self.returncode == 0
 
 
-@dataclass(slots=True)
+@dataclass
 class NetworkInterface:
     name: str
     ipv4: list[str] = field(default_factory=list)
     status: str = "unknown"
 
 
-@dataclass(slots=True)
+@dataclass
 class RDMAProbeResult:
     rdma_enabled: bool
     rdma_devices: list[str]

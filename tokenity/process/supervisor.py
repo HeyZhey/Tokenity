@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import os
+import re
+import select
 import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 
-@dataclass(slots=True)
+@dataclass
 class RoleStatus:
     role: str
     state: str
@@ -34,18 +37,23 @@ class RoleSupervisor:
 
         self.log_dir.mkdir(parents=True, exist_ok=True)
         log_path = self.log_dir / f"{role}.log"
-        log_handle = log_path.open("wb")
         merged_env = os.environ.copy()
         if env:
             merged_env.update(env)
+        log_path.write_bytes(b"")
         process = subprocess.Popen(
             command,
-            stdout=log_handle,
-            stderr=log_handle,
-            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.PIPE,
             env=merged_env,
             start_new_session=True,
         )
+        threading.Thread(
+            target=_copy_process_output,
+            args=(process, log_path),
+            daemon=True,
+        ).start()
         self._processes[role] = process
         self._commands[role] = command
         self._logs[role] = log_path
@@ -53,15 +61,21 @@ class RoleSupervisor:
 
     def stop(self, role: str, timeout: float = 10.0) -> RoleStatus:
         process = self._processes.get(role)
+        command = self._commands.get(role)
         if not process or process.poll() is not None:
+            _terminate_related_processes(command, signal.SIGTERM)
+            time.sleep(min(timeout, 0.5))
+            _terminate_related_processes(command, signal.SIGKILL)
             return self.status(role)  # type: ignore[return-value]
 
         _terminate_process_group(process, signal.SIGTERM)
+        _terminate_related_processes(command, signal.SIGTERM)
         deadline = time.monotonic() + timeout
         while process.poll() is None and time.monotonic() < deadline:
             time.sleep(0.1)
         if process.poll() is None:
             _terminate_process_group(process, signal.SIGKILL)
+        _terminate_related_processes(command, signal.SIGKILL)
         return self.status(role)
 
     def status(self, role: str | None = None) -> RoleStatus | list[RoleStatus]:
@@ -100,12 +114,117 @@ def _str(path: Path | None) -> str | None:
 
 
 def _terminate_process_group(process: subprocess.Popen[bytes], sig: signal.Signals) -> None:
+    if process.stdin is not None:
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
     try:
         os.killpg(process.pid, sig)
     except ProcessLookupError:
         return
     except PermissionError:
         process.send_signal(sig)
+
+
+def _terminate_related_processes(command: list[str] | None, sig: signal.Signals) -> None:
+    markers = _related_process_markers(command)
+    if not markers:
+        return
+    for pgid in _matching_process_groups(markers):
+        if pgid in {os.getpid(), os.getpgrp()}:
+            continue
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            continue
+
+
+def _related_process_markers(command: list[str] | None) -> list[str]:
+    if not command:
+        return []
+    command_text = " ".join(command)
+    markers: list[str] = []
+    for match in re.finditer(r"--hostfile\s+('([^']+)'|\"([^\"]+)\"|(\S+))", command_text):
+        marker = next(group for group in match.groups()[1:] if group)
+        if "tokenity-hostfiles" in marker:
+            markers.append(marker)
+    for match in re.finditer(
+        r"tokenity\s+distributed-openai\s+serve\s+--model\s+('([^']+)'|\"([^\"]+)\"|(\S+))",
+        command_text,
+    ):
+        model = next(group for group in match.groups()[1:] if group)
+        markers.append(f"tokenity distributed-openai serve --model {model}")
+    return markers
+
+
+def _matching_process_groups(markers: list[str]) -> set[int]:
+    try:
+        completed = subprocess.run(
+            ["/bin/ps", "-axo", "pid=,pgid=,command="],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    groups: set[int] = set()
+    current_pid = os.getpid()
+    for line in completed.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) != 3:
+            continue
+        try:
+            pid = int(parts[0])
+            pgid = int(parts[1])
+        except ValueError:
+            continue
+        if pid == current_pid:
+            continue
+        process_command = parts[2]
+        if any(marker in process_command for marker in markers):
+            groups.add(pgid)
+    return groups
+
+
+def _copy_process_output(process: subprocess.Popen[bytes], log_path: Path) -> None:
+    if process.stdout is None:
+        return
+    fd = process.stdout.fileno()
+    os.set_blocking(fd, False)
+    with log_path.open("ab") as handle:
+        while True:
+            readable, _, _ = select.select([fd], [], [], 0.5)
+            if not readable:
+                if process.poll() is not None:
+                    try:
+                        chunk = os.read(fd, 8192)
+                    except BlockingIOError:
+                        break
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    handle.flush()
+                continue
+            try:
+                chunk = os.read(fd, 8192)
+            except BlockingIOError:
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            handle.write(chunk)
+            handle.flush()
+        try:
+            process.stdout.close()
+        except OSError:
+            pass
 
 
 def _status_message(role: str, return_code: int | None, log_tail: str | None) -> str | None:

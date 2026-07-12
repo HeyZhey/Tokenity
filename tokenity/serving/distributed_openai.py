@@ -1,30 +1,560 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
+import json
+import logging
 import os
+import threading
 import time
-from collections.abc import AsyncIterator
+import uuid
+from collections.abc import AsyncIterator, Iterator
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .readiness import ReadinessPhase, ReadinessState
 
 
 class ChatCompletionRequest(BaseModel):
     model: str
-    messages: list[dict[str, object]]
+    messages: list[dict[str, Any]]
     stream: bool = False
+    max_tokens: int | None = Field(default=None, ge=1)
+    temperature: float | None = Field(default=None, ge=0)
+    top_p: float | None = Field(default=None, ge=0, le=1)
+    top_k: int | None = Field(default=None, ge=0)
+    min_p: float | None = Field(default=None, ge=0, le=1)
+    stop: str | list[str] | None = None
+    seed: int | None = None
+    tools: list[Any] | None = None
+    role_mapping: dict[str, Any] | None = None
+    chat_template_kwargs: dict[str, Any] | None = None
 
 
-def create_app(*, model: str, require_mlx: bool = False) -> FastAPI:
-    state = ReadinessState(model=model)
+@dataclass
+class _GenerationResult:
+    text: str
+    reasoning: str
+    finish_reason: str
+    prompt_tokens: int
+    completion_tokens: int
+    prompt_cache_tokens: int | None
+
+
+@dataclass
+class _MLXServerSymbols:
+    CompletionRequest: type
+    GenerationArguments: type
+    LogitsProcessorArguments: type
+    LRUPromptCache: type
+    ModelDescription: type
+    ModelProvider: type
+    ResponseGenerator: type
+    SamplingArguments: type
+
+    @classmethod
+    def load(cls) -> "_MLXServerSymbols":
+        import mlx_lm.server as server  # type: ignore
+
+        _install_chunked_sharded_load(server)
+        from mlx_lm.server import (  # type: ignore
+            CompletionRequest,
+            GenerationArguments,
+            LogitsProcessorArguments,
+            LRUPromptCache,
+            ModelDescription,
+            ModelProvider,
+            ResponseGenerator,
+            SamplingArguments,
+        )
+
+        return cls(
+            CompletionRequest=CompletionRequest,
+            GenerationArguments=GenerationArguments,
+            LogitsProcessorArguments=LogitsProcessorArguments,
+            LRUPromptCache=LRUPromptCache,
+            ModelDescription=ModelDescription,
+            ModelProvider=ModelProvider,
+            ResponseGenerator=ResponseGenerator,
+            SamplingArguments=SamplingArguments,
+        )
+
+
+def _install_chunked_sharded_load(server: Any) -> None:
+    if getattr(server, "_tokenity_chunked_sharded_load", False):
+        return
+
+    from mlx.utils import tree_flatten  # type: ignore
+    from mlx_lm.utils import _download, load_model, load_tokenizer  # type: ignore
+
+    def tokenity_sharded_load(
+        repo: str,
+        pipeline_group: Any = None,
+        tensor_group: Any = None,
+        return_config: bool = False,
+        *,
+        tokenizer_config: dict[str, Any] | None = None,
+    ) -> Any:
+        import mlx.core as mx  # type: ignore
+
+        model_path = _download(
+            repo,
+            allow_patterns=[
+                "*.json",
+                "*.py",
+                "tokenizer.model",
+                "*.tiktoken",
+                "tiktoken.model",
+                "*.txt",
+                "*.jsonl",
+                "*.jinja",
+            ],
+        )
+        model, config = load_model(model_path, lazy=True, strict=False)
+
+        has_pipelining = hasattr(model, "model") and hasattr(model.model, "pipeline")
+        has_tensor_parallel = hasattr(model, "shard")
+        if pipeline_group is not None and not has_pipelining:
+            raise ValueError("The model does not support pipelining but a pipeline_group was provided")
+        if tensor_group is not None and not has_tensor_parallel:
+            raise ValueError("The model does not support tensor parallelism but a tensor_group was provided")
+        if not has_pipelining and not has_tensor_parallel:
+            raise ValueError("The model does not support any sharding")
+        if pipeline_group is tensor_group is None:
+            if has_tensor_parallel:
+                tensor_group = mx.distributed.init()
+            elif has_pipelining:
+                pipeline_group = mx.distributed.init()
+
+        if pipeline_group is not None:
+            model.model.pipeline(pipeline_group)
+            with open(model_path / "model.safetensors.index.json", "r") as handle:
+                weight_index = json.load(handle)["weight_map"]
+            local_files = set()
+            for key, _ in tree_flatten(model.parameters()):
+                file_name = weight_index.get(key)
+                if file_name is None:
+                    raise ValueError("Pipeline loading is only supported for MLX converted models.")
+                local_files.add(file_name)
+            _download(repo, allow_patterns=local_files)
+        else:
+            _download(repo)
+
+        tokenizer = load_tokenizer(
+            model_path,
+            tokenizer_config or {"trust_remote_code": True},
+            eos_token_ids=config.get("eos_token_id", None),
+        )
+        model, _ = load_model(model_path, lazy=True, strict=False)
+        if tensor_group is not None:
+            model.shard(tensor_group)
+        if pipeline_group is not None:
+            model.model.pipeline(pipeline_group)
+        _eval_parameters_in_chunks(mx, tree_flatten(model.parameters()))
+        if _bool_env("TOKENITY_MLX_LOAD_POST_BARRIER", False):
+            logging.warning("Tokenity chunked sharded_load running post-load distributed all_sum barrier.")
+            mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
+            logging.warning("Tokenity chunked sharded_load finished post-load distributed all_sum barrier.")
+        else:
+            logging.warning("Tokenity chunked sharded_load skipped post-load distributed all_sum barrier.")
+        if return_config:
+            return model, tokenizer, config
+        return model, tokenizer
+
+    server.sharded_load = tokenity_sharded_load
+    server._tokenity_chunked_sharded_load = True
+
+
+def _eval_parameters_in_chunks(mx: Any, flattened_parameters: list[tuple[str, Any]]) -> None:
+    chunk_size = _positive_int_env("TOKENITY_MLX_LOAD_EVAL_CHUNK_SIZE", 1)
+    log_interval = _positive_int_env("TOKENITY_MLX_LOAD_EVAL_LOG_INTERVAL", 100)
+    sleep_seconds = _nonnegative_float_env("TOKENITY_MLX_LOAD_EVAL_SLEEP_SECONDS", 0.05)
+    total_chunks = (len(flattened_parameters) + chunk_size - 1) // chunk_size
+    logging.warning(
+        "Tokenity chunked sharded_load evaluating %s parameter leaves in %s chunks of %s.",
+        len(flattened_parameters),
+        total_chunks,
+        chunk_size,
+    )
+    for start in range(0, len(flattened_parameters), chunk_size):
+        chunk = flattened_parameters[start : start + chunk_size]
+        chunk_index = start // chunk_size + 1
+        should_log = chunk_index == 1 or chunk_index == total_chunks or chunk_index % log_interval == 0
+        if should_log:
+            logging.warning(
+                "Tokenity chunked sharded_load eval chunk %s/%s: %s.",
+                chunk_index,
+                total_chunks,
+                _describe_eval_chunk(chunk),
+            )
+        mx.eval([value for _, value in chunk])
+        if should_log:
+            logging.warning(
+                "Tokenity chunked sharded_load finished chunk %s/%s.",
+                chunk_index,
+                total_chunks,
+            )
+        if sleep_seconds:
+            time.sleep(sleep_seconds)
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
+def _nonnegative_float_env(name: str, default: float) -> float:
+    try:
+        return max(0.0, float(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _delay_rank0_distributed_init() -> None:
+    delay_seconds = _nonnegative_float_env("TOKENITY_MLX_DISTRIBUTED_INIT_RANK0_DELAY_SECONDS", 0.0)
+    if delay_seconds <= 0 or os.environ.get("MLX_RANK") != "0":
+        return
+    logging.warning(
+        "Tokenity delaying MLX distributed init on rank 0 for %.2f seconds.",
+        delay_seconds,
+    )
+    time.sleep(delay_seconds)
+
+
+def _describe_eval_chunk(chunk: list[tuple[str, Any]]) -> str:
+    descriptions = []
+    for name, value in chunk:
+        shape = getattr(value, "shape", None)
+        dtype = getattr(value, "dtype", None)
+        nbytes = _array_nbytes(value)
+        details = [name]
+        if shape is not None:
+            details.append(f"shape={shape}")
+        if dtype is not None:
+            details.append(f"dtype={dtype}")
+        if nbytes is not None:
+            details.append(f"bytes={nbytes}")
+        descriptions.append(" ".join(details))
+    return "; ".join(descriptions)
+
+
+def _array_nbytes(value: Any) -> int | None:
+    nbytes = getattr(value, "nbytes", None)
+    if callable(nbytes):
+        nbytes = nbytes()
+    if isinstance(nbytes, int):
+        return nbytes
+    return None
+
+
+class TokenityDistributedRuntime:
+    def __init__(
+        self,
+        *,
+        model: str,
+        state: ReadinessState,
+        max_tokens: int = 512,
+        trust_remote_code: bool = False,
+    ) -> None:
+        self.model = model
+        self.model_id = Path(model).name or model
+        self.state = state
+        self.max_tokens = max_tokens
+        self.trust_remote_code = trust_remote_code
+        self._symbols: _MLXServerSymbols | None = None
+        self._provider: Any = None
+        self._generator: Any = None
+        self._group: Any = None
+        self._load_monitor: threading.Thread | None = None
+
+    def start(self) -> None:
+        self.state.phase = ReadinessPhase.DISTRIBUTED_INIT
+        try:
+            import mlx.core as mx  # type: ignore
+
+            if mx.metal.is_available():
+                mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
+            _delay_rank0_distributed_init()
+            self._group = mx.distributed.init()
+        except Exception as exc:  # pragma: no cover - depends on target MLX runtime
+            self.state.phase = ReadinessPhase.FAILED
+            self.state.message = f"MLX distributed init failed: {exc}"
+            raise
+
+        self.state.rank = int(self._group.rank())
+        self.state.world_size = int(self._group.size())
+        self.state.backend = "mlx-distributed" if self.state.world_size > 1 else "single"
+
+        self.state.phase = ReadinessPhase.LOADING_MODEL
+        self._symbols = _MLXServerSymbols.load()
+        args = self._server_args()
+        self._provider = self._symbols.ModelProvider(args)
+        self._map_model_aliases(self._provider)
+        cache = self._symbols.LRUPromptCache(args.prompt_cache_size)
+        self._generator = self._symbols.ResponseGenerator(self._provider, cache)
+        self.state.message = "Loading model across MLX ranks."
+        self._load_monitor = threading.Thread(target=self._monitor_model_load, daemon=True)
+        self._load_monitor.start()
+
+    def is_rank0(self) -> bool:
+        return self.state.rank == 0
+
+    def join(self) -> None:
+        if self._generator is not None:
+            self._generator.join()
+
+    def stop(self) -> None:
+        if self._generator is not None:
+            self.state.phase = ReadinessPhase.STOPPING
+            self._generator.stop_and_join()
+
+    def accepts_model(self, model: str) -> bool:
+        return model in {"default_model", self.model, self.model_id}
+
+    def models_payload(self) -> dict[str, object]:
+        if not self._is_serving_model():
+            raise RuntimeError(self.state.message or "Model is still loading.")
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": self.model_id,
+                    "object": "model",
+                    "owned_by": "tokenity",
+                    "path": self.model,
+                    "tokenity": self.state.to_dict(),
+                }
+            ],
+        }
+
+    def complete(self, request: ChatCompletionRequest) -> dict[str, object]:
+        result = self._complete_sync(request)
+        return {
+            "id": f"chatcmpl-tokenity-{uuid.uuid4()}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": self.model_id,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": _message_payload(result.text, result.reasoning),
+                    "finish_reason": result.finish_reason,
+                }
+            ],
+            "usage": {
+                "prompt_tokens": result.prompt_tokens,
+                "completion_tokens": result.completion_tokens,
+                "total_tokens": result.prompt_tokens + result.completion_tokens,
+                "prompt_tokens_details": {
+                    "cached_tokens": result.prompt_cache_tokens or 0,
+                },
+            },
+        }
+
+    async def stream(self, request: ChatCompletionRequest) -> AsyncIterator[str]:
+        ctx = None
+        finish_reason = "stop"
+        try:
+            ctx, responses = await asyncio.to_thread(self._begin_generation, request)
+            self.state.phase = ReadinessPhase.GENERATING
+            while True:
+                item = await asyncio.to_thread(_next_response, responses)
+                if item is _DONE:
+                    break
+                finish_reason = getattr(item, "finish_reason", None) or finish_reason
+                payload = _stream_payload(item, self.model_id, finish_reason=None)
+                if payload is not None:
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            final = {
+                "id": f"chatcmpl-tokenity-{uuid.uuid4()}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": self.model_id,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": finish_reason,
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+        finally:
+            if ctx is not None:
+                ctx.stop()
+            self.state.phase = ReadinessPhase.READY
+
+    def _complete_sync(self, request: ChatCompletionRequest) -> _GenerationResult:
+        ctx = None
+        text = ""
+        reasoning = ""
+        finish_reason = "stop"
+        tokens = 0
+        try:
+            ctx, responses = self._begin_generation(request)
+            self.state.phase = ReadinessPhase.GENERATING
+            for item in responses:
+                tokens += 1
+                finish_reason = item.finish_reason or finish_reason
+                if item.state == "reasoning":
+                    reasoning += item.text
+                elif item.state != "tool":
+                    text += item.text
+            return _GenerationResult(
+                text=text,
+                reasoning=reasoning,
+                finish_reason=finish_reason,
+                prompt_tokens=len(ctx.prompt),
+                completion_tokens=tokens,
+                prompt_cache_tokens=ctx.prompt_cache_count,
+            )
+        finally:
+            if ctx is not None:
+                ctx.stop()
+            self.state.phase = ReadinessPhase.READY
+
+    def _begin_generation(self, request: ChatCompletionRequest) -> tuple[Any, Iterator[Any]]:
+        if self._symbols is None or self._generator is None:
+            raise RuntimeError("Tokenity distributed runtime has not started.")
+        if not self._is_serving_model():
+            raise RuntimeError(self.state.message or "Model is still loading.")
+        if not self.accepts_model(request.model):
+            raise ValueError(f"Model is not loaded: {request.model}")
+        self.state.phase = ReadinessPhase.PREFILL_PENDING
+        completion_request = self._symbols.CompletionRequest(
+            "chat",
+            "",
+            request.messages,
+            request.tools,
+            request.role_mapping,
+        )
+        return self._generator.generate(
+            completion_request,
+            self._generation_args(request),
+        )
+
+    def _generation_args(self, request: ChatCompletionRequest) -> Any:
+        assert self._symbols is not None
+        max_tokens = request.max_tokens or self.max_tokens
+        return self._symbols.GenerationArguments(
+            model=self._symbols.ModelDescription(
+                model="default_model",
+                draft="default_model",
+                adapter=None,
+            ),
+            sampling=self._symbols.SamplingArguments(
+                temperature=request.temperature if request.temperature is not None else 0.0,
+                top_p=request.top_p if request.top_p is not None else 1.0,
+                top_k=request.top_k if request.top_k is not None else 0,
+                min_p=request.min_p if request.min_p is not None else 0.0,
+                xtc_probability=0.0,
+                xtc_threshold=0.0,
+            ),
+            logits=self._symbols.LogitsProcessorArguments(
+                logit_bias=None,
+                repetition_penalty=0.0,
+                repetition_context_size=20,
+                presence_penalty=0.0,
+                presence_context_size=20,
+                frequency_penalty=0.0,
+                frequency_context_size=20,
+            ),
+            stop_words=_stop_words(request.stop),
+            max_tokens=max_tokens,
+            num_draft_tokens=0,
+            logprobs=False,
+            top_logprobs=-1,
+            seed=request.seed,
+            chat_template_kwargs=request.chat_template_kwargs,
+        )
+
+    def _server_args(self) -> argparse.Namespace:
+        return argparse.Namespace(
+            model=self.model,
+            adapter_path=None,
+            draft_model=None,
+            num_draft_tokens=0,
+            trust_remote_code=self.trust_remote_code,
+            chat_template="",
+            use_default_chat_template=False,
+            temp=0.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            max_tokens=self.max_tokens,
+            chat_template_args={},
+            decode_concurrency=1,
+            prompt_concurrency=1,
+            prefill_step_size=2048,
+            prompt_cache_size=4,
+            prompt_cache_bytes=None,
+            pipeline=False,
+            allowed_origins=["*"],
+        )
+
+    def _map_model_aliases(self, provider: Any) -> None:
+        model_map = getattr(provider, "_model_map", None)
+        if isinstance(model_map, dict):
+            model_map[self.model] = self.model
+            model_map[self.model_id] = self.model
+
+    def _is_serving_model(self) -> bool:
+        return self.state.phase in {
+            ReadinessPhase.READY,
+            ReadinessPhase.PREFILL_PENDING,
+            ReadinessPhase.GENERATING,
+        }
+
+    def _monitor_model_load(self) -> None:
+        assert self._generator is not None
+        assert self._provider is not None
+        generation_thread = getattr(self._generator, "_generation_thread", None)
+        while self.state.phase not in {ReadinessPhase.FAILED, ReadinessPhase.STOPPING}:
+            if getattr(self._provider, "model", None) is not None:
+                if self.state.phase == ReadinessPhase.LOADING_MODEL:
+                    self.state.phase = ReadinessPhase.READY
+                    self.state.message = "Runtime is accepting generation requests."
+                return
+            if generation_thread is not None and not generation_thread.is_alive():
+                self.state.phase = ReadinessPhase.FAILED
+                self.state.message = "MLX-LM generation thread exited before the model finished loading."
+                return
+            time.sleep(0.5)
+
+
+def create_app(
+    *,
+    model: str,
+    require_mlx: bool = False,
+    runtime: TokenityDistributedRuntime | None = None,
+) -> FastAPI:
+    state = runtime.state if runtime is not None else ReadinessState(model=model)
     app = FastAPI(title="Tokenity Distributed OpenAI Server", version="0.1.0")
 
     @app.on_event("startup")
     async def startup() -> None:
-        await _initialize_runtime(state, require_mlx=require_mlx)
+        if runtime is None:
+            await _initialize_skeleton_runtime(state, require_mlx=require_mlx)
+
+    @app.on_event("shutdown")
+    def shutdown() -> None:
+        if runtime is not None:
+            runtime.stop()
 
     @app.get("/v1/readiness")
     def readiness() -> dict[str, object]:
@@ -34,6 +564,11 @@ def create_app(*, model: str, require_mlx: bool = False) -> FastAPI:
     def models() -> dict[str, object]:
         if state.phase == ReadinessPhase.FAILED:
             raise HTTPException(status_code=503, detail=state.message or "runtime failed")
+        if runtime is not None:
+            try:
+                return runtime.models_payload()
+            except RuntimeError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
         return {
             "object": "list",
             "data": [
@@ -50,57 +585,34 @@ def create_app(*, model: str, require_mlx: bool = False) -> FastAPI:
     async def chat(request: ChatCompletionRequest):
         if state.phase == ReadinessPhase.FAILED:
             raise HTTPException(status_code=503, detail=state.message or "runtime failed")
+        if runtime is None:
+            if request.stream:
+                return StreamingResponse(_stream_skeleton(state), media_type="text/event-stream")
+            return _skeleton_completion(model=request.model)
         if request.stream:
-            return StreamingResponse(_stream_skeleton(state, request), media_type="text/event-stream")
-        return {
-            "id": f"chatcmpl-tokenity-skeleton-{int(time.time())}",
-            "object": "chat.completion",
-            "model": request.model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "Tokenity distributed OpenAI server skeleton is running; generation loop is not implemented yet.",
-                    },
-                    "finish_reason": "stop",
-                }
-            ],
-        }
+            return StreamingResponse(runtime.stream(request), media_type="text/event-stream")
+        try:
+            return await asyncio.to_thread(runtime.complete, request)
+        except Exception as exc:
+            logging.exception("Tokenity generation failed")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return app
 
 
-async def _initialize_runtime(state: ReadinessState, *, require_mlx: bool) -> None:
+async def _initialize_skeleton_runtime(state: ReadinessState, *, require_mlx: bool) -> None:
     state.phase = ReadinessPhase.DISTRIBUTED_INIT
-    state.rank = _env_int("RANK", _env_int("OMPI_COMM_WORLD_RANK", 0))
-    state.world_size = _env_int("WORLD_SIZE", _env_int("OMPI_COMM_WORLD_SIZE", 1))
-    state.backend = "mlx-distributed" if state.world_size > 1 else "single"
-
-    try:
-        import mlx.core as mx  # type: ignore
-
-        if state.world_size > 1:
-            mx.distributed.init()
-    except Exception as exc:  # pragma: no cover - depends on target MLX runtime
-        if require_mlx:
-            state.phase = ReadinessPhase.FAILED
-            state.message = f"MLX distributed init failed: {exc}"
-            return
-        state.message = f"MLX unavailable in skeleton mode: {exc}"
-
-    state.phase = ReadinessPhase.LOADING_MODEL
-    await asyncio.sleep(0)
+    state.rank = 0
+    state.world_size = 1
+    state.backend = "skeleton"
+    if require_mlx:
+        state.phase = ReadinessPhase.FAILED
+        state.message = "MLX runtime was required but no runtime was attached."
+        return
     state.phase = ReadinessPhase.READY
 
 
-async def _stream_skeleton(
-    state: ReadinessState,
-    request: ChatCompletionRequest,
-) -> AsyncIterator[str]:
-    state.phase = ReadinessPhase.PREFILL_PENDING
-    yield ": tokenity prefill keep-alive\n\n"
-    await asyncio.sleep(0)
+async def _stream_skeleton(state: ReadinessState) -> AsyncIterator[str]:
     state.phase = ReadinessPhase.GENERATING
     yield (
         "data: "
@@ -112,15 +624,106 @@ async def _stream_skeleton(
     state.phase = ReadinessPhase.READY
 
 
-def _env_int(name: str, default: int) -> int:
+def _skeleton_completion(*, model: str) -> dict[str, object]:
+    return {
+        "id": f"chatcmpl-tokenity-skeleton-{int(time.time())}",
+        "object": "chat.completion",
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Tokenity distributed OpenAI server skeleton is running; generation loop is not attached in this test process.",
+                },
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+
+def _message_payload(content: str, reasoning: str) -> dict[str, str]:
+    payload = {"role": "assistant", "content": content}
+    if reasoning:
+        payload["reasoning_content"] = reasoning
+    return payload
+
+
+def _stream_payload(item: Any, model_id: str, finish_reason: str | None) -> dict[str, object] | None:
+    if not getattr(item, "text", "") and finish_reason is None:
+        return None
+    delta: dict[str, object] = {}
+    if item.state == "reasoning":
+        delta["reasoning_content"] = item.text
+    elif item.state != "tool":
+        delta["content"] = item.text
+    else:
+        return None
+    return {
+        "id": f"chatcmpl-tokenity-{uuid.uuid4()}",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model_id,
+        "choices": [
+            {
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason,
+            }
+        ],
+    }
+
+
+def _stop_words(value: str | list[str] | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return value
+
+
+_DONE = object()
+
+
+def _next_response(iterator: Iterator[Any]) -> Any:
     try:
-        return int(os.environ.get(name, default))
-    except ValueError:
-        return default
+        return next(iterator)
+    except StopIteration:
+        return _DONE
 
 
-def serve(*, model: str, host: str, port: int, require_mlx: bool = False) -> None:
+def serve(
+    *,
+    model: str,
+    host: str,
+    port: int,
+    require_mlx: bool = False,
+    trust_remote_code: bool = False,
+) -> None:
     import uvicorn
 
-    uvicorn.run(create_app(model=model, require_mlx=require_mlx), host=host, port=port)
+    state = ReadinessState(model=model)
+    runtime: TokenityDistributedRuntime | None = None
+    try:
+        runtime = TokenityDistributedRuntime(
+            model=model,
+            state=state,
+            trust_remote_code=trust_remote_code,
+        )
+        runtime.start()
+    except Exception as exc:  # pragma: no cover - depends on target MLX runtime
+        logging.exception("Tokenity distributed runtime failed during startup")
+        state.phase = ReadinessPhase.FAILED
+        state.message = f"Tokenity distributed runtime failed: {exc}"
+        if require_mlx:
+            raise
 
+    if runtime is not None and not runtime.is_rank0():
+        runtime.join()
+        return
+
+    uvicorn.run(
+        create_app(model=model, require_mlx=require_mlx, runtime=runtime),
+        host=host,
+        port=port,
+    )

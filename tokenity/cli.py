@@ -67,6 +67,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Fail readiness if MLX/MLX-LM imports are unavailable.",
     )
+    distributed_serve.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow tokenizer remote code when the selected model needs it.",
+    )
     distributed_serve.set_defaults(handler=_run_distributed_serve)
 
     distributed_plan = distributed_sub.add_parser("launch-plan", help="Preview Tokenity distributed launch.")
@@ -141,7 +146,13 @@ def _run_distributed_launch_plan(args: argparse.Namespace) -> int:
 def _run_distributed_serve(args: argparse.Namespace) -> int:
     from .serving.distributed_openai import serve
 
-    serve(model=args.model, host=args.host, port=args.port, require_mlx=args.require_mlx)
+    serve(
+        model=args.model,
+        host=args.host,
+        port=args.port,
+        require_mlx=args.require_mlx,
+        trust_remote_code=args.trust_remote_code,
+    )
     return 0
 
 
@@ -181,4 +192,3 @@ def _json(payload: Any, *, pretty: bool = False) -> str:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

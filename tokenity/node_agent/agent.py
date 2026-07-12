@@ -3,13 +3,15 @@ from __future__ import annotations
 import getpass
 import importlib.metadata
 import json
+import os
 import platform
 import socket
+import subprocess
 import sys
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Literal
+from typing import List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -30,10 +32,10 @@ DEFAULT_MODEL_ROOT = "/Users/Shared/TokenityModels"
 class ClusterNodePayload(BaseModel):
     id: str
     ssh: str
-    lan_ip: str | None = None
-    rdma_ip: str | None = None
-    rdma_devices: list[str] = Field(default_factory=list)
-    rdma_matrix_row: list[str | None] | None = None
+    lan_ip: Optional[str] = None
+    rdma_ip: Optional[str] = None
+    rdma_devices: List[str] = Field(default_factory=list)
+    rdma_matrix_row: Optional[List[Optional[str]]] = None
 
     def to_cluster_node(self) -> ClusterNode:
         return ClusterNode(
@@ -48,7 +50,7 @@ class ClusterNodePayload(BaseModel):
 
 class StartRequest(BaseModel):
     model: str
-    nodes: list[ClusterNodePayload] = Field(default_factory=list)
+    nodes: List[ClusterNodePayload] = Field(default_factory=list)
     connection_mode: ConnectionMode = ConnectionMode.RING
     python: str = Field(default_factory=lambda: sys.executable)
     starting_port: int = 29500
@@ -73,6 +75,7 @@ def create_app(
     @app.get("/v1/node/info")
     def node_info() -> dict[str, object]:
         rdma: RDMAProbeResult = rdma_probe_fn()
+        memory = _memory_stats()
         return {
             "node_id": _node_id(),
             "hostname": socket.gethostname(),
@@ -87,6 +90,7 @@ def create_app(
             "tokenity_version": __version__,
             "available_ports": {"agent": 9100, "openai": 8000, "mlx_starting_port": 29500},
             "process_roles": [status.__dict__ for status in roles.status()],  # type: ignore[union-attr]
+            "memory": memory,
             "rdma": rdma.to_dict(),
         }
 
@@ -96,7 +100,10 @@ def create_app(
 
     @app.get("/v1/node/status")
     def node_status() -> dict[str, object]:
-        return {"roles": [status.__dict__ for status in roles.status()]}  # type: ignore[union-attr]
+        return {
+            "roles": [status.__dict__ for status in roles.status()],  # type: ignore[union-attr]
+            "memory": _memory_stats(),
+        }
 
     @app.post("/v1/node/start-official-mlx-lm")
     def start_official(request: StartRequest) -> dict[str, object]:
@@ -224,3 +231,63 @@ def _local_ipv4s() -> list[str]:
 def _node_id() -> str:
     return f"{getpass.getuser()}@{socket.gethostname()}"
 
+
+def _memory_stats() -> dict[str, object]:
+    total = _total_memory_bytes()
+    vm = _vm_stat_pages()
+    if total is None or vm is None:
+        return {
+            "total_bytes": total,
+            "used_bytes": None,
+            "free_bytes": None,
+            "used_ratio": None,
+        }
+
+    page_size = vm["page_size"]
+    free_pages = vm["pages"].get("Pages free", 0) + vm["pages"].get("Pages speculative", 0)
+    free = max(0, free_pages * page_size)
+    used = max(0, total - free)
+    return {
+        "total_bytes": total,
+        "used_bytes": used,
+        "free_bytes": free,
+        "used_ratio": used / total if total > 0 else None,
+    }
+
+
+def _total_memory_bytes() -> int | None:
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _vm_stat_pages() -> dict[str, object] | None:
+    try:
+        completed = subprocess.run(
+            ["/usr/bin/vm_stat"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    page_size = 4096
+    pages: dict[str, int] = {}
+    for raw_line in completed.stdout.splitlines():
+        line = raw_line.strip().rstrip(".")
+        if "page size of" in line:
+            try:
+                page_size = int(line.split("page size of", 1)[1].split("bytes", 1)[0].strip())
+            except (IndexError, ValueError):
+                page_size = 4096
+            continue
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        digits = "".join(char for char in value if char.isdigit())
+        if digits:
+            pages[key] = int(digits)
+    return {"page_size": page_size, "pages": pages}

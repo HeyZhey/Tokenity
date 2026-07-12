@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum
 
 
-class ReadinessPhase(StrEnum):
+class ReadinessPhase(str, Enum):
     LAUNCHING = "launching"
     DISTRIBUTED_INIT = "distributed_init"
     LOADING_MODEL = "loading_model"
@@ -16,7 +16,7 @@ class ReadinessPhase(StrEnum):
     STOPPING = "stopping"
 
 
-@dataclass(slots=True)
+@dataclass
 class ReadinessState:
     phase: ReadinessPhase = ReadinessPhase.LAUNCHING
     rank: int = 0
@@ -34,4 +34,3 @@ class ReadinessState:
             "model": self.model,
             "message": self.message,
         }
-

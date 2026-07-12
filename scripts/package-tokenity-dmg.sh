@@ -14,6 +14,12 @@ RUNTIME_SOURCE="${TOKENITY_RUNTIME_SOURCE:-/Users/Shared/TokenityRuntime}"
 RUNTIME_REMOTE="${TOKENITY_RUNTIME_REMOTE:-apple@192.168.5.23:/Users/Shared/TokenityRuntime/}"
 PKG_PATH="$DIST_DIR/Tokenity-${VERSION}.pkg"
 DMG_PATH="$DIST_DIR/Tokenity-${VERSION}.dmg"
+BACKEND_SOURCE="$ROOT/tokenity/serving/distributed_openai.py"
+
+if ! grep -q '^class TokenityDistributedRuntime' "$BACKEND_SOURCE"; then
+  echo "Refusing to package a skeleton-only Tokenity backend." >&2
+  exit 1
+fi
 
 rsync_excludes=(
   --exclude ".DS_Store"

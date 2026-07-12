@@ -1,9 +1,16 @@
 # Tokenity
 
-Tokenity is a clean rebuild of the Mac-native control plane for multi-machine
-MLX/MLX-LM inference. This repository intentionally starts from a fresh
-workspace and treats the old `MLX-Distributed` tree only as read-only product
-and experiment context.
+Tokenity is the Mac-native control plane for multi-machine MLX/MLX-LM
+inference. The `stable-baseline` branch combines the current SwiftUI control
+app with the distributed Qwen runtime that was validated on the Mango/Kiwi
+two-Mac cluster. The old `MLX-Distributed` tree is now read-only migration
+history; active development belongs in this repository.
+
+The isolated development worktree for this baseline is:
+
+```text
+/Users/zxc/Documents/Tokenity-Stable
+```
 
 ## First Milestone
 
@@ -14,7 +21,8 @@ and experiment context.
   dry runs, and local process supervision hooks
 - Fresh SwiftUI macOS app skeleton in `apps/TokenityControl`
 - Experimental official `mlx_lm server` launch-plan preview
-- Tokenity-owned distributed OpenAI server skeleton with readiness phases
+- Tokenity-owned distributed OpenAI server with sharded MLX-LM loading,
+  OpenAI-compatible streaming, reasoning output, and readiness phases
 
 ## Development
 
@@ -38,6 +46,13 @@ cd apps/TokenityControl
 swift build
 ```
 
+Run the complete baseline verification (Python tests, Swift tests, and a fresh
+app bundle build):
+
+```bash
+./scripts/verify-stable-baseline.sh
+```
+
 ## Safety Notes
 
 - SSH passwords are never stored in source, config, or logs.
@@ -45,4 +60,3 @@ swift build
   Thunderbolt IP data.
 - Official `mlx_lm server` mode is labelled Experimental because the target
   A/B multi-node chat path has not yet been stable for large models.
-

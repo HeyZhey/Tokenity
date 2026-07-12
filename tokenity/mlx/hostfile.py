@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import Enum
 from typing import Any
 
 
-class ConnectionMode(StrEnum):
+class ConnectionMode(str, Enum):
     RING = "ring"
     JACCL = "jaccl"
     JACCL_RING = "jaccl-ring"
@@ -15,7 +15,7 @@ class HostfileError(ValueError):
     pass
 
 
-@dataclass(slots=True)
+@dataclass
 class ClusterNode:
     id: str
     ssh: str
@@ -105,4 +105,3 @@ def _build_jaccl_hostfile(
 
         rows.append({"ssh": node.ssh, "ips": ips, "rdma": rdma_row})
     return rows
-
