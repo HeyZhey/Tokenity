@@ -52,6 +52,22 @@ enum BackendMode: String, CaseIterable, Identifiable {
     case singleNode = "Single-Mac Tokenity Server"
 
     var id: String { rawValue }
+
+    var shortName: String {
+        switch self {
+        case .official: return "Official MLX-LM"
+        case .distributed: return "Tokenity Distributed"
+        case .singleNode: return "Single Mac"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .official: return "Upstream MLX-LM server; experimental in Tokenity."
+        case .distributed: return "Tokenity-managed inference across the selected Macs."
+        case .singleNode: return "Run inference on one selected Mac only."
+        }
+    }
 }
 
 enum ConnectionMode: String, CaseIterable, Identifiable {
@@ -60,6 +76,22 @@ enum ConnectionMode: String, CaseIterable, Identifiable {
     case jacclRing = "Thunderbolt + Fallback"
 
     var id: String { rawValue }
+
+    var shortName: String {
+        switch self {
+        case .ring: return "Standard Network"
+        case .jaccl: return "Thunderbolt RDMA"
+        case .jacclRing: return "RDMA + Fallback"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .ring: return "Use the regular LAN when Thunderbolt RDMA is unavailable."
+        case .jaccl: return "Use the dedicated Thunderbolt RDMA link for maximum throughput."
+        case .jacclRing: return "Prefer RDMA and keep a standard-network fallback path."
+        }
+    }
 
     var cliValue: String {
         switch self {

@@ -147,6 +147,8 @@ struct OverviewPage: View {
 
 struct ClusterPage: View {
     @EnvironmentObject private var store: TokenityStore
+    @Environment(\.tokenityTheme) private var theme
+    @State private var showsAdvancedSetup = false
 
     var body: some View {
         PageScaffold(title: "Cluster") {
@@ -160,30 +162,28 @@ struct ClusterPage: View {
             }
 
             InfoGroup(title: "Cluster Setup") {
-                InfoRow(label: "Backend") {
-                    Picker("", selection: $store.backendMode) {
-                        ForEach(BackendMode.allCases) { mode in
-                            Text(mode.rawValue).tag(mode)
-                        }
+                InfoRow(label: "Runtime") {
+                    HStack(spacing: 10) {
+                        Label(store.backendMode.shortName, systemImage: "server.rack")
+                            .lineLimit(1)
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(theme.tertiaryText)
+                        Label(store.connectionMode.shortName, systemImage: connectionSymbol)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
                     }
-                    .pickerStyle(.menu)
-                }
-                InfoRow(label: "Connection") {
-                    Picker("", selection: $store.connectionMode) {
-                        ForEach(ConnectionMode.allCases) { mode in
-                            Text(mode.rawValue).tag(mode)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .frame(maxWidth: 360)
                 }
                 InfoRow(label: "Actions") {
-                    HStack {
+                    HStack(spacing: 10) {
                         Button {
                             store.phase == .running ? store.restart() : store.createCluster()
                         } label: {
-                            Label(store.phase == .running ? "Recreate Cluster" : "Create Cluster", systemImage: store.phase == .running ? "arrow.clockwise" : "play.fill")
+                            Label(store.phase == .running ? "Restart Cluster" : "Create Cluster", systemImage: store.phase == .running ? "arrow.clockwise" : "play.fill")
                         }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
+                        .tint(theme.accent)
                         .disabled(!store.launchPreview.readinessIssues.isEmpty || store.selectedNodes.isEmpty)
 
                         Button {
@@ -191,13 +191,55 @@ struct ClusterPage: View {
                         } label: {
                             Label("Stop Cluster", systemImage: "stop.fill")
                         }
+                        .buttonStyle(.bordered)
+                        .controlSize(.large)
+                        .tint(theme.danger)
                         .disabled(store.phase == .stopped)
 
                         Button {
                             Task { await store.refreshLocalAgent() }
                         } label: {
-                            Label("Refresh This Mac", systemImage: "arrow.clockwise")
+                            Label("Refresh Status", systemImage: "arrow.triangle.2.circlepath")
                         }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(theme.secondaryText)
+                        .help("Refresh node status")
+                        Spacer(minLength: 0)
+                    }
+                }
+                InfoRow(label: "Advanced") {
+                    DisclosureGroup(isExpanded: $showsAdvancedSetup) {
+                        VStack(alignment: .leading, spacing: 14) {
+                            advancedPicker(
+                                title: "Inference backend",
+                                detail: store.backendMode.detail
+                            ) {
+                                Picker("Inference backend", selection: $store.backendMode) {
+                                    ForEach(BackendMode.allCases) { mode in
+                                        Text(mode.shortName).tag(mode)
+                                    }
+                                }
+                                .labelsHidden()
+                                .pickerStyle(.menu)
+                            }
+
+                            advancedPicker(
+                                title: "Mac-to-Mac connection",
+                                detail: store.connectionMode.detail
+                            ) {
+                                Picker("Mac-to-Mac connection", selection: $store.connectionMode) {
+                                    ForEach(ConnectionMode.allCases) { mode in
+                                        Text(mode.shortName).tag(mode)
+                                    }
+                                }
+                                .labelsHidden()
+                                .pickerStyle(.menu)
+                            }
+                        }
+                        .padding(.top, 12)
+                    } label: {
+                        Text("Backend and connection options")
+                            .foregroundStyle(theme.secondaryText)
                     }
                 }
             }
@@ -234,6 +276,33 @@ struct ClusterPage: View {
                     }
                 }
             }
+        }
+    }
+
+    private var connectionSymbol: String {
+        switch store.connectionMode {
+        case .ring: return "network"
+        case .jaccl: return "bolt.horizontal.fill"
+        case .jacclRing: return "arrow.triangle.branch"
+        }
+    }
+
+    private func advancedPicker<PickerContent: View>(
+        title: String,
+        detail: String,
+        @ViewBuilder picker: () -> PickerContent
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text(title)
+                    .font(.tokenityText(12, weight: .medium))
+                Spacer(minLength: 12)
+                picker()
+            }
+            Text(detail)
+                .font(.tokenityText(11))
+                .foregroundStyle(theme.tertiaryText)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }
@@ -485,15 +554,15 @@ struct ChatPage: View {
                     .background(theme.window)
             }
 
+            ChatHistoryToggleRail(isExpanded: $showsHistory)
+
             if showsHistory {
                 Divider()
                 ChatHistorySidebar()
                     .frame(width: 270)
-                    .transition(.move(edge: .trailing).combined(with: .opacity))
             }
         }
         .frame(minWidth: 860, minHeight: 650)
-        .animation(.easeInOut(duration: 0.18), value: showsHistory)
     }
 
     private var chatHeader: some View {
@@ -513,11 +582,6 @@ struct ChatPage: View {
                     Label("New Chat", systemImage: "square.and.pencil")
                 }
                 .disabled(store.isChatRunning)
-                Button {
-                    showsHistory.toggle()
-                } label: {
-                    Label(showsHistory ? "Hide History" : "Show History", systemImage: "sidebar.right")
-                }
                 StatusPill(text: chatStatusText, tone: chatStatusTone)
             }
 
@@ -587,6 +651,40 @@ struct ChatPage: View {
     private func speedText(_ value: Double?) -> String {
         guard let value else { return "-" }
         return String(format: "%.1f tok/s", value)
+    }
+}
+
+private struct ChatHistoryToggleRail: View {
+    @Binding var isExpanded: Bool
+
+    @Environment(\.tokenityTheme) private var theme
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Spacer()
+                .frame(height: 92)
+            Button {
+                isExpanded.toggle()
+            } label: {
+                Image(systemName: isExpanded ? "chevron.right" : "chevron.left")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(theme.secondaryText)
+                    .frame(width: 20, height: 42)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .background(theme.group, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(theme.border.opacity(0.8), lineWidth: 0.5)
+            )
+            .help(isExpanded ? "Collapse chat history" : "Expand chat history")
+            .accessibilityLabel(isExpanded ? "Collapse chat history" : "Expand chat history")
+            Spacer(minLength: 0)
+        }
+        .frame(width: 24)
+        .frame(maxHeight: .infinity)
+        .background(theme.window)
     }
 }
 
