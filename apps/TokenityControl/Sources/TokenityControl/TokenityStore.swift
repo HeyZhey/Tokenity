@@ -77,16 +77,16 @@ final class TokenityStore: ObservableObject {
     @Published var isScanningModels = false
     @Published var modelScanSummary = "Not scanned"
     @Published var modelLoadMessage = "No model loaded"
+    private static let initialChatSession = ChatSession.fresh()
+
     @Published var chatInput = ""
-    @Published var chatMessages: [ChatMessage] = [
-        ChatMessage(
-            role: .assistant,
-            content: "Create a cluster, load a model, then send a prompt to measure first response and total generation time.",
-            includeInContext: false
-        )
-    ]
-    @Published var chatMetrics = ChatMetrics.empty
+    @Published var chatMessages: [ChatMessage] = TokenityStore.initialChatSession.messages
+    @Published var chatMetrics = TokenityStore.initialChatSession.metrics
     @Published var isChatRunning = false
+    @Published private(set) var chatSessions: [ChatSession] = [TokenityStore.initialChatSession]
+    @Published private(set) var activeChatSessionID: UUID = TokenityStore.initialChatSession.id
+    @Published private(set) var chatScrollRevision = 0
+    @Published private(set) var apiAccessStatus = "Not checked"
     @Published private(set) var modelConfigurations: [String: ModelRuntimeConfiguration] = [:]
     @Published var logs: [String] = [
         "Tokenity Control opened.",
@@ -97,6 +97,7 @@ final class TokenityStore: ObservableObject {
     private let lineStreamTransport: LineStreamTransport
     private let userDefaults: UserDefaults
     private let modelConfigurationsKey = "TokenityModelRuntimeConfigurations.v1"
+    private let chatSessionsKey = "TokenityChatSessions.v1"
     private let mlxStartingPort = 30020
     private var loadedBackendRole: String?
     private var loadedServiceModelName: String?
@@ -113,6 +114,14 @@ final class TokenityStore: ObservableObject {
            let decoded = try? JSONDecoder().decode([String: ModelRuntimeConfiguration].self, from: data) {
             modelConfigurations = decoded
         }
+        if let data = userDefaults.data(forKey: chatSessionsKey),
+           let decoded = try? JSONDecoder().decode([ChatSession].self, from: data),
+           let latest = decoded.sorted(by: { $0.updatedAt > $1.updatedAt }).first {
+            chatSessions = decoded.sorted(by: { $0.updatedAt > $1.updatedAt })
+            activeChatSessionID = latest.id
+            chatMessages = latest.messages
+            chatMetrics = latest.metrics
+        }
         rebuildLaunchPreview()
     }
 
@@ -126,6 +135,22 @@ final class TokenityStore: ObservableObject {
 
     var openAIEndpoint: String {
         isChatReady ? "Ready for chat" : "Create a cluster and load a model"
+    }
+
+    var openAIAPIBaseURL: String {
+        guard
+            let agentURL = coordinator?.agentURL,
+            var components = URLComponents(string: agentURL),
+            components.host != nil
+        else { return "Unavailable" }
+        components.port = 8000
+        components.path = "/v1"
+        components.query = nil
+        return components.url?.absoluteString ?? "Unavailable"
+    }
+
+    var externalAPIModelName: String {
+        loadedServiceModelName ?? loadedModelName ?? "Load a model first"
     }
 
     var selectedModelName: String {
@@ -160,6 +185,66 @@ final class TokenityStore: ObservableObject {
         appendLog("Updated runtime configuration for \(modelID).")
     }
 
+    func newChatSession() {
+        guard !isChatRunning else { return }
+        syncActiveChatSession()
+        let session = ChatSession.fresh()
+        chatSessions.insert(session, at: 0)
+        activeChatSessionID = session.id
+        chatMessages = session.messages
+        chatMetrics = session.metrics
+        chatInput = ""
+        chatScrollRevision += 1
+        persistChatSessions()
+    }
+
+    func selectChatSession(_ sessionID: UUID) {
+        guard !isChatRunning, sessionID != activeChatSessionID else { return }
+        syncActiveChatSession()
+        guard let session = chatSessions.first(where: { $0.id == sessionID }) else { return }
+        activeChatSessionID = session.id
+        chatMessages = session.messages
+        chatMetrics = session.metrics
+        chatInput = ""
+        chatScrollRevision += 1
+    }
+
+    func deleteChatSession(_ sessionID: UUID) {
+        guard !isChatRunning else { return }
+        chatSessions.removeAll { $0.id == sessionID }
+        if chatSessions.isEmpty {
+            let session = ChatSession.fresh()
+            chatSessions = [session]
+        }
+        if sessionID == activeChatSessionID,
+           let next = chatSessions.sorted(by: { $0.updatedAt > $1.updatedAt }).first {
+            activeChatSessionID = next.id
+            chatMessages = next.messages
+            chatMetrics = next.metrics
+            chatInput = ""
+            chatScrollRevision += 1
+        }
+        persistChatSessions()
+    }
+
+    func testExternalAPI() async {
+        guard openAIAPIBaseURL.hasPrefix("http"),
+              let url = URL(string: "\(openAIAPIBaseURL)/models") else {
+            apiAccessStatus = "Unavailable"
+            return
+        }
+        do {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 5
+            let (data, response) = try await dataTransport(request)
+            try validate(response, data: data)
+            _ = try JSONDecoder().decode(OpenAIModelsResponse.self, from: data)
+            apiAccessStatus = "Reachable"
+        } catch {
+            apiAccessStatus = "Not ready"
+        }
+    }
+
     var modelLibraryRows: [ModelLibraryRow] {
         let grouped = Dictionary(grouping: selectedNodes.flatMap { node in
             node.models.map { (node, $0) }
@@ -168,14 +253,21 @@ final class TokenityStore: ObservableObject {
         return grouped.keys.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }.map { modelID in
             let entries = grouped[modelID] ?? []
             let nodeNames = entries.map { $0.0.displayName }.sorted()
-            let path = entries.first?.1.path ?? "\(modelRoot)/\(modelID)"
+            let modelEntries = entries.map(\.1)
+            let representative = modelEntries.first
+            let path = representative?.path ?? "\(modelRoot)/\(modelID)"
             return ModelLibraryRow(
                 id: modelID,
                 displayName: modelID,
                 nodes: nodeNames,
                 availability: "\(nodeNames.count)/\(selectedNodes.count) selected Macs",
                 loadState: modelLoadStates[modelID, default: .notLoaded],
-                representativePath: path
+                representativePath: path,
+                format: modelEntries.compactMap(\.format).first,
+                quantization: modelEntries.compactMap(\.quantization).first,
+                sizeBytes: modelEntries.compactMap(\.sizeBytes).max(),
+                architecture: modelEntries.compactMap(\.architecture).first,
+                shardCount: modelEntries.compactMap(\.shardCount).max()
             )
         }
     }
@@ -338,8 +430,7 @@ final class TokenityStore: ObservableObject {
             }
             let role = backendRole
             try await startBackendModel(row, role: role, configuration: configuration)
-            let expectedServiceName = configuration.normalizedAPIIdentifier ?? row.displayName
-            let serviceModelName = try await waitForModelService(modelName: expectedServiceName, role: role)
+            let serviceModelName = try await waitForModelService(modelName: row.displayName, role: role)
 
             states = modelLoadStates
             for key in states.keys where key != row.id {
@@ -404,6 +495,11 @@ final class TokenityStore: ObservableObject {
         let assistantIndex = chatMessages.count - 1
         isChatRunning = true
         chatMetrics = .empty
+        chatScrollRevision += 1
+        defer {
+            isChatRunning = false
+            syncActiveChatSession()
+        }
 
         let start = Date()
         var firstTokenAt: Date?
@@ -435,7 +531,6 @@ final class TokenityStore: ObservableObject {
             appendLog("Chat request could not complete: \(userFacingMessage(for: error))")
         }
 
-        isChatRunning = false
     }
 
     func createCluster() {
@@ -652,7 +747,6 @@ final class TokenityStore: ObservableObject {
             host: "0.0.0.0",
             port: 8000,
             dryRun: false,
-            apiIdentifier: configuration.normalizedAPIIdentifier,
             maxTokens: configuration.maximumOutputTokens,
             promptCacheSize: configuration.promptCacheSize,
             prefillStepSize: configuration.prefillStepSize,
@@ -920,6 +1014,7 @@ final class TokenityStore: ObservableObject {
             let thinking = delta?.reasoningContent ?? delta?.reasoning
             if let thinking, !thinking.isEmpty {
                 chatMessages[assistantIndex].thinking = appendToken(thinking, to: chatMessages[assistantIndex].thinking)
+                chatScrollRevision += 1
                 if firstTokenAt == nil { firstTokenAt = Date() }
                 tokenEstimate += estimateTokens(thinking)
                 didReceiveThinking = true
@@ -929,6 +1024,7 @@ final class TokenityStore: ObservableObject {
                 let contentBefore = chatMessages[assistantIndex].content
                 let thinkingBefore = chatMessages[assistantIndex].thinking
                 appendAssistantContent(content, assistantIndex: assistantIndex)
+                chatScrollRevision += 1
                 tokenEstimate += estimateTokens(content)
                 didReceiveContent = didReceiveContent || chatMessages[assistantIndex].content != contentBefore
                 didReceiveThinking = didReceiveThinking || chatMessages[assistantIndex].thinking != thinkingBefore
@@ -973,6 +1069,29 @@ final class TokenityStore: ObservableObject {
             return token
         }
         return existing + token
+    }
+
+    private func syncActiveChatSession() {
+        guard let index = chatSessions.firstIndex(where: { $0.id == activeChatSessionID }) else { return }
+        var session = chatSessions[index]
+        session.messages = chatMessages
+        session.metrics = chatMetrics
+        session.updatedAt = Date()
+        if let firstPrompt = chatMessages.first(where: { $0.role == .user })?.content {
+            let clean = firstPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !clean.isEmpty {
+                session.title = String(clean.prefix(48))
+            }
+        }
+        chatSessions[index] = session
+        chatSessions.sort { $0.updatedAt > $1.updatedAt }
+        persistChatSessions()
+    }
+
+    private func persistChatSessions() {
+        if let encoded = try? JSONEncoder().encode(chatSessions) {
+            userDefaults.set(encoded, forKey: chatSessionsKey)
+        }
     }
 
     private func finishChatMetrics(start: Date, firstTokenAt: Date?, tokenEstimate: Int) {

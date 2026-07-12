@@ -58,9 +58,31 @@ app bundle build):
 Each model row in the Models page has a Configure action. Settings are saved
 per model and applied to later loads and chat requests. The default maximum
 output is `32768` tokens so reasoning models have room to finish their final
-answer. Configurable settings include the API identifier, sampling controls,
+answer. Configurable settings include sampling controls,
 prefill step size, prompt cache size, prompt/decode concurrency, and tokenizer
 remote-code trust.
+
+## Chat History
+
+Chat conversations are stored as separate sessions. The Chat page includes a
+collapsible right sidebar for creating, selecting, and deleting sessions.
+Thinking output is expanded by default and the transcript follows streaming
+generation automatically.
+
+## External API
+
+The API Access page exposes the active coordinator as an OpenAI-compatible
+backend for applications such as Cherry Studio and Msty. With the default A/B
+topology, the Base URL is:
+
+```text
+http://192.168.5.23:8000/v1
+```
+
+Supported endpoints include `GET /v1/models` and
+`POST /v1/chat/completions`, including streaming responses. Authentication is
+disabled on the local network; clients that require a non-empty key can use
+`tokenity-local` as a placeholder.
 
 ## Safety Notes
 

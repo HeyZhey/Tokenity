@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct TokenityRootView: View {
     @EnvironmentObject private var store: TokenityStore
@@ -15,12 +16,13 @@ struct TokenityRootView: View {
             case .chat: ChatPage()
             case .models: ModelsPage()
             case .network: NetworkPage()
+            case .api: APIAccessPage()
             case .logs: LogsPage()
             case .settings: SettingsPage()
             }
         }
         .navigationSplitViewStyle(.balanced)
-        .frame(minWidth: 920, idealWidth: 980, minHeight: 640, idealHeight: 700)
+        .frame(minWidth: 1_120, idealWidth: 1_280, minHeight: 720, idealHeight: 820)
         .background(theme.window)
         .task {
             await store.startStatusRefreshLoop()
@@ -445,29 +447,53 @@ struct NetworkPage: View {
 struct ChatPage: View {
     @EnvironmentObject private var store: TokenityStore
     @Environment(\.tokenityTheme) private var theme
+    @State private var showsHistory = true
+
+    private let chatBottomID = "tokenity-chat-bottom"
 
     var body: some View {
-        VStack(spacing: 0) {
-            chatHeader
-            Divider()
-            ScrollView {
-                LazyVStack(spacing: 14) {
-                    ForEach(store.chatMessages) { message in
-                        ChatBubble(message: message)
+        HStack(spacing: 0) {
+            VStack(spacing: 0) {
+                chatHeader
+                Divider()
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 14) {
+                            ForEach(store.chatMessages) { message in
+                                ChatBubble(message: message)
+                            }
+                            Color.clear
+                                .frame(height: 1)
+                                .id(chatBottomID)
+                        }
+                        .padding(24)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .scrollIndicators(.visible)
+                    .contentShape(Rectangle())
+                    .background(theme.window)
+                    .onAppear {
+                        proxy.scrollTo(chatBottomID, anchor: .bottom)
+                    }
+                    .onChange(of: store.chatScrollRevision) { _, _ in
+                        proxy.scrollTo(chatBottomID, anchor: .bottom)
                     }
                 }
-                .padding(24)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                Divider()
+                composer
+                    .padding(16)
+                    .background(theme.window)
             }
-            .scrollIndicators(.visible)
-            .contentShape(Rectangle())
-            .background(theme.window)
-            Divider()
-            composer
-                .padding(16)
-                .background(theme.window)
+
+            if showsHistory {
+                Divider()
+                ChatHistorySidebar()
+                    .frame(width: 270)
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
         }
-        .frame(minWidth: 700, minHeight: 620)
+        .frame(minWidth: 860, minHeight: 650)
+        .animation(.easeInOut(duration: 0.18), value: showsHistory)
     }
 
     private var chatHeader: some View {
@@ -481,6 +507,17 @@ struct ChatPage: View {
                         .foregroundStyle(theme.secondaryText)
                 }
                 Spacer()
+                Button {
+                    store.newChatSession()
+                } label: {
+                    Label("New Chat", systemImage: "square.and.pencil")
+                }
+                .disabled(store.isChatRunning)
+                Button {
+                    showsHistory.toggle()
+                } label: {
+                    Label(showsHistory ? "Hide History" : "Show History", systemImage: "sidebar.right")
+                }
                 StatusPill(text: chatStatusText, tone: chatStatusTone)
             }
 
@@ -557,6 +594,7 @@ private struct ChatBubble: View {
     let message: ChatMessage
 
     @Environment(\.tokenityTheme) private var theme
+    @State private var isThinkingExpanded = true
 
     var body: some View {
         HStack {
@@ -580,7 +618,7 @@ private struct ChatBubble: View {
             }
 
             if message.role == .assistant, !message.thinking.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                DisclosureGroup {
+                DisclosureGroup(isExpanded: $isThinkingExpanded) {
                     Text(message.thinking)
                         .font(.tokenityText(12))
                         .foregroundStyle(theme.secondaryText)
@@ -612,6 +650,76 @@ private struct ChatBubble: View {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .stroke(message.role == .user ? Color.clear : theme.border.opacity(0.8), lineWidth: 0.5)
         )
+    }
+}
+
+private struct ChatHistorySidebar: View {
+    @EnvironmentObject private var store: TokenityStore
+    @Environment(\.tokenityTheme) private var theme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("History")
+                    .font(.tokenityText(14, weight: .semibold))
+                Spacer()
+                Button {
+                    store.newChatSession()
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .buttonStyle(.borderless)
+                .help("New chat")
+                .disabled(store.isChatRunning)
+            }
+            .padding(14)
+
+            Divider()
+
+            ScrollView {
+                LazyVStack(spacing: 6) {
+                    ForEach(store.chatSessions) { session in
+                        historyRow(session)
+                    }
+                }
+                .padding(10)
+            }
+        }
+        .background(theme.sidebar)
+    }
+
+    private func historyRow(_ session: ChatSession) -> some View {
+        HStack(spacing: 6) {
+            Button {
+                store.selectChatSession(session.id)
+            } label: {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(session.title)
+                        .font(.tokenityText(12, weight: .medium))
+                        .lineLimit(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Text(session.updatedAt.formatted(date: .abbreviated, time: .shortened))
+                        .font(.tokenityText(10))
+                        .foregroundStyle(theme.tertiaryText)
+                }
+                .padding(9)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(session.id == store.activeChatSessionID ? theme.accent.opacity(0.14) : Color.clear)
+                )
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                store.deleteChatSession(session.id)
+            } label: {
+                Image(systemName: "trash")
+                    .foregroundStyle(theme.tertiaryText)
+            }
+            .buttonStyle(.borderless)
+            .help("Delete chat")
+            .disabled(store.isChatRunning)
+        }
     }
 }
 
@@ -687,6 +795,11 @@ struct ModelsPage: View {
                 }
             )
         }
+        .task {
+            if store.modelScanSummary == "Not scanned" {
+                await store.scanModels()
+            }
+        }
     }
 }
 
@@ -714,6 +827,21 @@ private struct ModelLoadRow: View {
                         .lineLimit(1)
                     StatusPill(text: row.loadState.rawValue, tone: stateTone)
                 }
+                HStack(spacing: 6) {
+                    if let format = row.format {
+                        StatusPill(text: format, tone: .neutral)
+                    }
+                    if let quantization = row.quantization {
+                        StatusPill(text: quantization, tone: .accent)
+                    }
+                    Text(row.sizeText)
+                    if let architecture = row.architecture {
+                        Text("· \(architecture)")
+                            .lineLimit(1)
+                    }
+                }
+                .font(.tokenityText(11))
+                .foregroundStyle(theme.secondaryText)
                 Text("\(row.availability) · \(row.nodes.joined(separator: ", "))")
                     .font(.tokenityText(11))
                     .foregroundStyle(theme.secondaryText)
@@ -799,19 +927,21 @@ private struct ModelConfigurationSheet: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Model Identity") {
+                Section("Model") {
                     LabeledContent("Model") {
                         Text(row.displayName)
                             .textSelection(.enabled)
                     }
-                    LabeledContent("API Identifier") {
-                        TextField(row.displayName, text: $draft.apiIdentifier)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(minWidth: 280)
+                    LabeledContent("Served as") {
+                        Text(row.displayName)
+                            .textSelection(.enabled)
                     }
-                    Text("Leave the identifier empty to serve the model using its folder name.")
-                        .font(.tokenityText(11))
-                        .foregroundStyle(.secondary)
+                    LabeledContent("Path") {
+                        Text(row.representativePath)
+                            .lineLimit(2)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                    }
                 }
 
                 Section("Generation") {
@@ -866,7 +996,7 @@ private struct ModelConfigurationSheet: View {
                 }
             }
         }
-        .frame(width: 620, height: 680)
+        .frame(width: 600, height: 600)
     }
 
     @ViewBuilder
@@ -912,6 +1042,81 @@ private struct ModelConfigurationSheet: View {
     }
 }
 
+struct APIAccessPage: View {
+    @EnvironmentObject private var store: TokenityStore
+    @Environment(\.tokenityTheme) private var theme
+
+    var body: some View {
+        PageScaffold(title: "API Access") {
+            InfoGroup(title: "OpenAI-Compatible API") {
+                InfoRow(label: "Status") {
+                    HStack {
+                        StatusPill(
+                            text: store.isChatReady ? "Available" : "Load a model",
+                            tone: store.isChatReady ? .good : .warning
+                        )
+                        Text(store.apiAccessStatus)
+                            .foregroundStyle(theme.secondaryText)
+                        Spacer()
+                        Button("Test Connection") {
+                            Task { await store.testExternalAPI() }
+                        }
+                    }
+                }
+                APIValueRow(label: "Base URL", value: store.openAIAPIBaseURL)
+                APIValueRow(label: "Model", value: store.externalAPIModelName)
+                InfoRow(label: "API key") {
+                    Text("Not required. If a client requires one, enter tokenity-local.")
+                        .foregroundStyle(theme.secondaryText)
+                        .textSelection(.enabled)
+                }
+            }
+
+            InfoGroup(title: "Supported Endpoints") {
+                APIValueRow(label: "Models", value: "GET \(store.openAIAPIBaseURL)/models")
+                APIValueRow(label: "Chat", value: "POST \(store.openAIAPIBaseURL)/chat/completions")
+                APIValueRow(label: "Health", value: store.openAIAPIBaseURL.replacingOccurrences(of: "/v1", with: "/health"))
+            }
+
+            InfoGroup(title: "Client Setup") {
+                InfoRow(label: "Cherry Studio / Msty") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Choose a custom OpenAI provider, paste the Base URL above, use the displayed model name, and enter tokenity-local only if the client requires an API key.")
+                            .foregroundStyle(theme.secondaryText)
+                        Text("Tokenity listens on the coordinator Mac over the local network. Keep that Mac and the model service running while external clients are connected.")
+                            .font(.tokenityText(11))
+                            .foregroundStyle(theme.tertiaryText)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct APIValueRow: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        InfoRow(label: label) {
+            HStack {
+                Text(value)
+                    .font(.system(.body, design: .monospaced))
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+                Spacer()
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(value, forType: .string)
+                } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                }
+            }
+        }
+    }
+}
+
 struct LogsPage: View {
     @EnvironmentObject private var store: TokenityStore
 
@@ -942,8 +1147,9 @@ struct SettingsPage: View {
                         .lineLimit(1)
                 }
                 InfoRow(label: "Access") {
-                    Text("Available after the cluster starts")
+                    Text(store.openAIAPIBaseURL)
                         .lineLimit(1)
+                        .truncationMode(.middle)
                 }
             }
 

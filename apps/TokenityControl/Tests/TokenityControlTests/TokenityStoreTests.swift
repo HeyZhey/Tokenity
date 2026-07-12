@@ -8,6 +8,8 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertEqual(AppSection.models.group, "Cluster")
         XCTAssertTrue(AppSection.allCases.contains(.chat))
         XCTAssertTrue(AppSection.allCases.contains(.models))
+        XCTAssertEqual(AppSection.api.group, "Operations")
+        XCTAssertTrue(AppSection.allCases.contains(.api))
         XCTAssertFalse(AppSection.allCases.contains { $0.title == "Nodes" })
     }
 
@@ -209,6 +211,9 @@ final class TokenityStoreTests: XCTestCase {
     }
 
     func testLiveChatStreamRecordsMetrics() async {
+        let suiteName = "TokenityStoreTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
         let store = TokenityStore(
             dataTransport: Self.successfulModelTransport,
             lineStreamTransport: { _ in
@@ -218,7 +223,8 @@ final class TokenityStoreTests: XCTestCase {
                     continuation.yield("data: [DONE]")
                     continuation.finish()
                 }
-            }
+            },
+            userDefaults: defaults
         )
         guard let first = store.modelLibraryRows.first else {
             XCTFail("Expected sample model")
@@ -239,6 +245,9 @@ final class TokenityStoreTests: XCTestCase {
     }
 
     func testReasoningOnlyChatDoesNotShowNotRespondingError() async {
+        let suiteName = "TokenityStoreTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
         let store = TokenityStore(
             dataTransport: Self.successfulModelTransport,
             lineStreamTransport: { _ in
@@ -247,7 +256,8 @@ final class TokenityStoreTests: XCTestCase {
                     continuation.yield("data: [DONE]")
                     continuation.finish()
                 }
-            }
+            },
+            userDefaults: defaults
         )
         guard let first = store.modelLibraryRows.first else {
             XCTFail("Expected sample model")
@@ -267,6 +277,9 @@ final class TokenityStoreTests: XCTestCase {
     }
 
     func testPartialReasoningIsPreservedWhenChatStreamFails() async {
+        let suiteName = "TokenityStoreTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
         let store = TokenityStore(
             dataTransport: Self.successfulModelTransport,
             lineStreamTransport: { _ in
@@ -274,7 +287,8 @@ final class TokenityStoreTests: XCTestCase {
                     continuation.yield("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"partial thought\"},\"finish_reason\":null}]}")
                     continuation.finish(throwing: URLError(.timedOut))
                 }
-            }
+            },
+            userDefaults: defaults
         )
         guard let first = store.modelLibraryRows.first else {
             XCTFail("Expected sample model")
@@ -396,17 +410,86 @@ final class TokenityStoreTests: XCTestCase {
         let store = TokenityStore(userDefaults: defaults)
         let modelID = "Qwen"
         var configuration = ModelRuntimeConfiguration.default
-        configuration.apiIdentifier = "  tokenity/qwen  "
         configuration.maximumOutputTokens = 999_999
         configuration.temperature = 3
         configuration.prefillStepSize = 64
         store.updateModelConfiguration(configuration, for: modelID)
 
         let restored = TokenityStore(userDefaults: defaults).modelConfiguration(for: modelID)
-        XCTAssertEqual(restored.apiIdentifier, "tokenity/qwen")
         XCTAssertEqual(restored.maximumOutputTokens, 262_144)
         XCTAssertEqual(restored.temperature, 2)
         XCTAssertEqual(restored.prefillStepSize, 128)
+    }
+
+    func testChatHistoryCreatesAndRestoresSeparateSessions() async {
+        let suiteName = "TokenityStoreTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = TokenityStore(
+            dataTransport: Self.successfulModelTransport,
+            lineStreamTransport: { _ in
+                AsyncThrowingStream { continuation in
+                    continuation.yield("data: {\"choices\":[{\"delta\":{\"content\":\"First answer\"},\"finish_reason\":null}]}")
+                    continuation.yield("data: [DONE]")
+                    continuation.finish()
+                }
+            },
+            userDefaults: defaults
+        )
+        guard let first = store.modelLibraryRows.first else {
+            XCTFail("Expected sample model")
+            return
+        }
+        let firstSessionID = store.activeChatSessionID
+        store.connectionMode = .ring
+        store.createCluster()
+        await store.loadModel(first)
+        store.chatInput = "First conversation"
+        await store.sendChatMessage()
+
+        store.newChatSession()
+
+        XCTAssertEqual(store.chatSessions.count, 2)
+        XCTAssertNotEqual(store.activeChatSessionID, firstSessionID)
+        XCTAssertEqual(store.chatMessages.filter { $0.role == .user }.count, 0)
+
+        store.selectChatSession(firstSessionID)
+        XCTAssertTrue(store.chatMessages.contains { $0.content == "First conversation" })
+        XCTAssertTrue(store.chatMessages.contains { $0.content == "First answer" })
+
+        let restored = TokenityStore(userDefaults: defaults)
+        XCTAssertEqual(restored.chatSessions.count, 2)
+    }
+
+    func testModelLibraryRowsExposeFormatQuantizationAndSize() {
+        let store = TokenityStore()
+        for index in store.nodes.indices where store.selectedNodeIDs.contains(store.nodes[index].id) {
+            store.nodes[index].models = [
+                ModelEntry(
+                    id: "Qwen",
+                    path: "/models/Qwen",
+                    format: "MLX",
+                    quantization: "4-bit · group 64",
+                    sizeBytes: 64 * 1_073_741_824,
+                    architecture: "QwenMoeForCausalLM",
+                    shardCount: 10
+                )
+            ]
+        }
+
+        let row = store.modelLibraryRows.first { $0.id == "Qwen" }
+        XCTAssertEqual(row?.format, "MLX")
+        XCTAssertEqual(row?.quantization, "4-bit · group 64")
+        XCTAssertEqual(row?.sizeText, "64 GB")
+        XCTAssertEqual(row?.architecture, "QwenMoeForCausalLM")
+        XCTAssertEqual(row?.shardCount, 10)
+    }
+
+    func testExternalAPIUsesCoordinatorAddress() {
+        let store = TokenityStore()
+
+        XCTAssertEqual(store.openAIAPIBaseURL, "http://192.168.5.23:8000/v1")
+        XCTAssertEqual(store.externalAPIModelName, "Load a model first")
     }
 
     private static func successfulModelTransport(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {

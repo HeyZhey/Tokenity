@@ -6,6 +6,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     case chat
     case models
     case network
+    case api
     case logs
     case settings
 
@@ -18,6 +19,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .chat: return "Chat"
         case .models: return "Models"
         case .network: return "Network / RDMA"
+        case .api: return "API Access"
         case .logs: return "Logs"
         case .settings: return "Settings"
         }
@@ -30,6 +32,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .chat: return "bubble.left.and.bubble.right"
         case .models: return "cube.transparent"
         case .network: return "network"
+        case .api: return "point.3.connected.trianglepath.dotted"
         case .logs: return "scroll"
         case .settings: return "gearshape"
         }
@@ -38,7 +41,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     var group: String {
         switch self {
         case .overview, .cluster, .chat, .models, .network: return "Cluster"
-        case .logs, .settings: return "Operations"
+        case .api, .logs, .settings: return "Operations"
         }
     }
 }
@@ -137,6 +140,17 @@ struct NodeStatusResponse: Codable {
 struct ModelEntry: Codable, Hashable, Identifiable {
     var id: String
     var path: String
+    var format: String? = nil
+    var quantization: String? = nil
+    var sizeBytes: Int64? = nil
+    var architecture: String? = nil
+    var shardCount: Int? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case id, path, format, quantization, architecture
+        case sizeBytes = "size_bytes"
+        case shardCount = "shard_count"
+    }
 }
 
 struct NodeModelsResponse: Codable {
@@ -353,10 +367,20 @@ struct ModelLibraryRow: Identifiable, Hashable {
     var availability: String
     var loadState: ModelLoadState
     var representativePath: String
+    var format: String?
+    var quantization: String?
+    var sizeBytes: Int64?
+    var architecture: String?
+    var shardCount: Int?
+
+    var sizeText: String {
+        guard let sizeBytes else { return "Size unknown" }
+        let gib = Double(sizeBytes) / 1_073_741_824
+        return gib >= 10 ? String(format: "%.0f GB", gib) : String(format: "%.1f GB", gib)
+    }
 }
 
 struct ModelRuntimeConfiguration: Codable, Hashable {
-    var apiIdentifier: String = ""
     var maximumOutputTokens: Int = 32_768
     var temperature: Double = 0
     var topP: Double = 1
@@ -370,14 +394,8 @@ struct ModelRuntimeConfiguration: Codable, Hashable {
 
     static let `default` = ModelRuntimeConfiguration()
 
-    var normalizedAPIIdentifier: String? {
-        let value = apiIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
-        return value.isEmpty ? nil : value
-    }
-
     func validated() -> ModelRuntimeConfiguration {
         var copy = self
-        copy.apiIdentifier = apiIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
         copy.maximumOutputTokens = min(max(maximumOutputTokens, 1), 262_144)
         copy.temperature = min(max(temperature, 0), 2)
         copy.topP = min(max(topP, 0), 1)
@@ -396,7 +414,7 @@ enum ChatRole: String, Codable, Hashable {
     case assistant
 }
 
-struct ChatMessage: Identifiable, Hashable {
+struct ChatMessage: Identifiable, Codable, Hashable {
     let id: UUID
     var role: ChatRole
     var content: String
@@ -421,12 +439,42 @@ struct ChatMessage: Identifiable, Hashable {
     }
 }
 
-struct ChatMetrics: Hashable {
+struct ChatMetrics: Codable, Hashable {
     var firstTokenSeconds: Double?
     var totalSeconds: Double?
     var outputTokensPerSecond: Double?
 
     static let empty = ChatMetrics()
+}
+
+struct ChatSession: Identifiable, Codable, Hashable {
+    var id: UUID
+    var title: String
+    var createdAt: Date
+    var updatedAt: Date
+    var messages: [ChatMessage]
+    var metrics: ChatMetrics
+
+    static func fresh(id: UUID = UUID(), now: Date = Date()) -> ChatSession {
+        ChatSession(
+            id: id,
+            title: "New Chat",
+            createdAt: now,
+            updatedAt: now,
+            messages: [
+                ChatMessage(
+                    role: .assistant,
+                    content: "Create a cluster, load a model, then send a prompt to measure first response and total generation time.",
+                    includeInContext: false
+                )
+            ],
+            metrics: .empty
+        )
+    }
+
+    var preview: String {
+        messages.last(where: { $0.role == .user })?.content ?? "No prompts yet"
+    }
 }
 
 struct OpenAIChatRequest: Encodable {
@@ -484,7 +532,6 @@ struct AgentStartModelRequest: Encodable {
     var host: String
     var port: Int
     var dryRun: Bool
-    var apiIdentifier: String?
     var maxTokens: Int
     var promptCacheSize: Int
     var prefillStepSize: Int
@@ -497,7 +544,6 @@ struct AgentStartModelRequest: Encodable {
         case connectionMode = "connection_mode"
         case startingPort = "starting_port"
         case dryRun = "dry_run"
-        case apiIdentifier = "api_identifier"
         case maxTokens = "max_tokens"
         case promptCacheSize = "prompt_cache_size"
         case prefillStepSize = "prefill_step_size"

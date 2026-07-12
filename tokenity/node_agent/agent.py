@@ -5,6 +5,7 @@ import importlib.metadata
 import json
 import os
 import platform
+import re
 import socket
 import subprocess
 import sys
@@ -202,14 +203,72 @@ def scan_models(root: Path) -> list[dict[str, object]]:
     for child in sorted(root.iterdir(), key=lambda item: item.name.lower()):
         if not child.is_dir():
             continue
+        config = _read_model_config(child / "config.json")
+        safetensors = list(child.glob("*.safetensors"))
+        gguf_files = list(child.glob("*.gguf"))
         markers = {
             "config": (child / "config.json").exists(),
             "tokenizer": (child / "tokenizer.json").exists() or (child / "tokenizer.model").exists(),
-            "safetensors": any(child.glob("*.safetensors")),
+            "safetensors": bool(safetensors),
+            "gguf": bool(gguf_files),
         }
         if any(markers.values()):
-            models.append({"id": child.name, "path": str(child), "markers": markers})
+            architecture = None
+            architectures = config.get("architectures")
+            if isinstance(architectures, list) and architectures:
+                architecture = str(architectures[0])
+            elif config.get("model_type"):
+                architecture = str(config["model_type"])
+            models.append(
+                {
+                    "id": child.name,
+                    "path": str(child),
+                    "markers": markers,
+                    "format": "GGUF" if gguf_files else "MLX" if safetensors else "Transformers",
+                    "quantization": _quantization_description(config, child),
+                    "size_bytes": _directory_size(child),
+                    "architecture": architecture,
+                    "shard_count": len(gguf_files) + len(safetensors),
+                }
+            )
     return models
+
+
+def _read_model_config(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _quantization_description(config: dict[str, object], model_path: Path) -> str | None:
+    raw = config.get("quantization") or config.get("quantization_config")
+    if isinstance(raw, dict):
+        bits = raw.get("bits") or raw.get("nbits")
+        group_size = raw.get("group_size")
+        if isinstance(bits, (int, float)):
+            result = f"{int(bits)}-bit"
+            if isinstance(group_size, (int, float)):
+                result += f" · group {int(group_size)}"
+            return result
+
+    for file in model_path.glob("*.gguf"):
+        match = re.search(r"\b(Q\d(?:_[A-Z0-9]+)*)\b", file.name.upper())
+        if match:
+            return match.group(1)
+    return None
+
+
+def _directory_size(path: Path) -> int:
+    total = 0
+    for directory, _, files in os.walk(path, followlinks=False):
+        for name in files:
+            try:
+                total += (Path(directory) / name).stat().st_size
+            except OSError:
+                continue
+    return total
 
 
 def _request_nodes(request: StartRequest) -> list[ClusterNode]:

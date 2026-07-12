@@ -16,9 +16,14 @@ def test_distributed_skeleton_readiness_and_models():
     with TestClient(create_app(model="/models/qwen")) as client:
         readiness = client.get("/v1/readiness").json()
         models = client.get("/v1/models").json()
+        info = client.get("/v1/tokenity/info").json()
+        health = client.get("/health").json()
 
     assert readiness["phase"] == "ready"
     assert models["data"][0]["id"] == "/models/qwen"
+    assert info["api"] == "openai-compatible"
+    assert info["endpoints"] == ["/v1/models", "/v1/chat/completions"]
+    assert health == {"status": "ok", "phase": "ready"}
 
 
 def test_consolidated_runtime_is_not_skeleton_only():

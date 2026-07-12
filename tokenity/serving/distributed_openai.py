@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -554,6 +555,13 @@ def create_app(
 ) -> FastAPI:
     state = runtime.state if runtime is not None else ReadinessState(model=model)
     app = FastAPI(title="Tokenity Distributed OpenAI Server", version="0.1.0")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     @app.on_event("startup")
     async def startup() -> None:
@@ -568,6 +576,25 @@ def create_app(
     @app.get("/v1/readiness")
     def readiness() -> dict[str, object]:
         return state.to_dict()
+
+    @app.get("/")
+    @app.get("/v1/tokenity/info")
+    def service_info() -> dict[str, object]:
+        return {
+            "name": "Tokenity",
+            "api": "openai-compatible",
+            "base_path": "/v1",
+            "model": runtime.model_id if runtime is not None else model,
+            "endpoints": ["/v1/models", "/v1/chat/completions"],
+            "readiness": state.to_dict(),
+        }
+
+    @app.get("/health")
+    def health() -> dict[str, object]:
+        return {
+            "status": "ok" if state.phase != ReadinessPhase.FAILED else "failed",
+            "phase": state.phase.value,
+        }
 
     @app.get("/v1/models")
     def models() -> dict[str, object]:

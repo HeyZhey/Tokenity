@@ -241,13 +241,24 @@ def test_supervisor_stop_kills_related_tokenity_serve_process(tmp_path: Path):
 def test_model_scan(tmp_path: Path):
     model = tmp_path / "Qwen3.5-122B-A10B-4bit"
     model.mkdir()
-    (model / "config.json").write_text("{}", encoding="utf-8")
+    (model / "config.json").write_text(
+        '{"architectures":["Qwen3_5MoeForCausalLM"],"quantization":{"bits":4,"group_size":64}}',
+        encoding="utf-8",
+    )
+    (model / "model-00001-of-00002.safetensors").write_bytes(b"a" * 128)
+    (model / "model-00002-of-00002.safetensors").write_bytes(b"b" * 256)
 
     client = TestClient(create_app(rdma_probe_fn=fake_rdma_probe))
     response = client.get("/v1/node/models", params={"root": str(tmp_path)})
 
     assert response.status_code == 200
-    assert response.json()["models"][0]["id"] == "Qwen3.5-122B-A10B-4bit"
+    payload = response.json()["models"][0]
+    assert payload["id"] == "Qwen3.5-122B-A10B-4bit"
+    assert payload["format"] == "MLX"
+    assert payload["quantization"] == "4-bit · group 64"
+    assert payload["architecture"] == "Qwen3_5MoeForCausalLM"
+    assert payload["shard_count"] == 2
+    assert payload["size_bytes"] >= 384
 
 
 def test_official_dry_run_blocks_bad_jaccl():
