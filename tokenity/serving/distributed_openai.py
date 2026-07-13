@@ -62,6 +62,12 @@ class _MLXServerSymbols:
     def load(cls) -> "_MLXServerSymbols":
         import mlx_lm.server as server  # type: ignore
 
+        from tokenity.mlx.glm_moe_dsa_compat import install_glm_moe_dsa_compat
+
+        if install_glm_moe_dsa_compat():
+            logging.warning(
+                "Tokenity installed GLM-5.2 cross-layer indexer sharing compatibility from mlx-lm PR #1410."
+            )
         _install_chunked_sharded_load(server)
         from mlx_lm.server import (  # type: ignore
             CompletionRequest,

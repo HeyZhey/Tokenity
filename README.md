@@ -33,6 +33,7 @@ fit across the combined unified memory of several machines.
 - Thunderbolt RDMA/JACCL, regular-network, and RDMA-with-fallback launch modes.
 - Live readiness phases for distributed initialization, model loading, and generation.
 - Model inventory with format, quantization, size, architecture, and shard metadata.
+- GLM-5.2 cross-layer DSA indexer compatibility based on upstream mlx-lm PR #1410.
 - Per-model runtime and sampling configuration.
 - Streaming Chat with expanded reasoning, automatic scrolling, metrics, and separate history sessions.
 - Automatic non-streaming recovery when a macOS streaming connection fails before the first token.
@@ -297,6 +298,7 @@ busy; stop the existing model role before launching it again.
 
 - [Stable baseline](docs/stable-baseline.md)
 - [HTTP Node Agent protocol](docs/http-node-agent.md)
+- [GLM-5.2 compatibility](docs/glm-5.2-compat.md)
 - [External API](docs/external-api.md)
 - [Current RDMA + Qwen operations](docs/current-usage-rdma-qwen.md)
 - [Installer DMG](docs/installer-dmg.md)

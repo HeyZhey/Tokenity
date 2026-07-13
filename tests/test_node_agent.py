@@ -9,6 +9,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from tokenity.mlx.rdma_probe import RDMAProbeResult
+from tokenity.mlx.glm_moe_dsa_compat import derive_indexer_types
 from tokenity.node_agent.agent import RankStartRequest, _rank_command_and_environment, create_app
 from tokenity.process.supervisor import RoleStatus, RoleSupervisor
 
@@ -21,6 +22,41 @@ def fake_rdma_probe():
         thunderbolt_ip="192.168.0.1",
         rdma_errors=[],
     )
+
+
+def test_glm_52_indexer_schedule_matches_upstream_pr_1410():
+    schedule = derive_indexer_types(
+        num_hidden_layers=78,
+        frequency=4,
+        skip_offset=3,
+    )
+
+    assert schedule[:15] == [
+        "full",
+        "full",
+        "full",
+        "shared",
+        "shared",
+        "shared",
+        "full",
+        "shared",
+        "shared",
+        "shared",
+        "full",
+        "shared",
+        "shared",
+        "shared",
+        "full",
+    ]
+    assert len(schedule) == 78
+    assert schedule.count("full") == 21
+
+
+def test_glm_indexer_pattern_accepts_explicit_full_shared_schedule():
+    assert derive_indexer_types(
+        num_hidden_layers=6,
+        pattern="FSFSFS",
+    ) == ["full", "shared", "full", "shared", "full", "shared"]
 
 
 def test_node_info_reports_rdma():
