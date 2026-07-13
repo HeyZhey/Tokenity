@@ -8,6 +8,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+import tokenity.node_agent.agent as agent_module
 from tokenity.mlx.rdma_probe import RDMAProbeResult
 from tokenity.mlx.glm_moe_dsa_compat import derive_indexer_types
 from tokenity.node_agent.agent import RankStartRequest, _rank_command_and_environment, create_app
@@ -76,6 +77,38 @@ def test_node_status_reports_memory():
 
     assert response.status_code == 200
     assert "memory" in response.json()
+
+
+def test_memory_stats_prefers_physical_vm_pages_over_pressure_percentage(monkeypatch):
+    gib = 1_073_741_824
+    total = 512 * gib
+    page_size = 16_384
+    free_pages = (125 * gib) // page_size
+    monkeypatch.setattr(agent_module, "_total_memory_bytes", lambda: total)
+    monkeypatch.setattr(
+        agent_module,
+        "_vm_stat_pages",
+        lambda: {
+            "page_size": page_size,
+            "pages": {
+                "Pages free": free_pages - 100,
+                "Pages speculative": 100,
+                "Pages wired down": (5 * gib) // page_size,
+                "Pages occupied by compressor": 0,
+                "Pages inactive": (370 * gib) // page_size,
+                "File-backed pages": (368 * gib) // page_size,
+            },
+        },
+    )
+    monkeypatch.setattr(agent_module, "_memory_pressure_available_ratio", lambda: 0.99)
+
+    memory = agent_module._memory_stats()
+
+    assert memory["free_bytes"] == 125 * gib
+    assert memory["used_bytes"] == 387 * gib
+    assert memory["used_ratio"] == 387 / 512
+    assert memory["file_backed_bytes"] == 368 * gib
+    assert memory["pressure_available_ratio"] == 0.99
 
 
 def test_running_role_reports_failed_when_child_rank_crashes(tmp_path: Path):
@@ -153,6 +186,37 @@ def test_supervisor_replaces_a_running_role_when_the_model_command_changes(tmp_p
             raise AssertionError("the old model role survived replacement")
     finally:
         supervisor.stop("distributed-openai", timeout=1)
+
+
+def test_supervisor_can_request_then_wait_for_a_clean_distributed_exit(tmp_path: Path):
+    supervisor = RoleSupervisor(log_dir=tmp_path)
+    started = supervisor.start(
+        "distributed-openai-rank",
+        [
+            sys.executable,
+            "-c",
+            (
+                "import signal, sys, time; "
+                "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); "
+                "print('ready', flush=True); "
+                "time.sleep(30)"
+            ),
+        ],
+    )
+    assert started.log_path is not None
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if "ready" in Path(started.log_path).read_text(encoding="utf-8"):
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("distributed exit probe did not start")
+
+    supervisor.request_stop("distributed-openai-rank")
+    status = supervisor.wait("distributed-openai-rank", timeout=3)
+
+    assert status.state == "stopped"
+    assert status.return_code == 0
 
 
 def test_supervisor_keeps_child_stdin_open(tmp_path: Path):
@@ -542,6 +606,7 @@ def test_distributed_start_fans_out_worker_rank_over_http():
         json={"role": "distributed-openai", "timeout": 5},
     )
     assert stop.status_code == 200
+    assert any(url.endswith("/v1/node/request-stop-all") for url, _, _ in posts)
     assert posts[-1][0] == "http://192.168.5.75:9100/v1/node/stop-all"
     assert posts[-1][1]["timeout"] == 5
 

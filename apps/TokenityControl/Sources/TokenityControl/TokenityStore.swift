@@ -186,6 +186,14 @@ final class TokenityStore: ObservableObject {
         modelLoadStates.values.contains(.loading)
     }
 
+    var isModelUnloading: Bool {
+        modelLoadStates.values.contains(.unloading)
+    }
+
+    var isModelTransitioning: Bool {
+        isModelLoading || isModelUnloading
+    }
+
     var canEditCluster: Bool {
         phase == .stopped || phase == .failed
     }
@@ -509,12 +517,21 @@ final class TokenityStore: ObservableObject {
         activeModelLoadID = nil
         modelLoadTask?.cancel()
         modelLoadTask = nil
-        modelLoadMessage = "Stopping \(row.displayName)..."
+        var states = modelLoadStates
+        for key in states.keys where key != row.id {
+            states[key] = .notLoaded
+        }
+        states[row.id] = .unloading
+        modelLoadStates = states
+        modelLoadProgress = nil
+        modelLoadMessage = "Unloading \(row.displayName) and releasing memory on all Macs..."
+        appendLog("Unloading model: \(row.displayName).")
         do {
             try await cleanupAllModelRoles()
         } catch {
             appendLog("Some model stop requests could not reach a selected Mac: \(userFacingMessage(for: error))")
         }
+        await refreshSelectedNodeStatus()
         resetModelLoadState(message: "No model loaded")
         appendLog("Model stopped: \(row.displayName).")
     }
@@ -890,7 +907,7 @@ final class TokenityStore: ObservableObject {
     }
 
     private func renewModelLeasesIfNeeded() async {
-        guard isModelLoading || loadedModelName != nil else { return }
+        guard isModelTransitioning || loadedModelName != nil else { return }
         for node in selectedNodes {
             guard let baseURL = URL(string: node.agentURL),
                   let request = try? jsonRequest(

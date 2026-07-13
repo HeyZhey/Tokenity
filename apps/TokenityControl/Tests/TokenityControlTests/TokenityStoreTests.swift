@@ -279,6 +279,56 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(stopAllRequests, store.selectedNodes.count * 2)
     }
 
+    func testStopShowsUnloadingUntilEveryAgentConfirmsExit() async {
+        let store = TokenityStore(dataTransport: { request in
+            let path = request.url?.path ?? ""
+            let payload: String
+            if path == "/v1/node/stop-all" {
+                try await Task.sleep(for: .milliseconds(200))
+                payload = #"{"statuses":[]}"#
+            } else {
+                return try await Self.successfulModelTransport(request)
+            }
+            let response = HTTPURLResponse(
+                url: request.url ?? URL(string: "http://127.0.0.1")!,
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            return (Data(payload.utf8), response)
+        })
+        store.connectionMode = .ring
+        store.createCluster()
+        guard let first = store.modelLibraryRows.first else {
+            XCTFail("Expected sample model")
+            return
+        }
+        await store.loadModel(first)
+
+        let stopTask = Task { await store.stopModel(first) }
+        try? await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertTrue(store.isModelUnloading)
+        XCTAssertEqual(store.modelLoadStates[first.id], .unloading)
+        XCTAssertTrue(store.modelLoadMessage.contains("releasing memory on all Macs"))
+        XCTAssertNil(store.loadedModelName)
+
+        await stopTask.value
+        XCTAssertFalse(store.isModelUnloading)
+        XCTAssertEqual(store.modelLoadStates[first.id], .notLoaded)
+        XCTAssertEqual(store.modelLoadMessage, "No model loaded")
+    }
+
+    func testMemoryStatsDecodePhysicalMemoryUsage() throws {
+        let payload = #"{"total_bytes":549755813888,"used_bytes":415538003968,"free_bytes":134217809920,"used_ratio":0.756}"#
+
+        let memory = try JSONDecoder().decode(MemoryStats.self, from: Data(payload.utf8))
+
+        XCTAssertEqual(memory.usedBytes, 415_538_003_968)
+        XCTAssertEqual(memory.freeBytes, 134_217_809_920)
+        XCTAssertEqual(memory.usedRatio, 0.756)
+    }
+
     func testApplicationTerminationCleanupStopsAllSelectedNodes() async {
         var stopAllHosts: Set<String> = []
         let store = TokenityStore(dataTransport: { request in

@@ -875,7 +875,7 @@ struct ModelsPage: View {
                         ModelLoadRow(
                             row: row,
                             selectedNodeCount: store.selectedNodes.count,
-                            clusterIsReady: store.phase == .running && !store.isModelLoading,
+                            clusterIsReady: store.phase == .running && !store.isModelTransitioning,
                             loadingProgress: row.loadState == .loading ? store.modelLoadProgress : nil,
                             configurationAction: { configurationTarget = row },
                             loadAction: { store.beginLoadingModel(row) },
@@ -960,6 +960,15 @@ private struct ModelLoadRow: View {
                     .font(.tokenityText(11, weight: .medium))
                     .foregroundStyle(theme.secondaryText)
                     .accessibilityLabel("Model loading progress")
+                } else if row.loadState == .unloading {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Releasing memory on all selected Macs...")
+                    }
+                    .font(.tokenityText(11, weight: .medium))
+                    .foregroundStyle(theme.secondaryText)
+                    .accessibilityLabel("Model unloading in progress")
                 }
             }
 
@@ -986,6 +995,12 @@ private struct ModelLoadRow: View {
                     Label("Stop", systemImage: "stop.fill")
                 }
                 .help("Cancel loading and release model memory on every selected Mac")
+            case .unloading:
+                Button {
+                } label: {
+                    Label("Unloading", systemImage: "hourglass")
+                }
+                .disabled(true)
             case .notLoaded:
                 Button {
                     loadAction()
@@ -1009,7 +1024,7 @@ private struct ModelLoadRow: View {
     private var stateTone: StatusPill.Tone {
         switch row.loadState {
         case .loaded: return .good
-        case .loading: return .warning
+        case .loading, .unloading: return .warning
         case .notLoaded: return .danger
         }
     }
@@ -1017,7 +1032,7 @@ private struct ModelLoadRow: View {
     private var stateColor: Color {
         switch row.loadState {
         case .loaded: return theme.success
-        case .loading: return theme.warning
+        case .loading, .unloading: return theme.warning
         case .notLoaded: return theme.danger
         }
     }

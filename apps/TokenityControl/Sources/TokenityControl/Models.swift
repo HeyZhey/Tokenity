@@ -120,6 +120,7 @@ enum ModelLoadState: String, Hashable {
     case notLoaded = "Not loaded"
     case loading = "Loading"
     case loaded = "Loaded"
+    case unloading = "Unloading"
 }
 
 struct RDMAStatus: Codable, Hashable {

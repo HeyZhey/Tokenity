@@ -106,6 +106,37 @@ class RoleSupervisor:
             _terminate_related_processes(command, signal.SIGKILL)
             return self.status(role)
 
+    def request_stop(self, role: str) -> RoleStatus:
+        """Ask a role to stop without waiting or escalating to SIGKILL.
+
+        Distributed ranks need a short coordination phase where every rank has
+        observed the stop request before any one process is reaped.  Keeping
+        this separate from ``stop`` lets the Node Agent fan the request out to
+        all ranks first and only then wait for them to leave their collectives.
+        """
+
+        with self._lock:
+            process = self._processes.get(role)
+            if not process or process.poll() is not None:
+                return self.status(role)  # type: ignore[return-value]
+            if self._new_sessions.get(role, True):
+                _terminate_process_group(process, signal.SIGTERM)
+            else:
+                process.terminate()
+            return self.status(role)  # type: ignore[return-value]
+
+    def wait(self, role: str, timeout: float = 10.0) -> RoleStatus:
+        """Wait for a role to exit without sending another signal."""
+
+        with self._lock:
+            process = self._processes.get(role)
+        if process is None or process.poll() is not None:
+            return self.status(role)  # type: ignore[return-value]
+        deadline = time.monotonic() + timeout
+        while process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return self.status(role)  # type: ignore[return-value]
+
     def stop_all(self, roles: list[str] | tuple[str, ...] | None = None, timeout: float = 10.0) -> list[RoleStatus]:
         with self._lock:
             selected = list(roles) if roles is not None else sorted(set(self._processes) | set(self._commands))

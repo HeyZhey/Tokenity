@@ -183,25 +183,72 @@ def create_app(
         with lifecycle_lock:
             lease_deadline = None
 
-    def stop_local_model_roles(timeout: float) -> list[dict[str, object]]:
+    def request_local_model_roles_stop() -> list[dict[str, object]]:
         with lifecycle_lock:
             port = runtime_port
+        coordinator_requested = False
         try:
             _post_json(f"http://127.0.0.1:{port}/v1/tokenity/stop", {}, 2.0)
+            coordinator_requested = True
         except Exception:
             pass
-        if hasattr(roles, "stop_all"):
-            statuses = roles.stop_all(MODEL_ROLES, timeout=timeout)  # type: ignore[union-attr]
-        else:
-            statuses = [roles.stop(role, timeout=timeout) for role in MODEL_ROLES]
+
+        statuses: list[object] = []
+        request_role_stop = getattr(roles, "request_stop", None)
+        for role in MODEL_ROLES:
+            # The coordinator's admin endpoint asks Uvicorn to exit naturally.
+            # Sending SIGTERM immediately would turn a clean exit into -15 and
+            # can tear down JACCL while the worker is still in a collective.
+            if role == "distributed-openai" and coordinator_requested:
+                statuses.append(roles.status(role))
+            elif request_role_stop is not None:
+                statuses.append(request_role_stop(role))
+            else:
+                statuses.append(roles.status(role))
         return [status.__dict__ for status in statuses]
 
-    def stop_known_workers(timeout: float) -> list[dict[str, object]]:
+    def stop_local_model_roles(
+        timeout: float,
+        *,
+        request_first: bool = True,
+    ) -> list[dict[str, object]]:
+        if request_first:
+            request_local_model_roles_stop()
+        deadline = time.monotonic() + timeout
+        statuses: list[object] = []
+        wait_for_role = getattr(roles, "wait", None)
+        for role in MODEL_ROLES:
+            remaining = max(0.0, deadline - time.monotonic())
+            status = wait_for_role(role, remaining) if wait_for_role is not None else roles.status(role)
+            if getattr(status, "pid", None) is not None:
+                status = roles.stop(role, timeout=max(0.5, min(2.0, remaining)))
+            statuses.append(status)
+        return [status.__dict__ for status in statuses]
+
+    def worker_urls(*, clear: bool = False) -> list[str]:
         with lifecycle_lock:
-            worker_urls = list(distributed_workers)
-            distributed_workers.clear()
+            urls = list(distributed_workers)
+            if clear:
+                distributed_workers.clear()
+        return urls
+
+    def request_known_workers_stop() -> list[dict[str, object]]:
         results: list[dict[str, object]] = []
-        for agent_url in worker_urls:
+        for agent_url in worker_urls():
+            try:
+                result = post_json(
+                    f"{agent_url}/v1/node/request-stop-all",
+                    {},
+                    3.0,
+                )
+                results.append({"agent_url": agent_url, "result": result})
+            except Exception as exc:
+                results.append({"agent_url": agent_url, "error": str(exc)})
+        return results
+
+    def stop_known_workers(timeout: float) -> list[dict[str, object]]:
+        results: list[dict[str, object]] = []
+        for agent_url in worker_urls(clear=True):
             try:
                 result = post_json(
                     f"{agent_url}/v1/node/stop-all",
@@ -217,15 +264,34 @@ def create_app(
         cancel_launch()
         statuses: list[dict[str, object]] = []
 
+        # Phase 1: every rank observes the stop request before any process is
+        # forcibly reaped.  This keeps JACCL/MLX collectives symmetric.
+        requested_workers: list[dict[str, object]] = []
+
+        def request_workers() -> None:
+            if notify_workers:
+                requested_workers.extend(request_known_workers_stop())
+
+        worker_request_thread = threading.Thread(target=request_workers)
+        local_request_thread = threading.Thread(target=request_local_model_roles_stop)
+        worker_request_thread.start()
+        local_request_thread.start()
+        worker_request_thread.join(4)
+        local_request_thread.join(4)
+
         def stop_local() -> None:
-            statuses.extend(stop_local_model_roles(timeout))
+            statuses.extend(stop_local_model_roles(timeout, request_first=False))
 
         local_thread = threading.Thread(target=stop_local)
         local_thread.start()
         workers = stop_known_workers(timeout) if notify_workers else []
         local_thread.join(timeout + 3)
         clear_lease()
-        return {"statuses": statuses, "workers": workers}
+        return {
+            "statuses": statuses,
+            "requested_workers": requested_workers,
+            "workers": workers,
+        }
 
     def lease_watchdog() -> None:
         while not watchdog_stop.wait(1.0):
@@ -422,8 +488,20 @@ def create_app(
         worker_results: list[dict[str, object]] = []
         local_status: list[object] = []
 
+        request_threads = [threading.Thread(target=request_local_model_roles_stop)]
+        if request.role == "distributed-openai":
+            request_threads.append(threading.Thread(target=request_known_workers_stop))
+        for thread in request_threads:
+            thread.start()
+        for thread in request_threads:
+            thread.join(4)
+
         def stop_local() -> None:
-            local_status.append(roles.stop(request.role, timeout=request.timeout))
+            wait_for_role = getattr(roles, "wait", None)
+            status = wait_for_role(request.role, request.timeout) if wait_for_role is not None else roles.status(request.role)
+            if getattr(status, "pid", None) is not None:
+                status = roles.stop(request.role, timeout=2)
+            local_status.append(status)
 
         local_thread = threading.Thread(target=stop_local)
         local_thread.start()
@@ -441,6 +519,13 @@ def create_app(
     @app.post("/v1/node/stop-all")
     def stop_all(request: StopAllRequest) -> dict[str, object]:
         return stop_everything(request.timeout)
+
+    @app.post("/v1/node/request-stop-all")
+    def request_stop_all() -> dict[str, object]:
+        """Phase-one distributed stop: signal local ranks without waiting."""
+
+        cancel_launch()
+        return {"statuses": request_local_model_roles_stop()}
 
     return app
 
@@ -827,6 +912,34 @@ def _node_id() -> str:
 
 def _memory_stats() -> dict[str, object]:
     total = _total_memory_bytes()
+    vm = _vm_stat_pages()
+    if total is not None and vm is not None:
+        page_size = int(vm["page_size"])
+        pages = vm["pages"]
+        free_pages = pages.get("Pages free", 0) + pages.get("Pages speculative", 0)
+        free = min(total, max(0, free_pages * page_size))
+        used = max(0, total - free)
+
+        def page_bytes(key: str) -> int:
+            return max(0, pages.get(key, 0) * page_size)
+
+        return {
+            "total_bytes": total,
+            # Match macOS `top` PhysMem: memory which currently occupies
+            # physical pages, including reclaimable file-backed model weights.
+            "used_bytes": used,
+            "free_bytes": free,
+            "used_ratio": used / total if total > 0 else None,
+            "wired_bytes": page_bytes("Pages wired down"),
+            "compressed_bytes": page_bytes("Pages occupied by compressor"),
+            "active_bytes": page_bytes("Pages active"),
+            "inactive_bytes": page_bytes("Pages inactive"),
+            "file_backed_bytes": page_bytes("File-backed pages"),
+            "pressure_available_ratio": _memory_pressure_available_ratio(),
+        }
+
+    # Keep a pressure-based fallback for non-macOS/test environments where
+    # vm_stat is unavailable, but never prefer it over physical page counts.
     available_ratio = _memory_pressure_available_ratio()
     if total is not None and available_ratio is not None:
         free = int(total * available_ratio)
@@ -838,24 +951,11 @@ def _memory_stats() -> dict[str, object]:
             "used_ratio": used / total if total > 0 else None,
         }
 
-    vm = _vm_stat_pages()
-    if total is None or vm is None:
-        return {
-            "total_bytes": total,
-            "used_bytes": None,
-            "free_bytes": None,
-            "used_ratio": None,
-        }
-
-    page_size = vm["page_size"]
-    free_pages = vm["pages"].get("Pages free", 0) + vm["pages"].get("Pages speculative", 0)
-    free = max(0, free_pages * page_size)
-    used = max(0, total - free)
     return {
         "total_bytes": total,
-        "used_bytes": used,
-        "free_bytes": free,
-        "used_ratio": used / total if total > 0 else None,
+        "used_bytes": None,
+        "free_bytes": None,
+        "used_ratio": None,
     }
 
 

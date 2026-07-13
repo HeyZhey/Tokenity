@@ -10,7 +10,7 @@ import signal
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -288,6 +288,29 @@ def _delay_rank0_distributed_init() -> None:
     time.sleep(delay_seconds)
 
 
+def _requires_process_isolated_shutdown(model: str) -> bool:
+    """Return whether model teardown must bypass MLX thread destructors.
+
+    MLX 0.31.x can double-free the thread-local CompilerCache when the GLM
+    generation thread exits after JACCL inference.  The runtime already lives
+    in a disposable subprocess, so an explicit ``os._exit(0)`` is the safest
+    ownership boundary: macOS reclaims Metal/JACCL resources without running
+    the faulty C++ TLS destructor.
+    """
+
+    config_path = Path(model) / "config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        config = {}
+    identities = [str(config.get("model_type", "")), Path(model).name]
+    architectures = config.get("architectures")
+    if isinstance(architectures, list):
+        identities.extend(str(item) for item in architectures)
+    identity = " ".join(identities).lower()
+    return "glm" in identity and ("moe" in identity or "5.2" in identity)
+
+
 def _describe_eval_chunk(chunk: list[tuple[str, Any]]) -> str:
     descriptions = []
     for name, value in chunk:
@@ -337,6 +360,7 @@ class TokenityDistributedRuntime:
         self.prefill_step_size = prefill_step_size
         self.decode_concurrency = decode_concurrency
         self.prompt_concurrency = prompt_concurrency
+        self.process_isolated_shutdown = _requires_process_isolated_shutdown(model)
         self._symbols: _MLXServerSymbols | None = None
         self._provider: Any = None
         self._generator: Any = None
@@ -392,11 +416,16 @@ class TokenityDistributedRuntime:
         self._stop_event.set()
         self.state.phase = ReadinessPhase.STOPPING
         self.state.message = "Stopping model runtime and releasing MLX memory."
-        if self._generator is not None:
+        if self._generator is not None and not self.process_isolated_shutdown:
             self._generator._stop = True
 
     def stop(self) -> None:
         self.request_stop()
+        if self.process_isolated_shutdown:
+            logging.warning(
+                "Tokenity is using process-isolated GLM teardown to bypass the MLX CompilerCache destructor bug."
+            )
+            os._exit(0)
         if self._generator is not None:
             self.state.phase = ReadinessPhase.STOPPING
             self.state.message = "Stopping model runtime and releasing MLX memory."
@@ -406,17 +435,18 @@ class TokenityDistributedRuntime:
                 self._release_memory()
 
     def _release_memory(self) -> None:
-        clear_mlx_cache = self.state.rank == 0
+        distributed_runtime = self.state.world_size > 1
         _set_active_load_state(None)
         self._generator = None
         self._provider = None
         self._symbols = None
         self._group = None
         gc.collect()
-        if not clear_mlx_cache:
-            # Worker ranks can block in a distributed Metal cache teardown
-            # after rank 0 has already exited. Process exit releases their
-            # allocations without requiring a cross-rank cache operation.
+        if distributed_runtime:
+            # A distributed process exits immediately after shutdown, so the
+            # OS will reclaim its Metal allocations. Calling mx.clear_cache()
+            # while JACCL/MLX ranks are dismantling their groups can segfault
+            # GLM on rank 0 or leave a worker blocked in teardown.
             return
         try:
             import mlx.core as mx  # type: ignore
@@ -649,6 +679,7 @@ def create_app(
     model: str,
     require_mlx: bool = False,
     runtime: TokenityDistributedRuntime | None = None,
+    request_server_exit: Callable[[], None] | None = None,
 ) -> FastAPI:
     state = runtime.state if runtime is not None else ReadinessState(model=model)
     app = FastAPI(title="Tokenity Distributed OpenAI Server", version="0.1.0")
@@ -699,6 +730,12 @@ def create_app(
             runtime.request_stop()
         state.phase = ReadinessPhase.STOPPING
         state.message = "Stopping model runtime and releasing MLX memory."
+        if request_server_exit is not None:
+            # Let the response reach the Node Agent, then ask Uvicorn to run
+            # its normal lifespan shutdown instead of requiring SIGTERM.
+            timer = threading.Timer(0.05, request_server_exit)
+            timer.daemon = True
+            timer.start()
         return {"status": "stopping"}
 
     @app.get("/v1/models")
@@ -874,6 +911,8 @@ def serve(
 
     if runtime is not None and not runtime.is_rank0():
         def request_rank_stop(_signum: int, _frame: Any) -> None:
+            if runtime.process_isolated_shutdown:
+                os._exit(0)
             runtime.request_stop()
 
         signal.signal(signal.SIGTERM, request_rank_stop)
@@ -881,9 +920,27 @@ def serve(
         runtime.join()
         return
 
-    uvicorn.run(
-        create_app(model=model, require_mlx=require_mlx, runtime=runtime),
+    server_holder: dict[str, Any] = {}
+
+    def request_server_exit() -> None:
+        if runtime is not None and runtime.process_isolated_shutdown:
+            os._exit(0)
+        server = server_holder.get("server")
+        if server is not None:
+            server.should_exit = True
+
+    app = create_app(
+        model=model,
+        require_mlx=require_mlx,
+        runtime=runtime,
+        request_server_exit=request_server_exit,
+    )
+    config = uvicorn.Config(
+        app,
         host=host,
         port=port,
         timeout_graceful_shutdown=5,
     )
+    server = uvicorn.Server(config)
+    server_holder["server"] = server
+    server.run()
