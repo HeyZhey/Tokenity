@@ -105,42 +105,83 @@ struct MemoryUsageBar: View {
                     Capsule()
                         .fill(theme.border.opacity(0.35))
                     Capsule()
+                        .fill(theme.secondaryText.opacity(0.22))
+                        .frame(width: proxy.size.width * CGFloat(clampedPhysicalRatio))
+                    Capsule()
                         .fill(toneColor)
-                        .frame(width: proxy.size.width * CGFloat(clampedRatio))
+                        .frame(width: proxy.size.width * CGFloat(clampedInUseRatio))
                 }
             }
             .frame(height: 6)
 
-            HStack(spacing: 8) {
-                Text(percentText)
+            HStack(spacing: 6) {
+                Text(inUseText)
                     .font(.tokenityText(11, weight: .medium))
                     .foregroundStyle(theme.secondaryText)
-                Text(bytesText)
+                Spacer(minLength: 4)
+                Text(residentText)
                     .font(.tokenityText(11))
                     .foregroundStyle(theme.tertiaryText)
                     .lineLimit(1)
             }
+
+            if !detailText.isEmpty {
+                Text(detailText)
+                    .font(.tokenityText(10))
+                    .foregroundStyle(theme.tertiaryText)
+                    .lineLimit(1)
+            }
         }
+        .help(helpText)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(helpText)
     }
 
-    private var clampedRatio: Double {
-        min(max(memory.usedRatio ?? 0, 0), 1)
+    private var clampedInUseRatio: Double {
+        min(max(memory.inUseRatio ?? memory.usedRatio ?? 0, 0), 1)
+    }
+
+    private var clampedPhysicalRatio: Double {
+        min(max(memory.physicalUsedRatio ?? memory.usedRatio ?? clampedInUseRatio, clampedInUseRatio), 1)
     }
 
     private var toneColor: Color {
-        if clampedRatio >= 0.9 { return theme.danger }
-        if clampedRatio >= 0.75 { return theme.warning }
+        if clampedInUseRatio >= 0.9 { return theme.danger }
+        if clampedInUseRatio >= 0.75 { return theme.warning }
         return theme.success
     }
 
-    private var percentText: String {
-        guard let ratio = memory.usedRatio else { return "Memory unknown" }
-        return "\(Int((ratio * 100).rounded()))%"
+    private var inUseText: String {
+        guard let ratio = memory.inUseRatio ?? memory.usedRatio else { return "Memory unknown" }
+        return "In use \(formatPercent(ratio))"
     }
 
-    private var bytesText: String {
-        guard let used = memory.usedBytes, let total = memory.totalBytes else { return "" }
-        return "\(formatBytes(used)) / \(formatBytes(total))"
+    private var residentText: String {
+        guard memory.physicalUsedRatio != nil || memory.usedRatio != nil else { return "" }
+        return "Resident \(formatPercent(clampedPhysicalRatio))"
+    }
+
+    private var detailText: String {
+        guard let inUse = memory.inUseBytes ?? memory.usedBytes else { return "" }
+        var value = "\(formatBytes(inUse)) in use"
+        if let cache = memory.reclaimableBytes, cache > 0 {
+            value += " · \(formatBytes(cache)) reclaimable cache"
+        }
+        return value
+    }
+
+    private var helpText: String {
+        var parts = [inUseText]
+        if !residentText.isEmpty { parts.append(residentText + " including cache") }
+        if !detailText.isEmpty { parts.append(detailText) }
+        if let pressure = memory.pressureAvailableRatio {
+            parts.append("\(formatPercent(pressure)) pressure headroom")
+        }
+        return parts.joined(separator: ", ")
+    }
+
+    private func formatPercent(_ ratio: Double) -> String {
+        "\(Int((ratio * 100).rounded()))%"
     }
 
     private func formatBytes(_ bytes: Int64) -> String {

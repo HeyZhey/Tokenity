@@ -95,6 +95,7 @@ def test_memory_stats_prefers_physical_vm_pages_over_pressure_percentage(monkeyp
                 "Pages speculative": 100,
                 "Pages wired down": (5 * gib) // page_size,
                 "Pages occupied by compressor": 0,
+                "Anonymous pages": (3 * gib) // page_size,
                 "Pages inactive": (370 * gib) // page_size,
                 "File-backed pages": (368 * gib) // page_size,
             },
@@ -107,6 +108,11 @@ def test_memory_stats_prefers_physical_vm_pages_over_pressure_percentage(monkeyp
     assert memory["free_bytes"] == 125 * gib
     assert memory["used_bytes"] == 387 * gib
     assert memory["used_ratio"] == 387 / 512
+    assert memory["physical_used_bytes"] == 387 * gib
+    assert memory["physical_used_ratio"] == 387 / 512
+    assert memory["in_use_bytes"] == 8 * gib
+    assert memory["in_use_ratio"] == 8 / 512
+    assert memory["reclaimable_bytes"] == 368 * gib
     assert memory["file_backed_bytes"] == 368 * gib
     assert memory["pressure_available_ratio"] == 0.99
 

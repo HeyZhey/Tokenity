@@ -431,7 +431,7 @@ private struct ClusterNodeCard: View {
             }
         }
         .padding(12)
-        .frame(width: 228, height: 146, alignment: .leading)
+        .frame(width: 228, height: 162, alignment: .leading)
         .background(theme.group, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)

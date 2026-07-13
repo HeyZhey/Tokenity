@@ -320,13 +320,19 @@ final class TokenityStoreTests: XCTestCase {
     }
 
     func testMemoryStatsDecodePhysicalMemoryUsage() throws {
-        let payload = #"{"total_bytes":549755813888,"used_bytes":415538003968,"free_bytes":134217809920,"used_ratio":0.756}"#
+        let payload = #"{"total_bytes":549755813888,"used_bytes":415538003968,"free_bytes":134217809920,"used_ratio":0.756,"physical_used_bytes":415538003968,"physical_used_ratio":0.756,"in_use_bytes":7516192768,"in_use_ratio":0.0137,"reclaimable_bytes":405337620480,"wired_bytes":5368709120,"compressed_bytes":0,"anonymous_bytes":2147483648,"file_backed_bytes":405337620480,"pressure_available_ratio":0.99}"#
 
         let memory = try JSONDecoder().decode(MemoryStats.self, from: Data(payload.utf8))
 
         XCTAssertEqual(memory.usedBytes, 415_538_003_968)
         XCTAssertEqual(memory.freeBytes, 134_217_809_920)
         XCTAssertEqual(memory.usedRatio, 0.756)
+        XCTAssertEqual(memory.physicalUsedBytes, 415_538_003_968)
+        XCTAssertEqual(memory.physicalUsedRatio, 0.756)
+        XCTAssertEqual(memory.inUseBytes, 7_516_192_768)
+        XCTAssertEqual(memory.inUseRatio, 0.0137)
+        XCTAssertEqual(memory.reclaimableBytes, 405_337_620_480)
+        XCTAssertEqual(memory.pressureAvailableRatio, 0.99)
     }
 
     func testApplicationTerminationCleanupStopsAllSelectedNodes() async {

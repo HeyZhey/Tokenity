@@ -227,15 +227,50 @@ struct MemoryStats: Codable, Hashable {
     var usedBytes: Int64?
     var freeBytes: Int64?
     var usedRatio: Double?
+    var physicalUsedBytes: Int64?
+    var physicalUsedRatio: Double?
+    var inUseBytes: Int64?
+    var inUseRatio: Double?
+    var reclaimableBytes: Int64?
+    var wiredBytes: Int64?
+    var compressedBytes: Int64?
+    var anonymousBytes: Int64?
+    var fileBackedBytes: Int64?
+    var pressureAvailableRatio: Double?
 
     enum CodingKeys: String, CodingKey {
         case totalBytes = "total_bytes"
         case usedBytes = "used_bytes"
         case freeBytes = "free_bytes"
         case usedRatio = "used_ratio"
+        case physicalUsedBytes = "physical_used_bytes"
+        case physicalUsedRatio = "physical_used_ratio"
+        case inUseBytes = "in_use_bytes"
+        case inUseRatio = "in_use_ratio"
+        case reclaimableBytes = "reclaimable_bytes"
+        case wiredBytes = "wired_bytes"
+        case compressedBytes = "compressed_bytes"
+        case anonymousBytes = "anonymous_bytes"
+        case fileBackedBytes = "file_backed_bytes"
+        case pressureAvailableRatio = "pressure_available_ratio"
     }
 
-    static let unknown = MemoryStats(totalBytes: nil, usedBytes: nil, freeBytes: nil, usedRatio: nil)
+    static let unknown = MemoryStats(
+        totalBytes: nil,
+        usedBytes: nil,
+        freeBytes: nil,
+        usedRatio: nil,
+        physicalUsedBytes: nil,
+        physicalUsedRatio: nil,
+        inUseBytes: nil,
+        inUseRatio: nil,
+        reclaimableBytes: nil,
+        wiredBytes: nil,
+        compressedBytes: nil,
+        anonymousBytes: nil,
+        fileBackedBytes: nil,
+        pressureAvailableRatio: nil
+    )
 }
 
 struct TokenityNode: Identifiable, Hashable {
@@ -282,13 +317,19 @@ struct TokenityNode: Identifiable, Hashable {
     }
 
     var memoryPercentText: String {
-        guard let usedRatio = memory.usedRatio else { return "Memory unknown" }
-        return "\(Int((usedRatio * 100).rounded()))% memory"
+        guard let inUseRatio = memory.inUseRatio ?? memory.usedRatio else { return "Memory unknown" }
+        return "\(Int((inUseRatio * 100).rounded()))% in use"
     }
 
     var memoryUsageText: String {
-        guard let used = memory.usedBytes, let total = memory.totalBytes else { return "Memory unknown" }
-        return "\(Self.formatBytes(used)) / \(Self.formatBytes(total))"
+        guard let inUse = memory.inUseBytes ?? memory.usedBytes,
+              let total = memory.totalBytes else { return "Memory unknown" }
+        var parts = ["\(Self.formatBytes(inUse)) in use"]
+        if let reclaimable = memory.reclaimableBytes, reclaimable > 0 {
+            parts.append("\(Self.formatBytes(reclaimable)) reclaimable cache")
+        }
+        parts.append("\(Self.formatBytes(total)) total")
+        return parts.joined(separator: " · ")
     }
 
     var displayRuntime: String {

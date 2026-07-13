@@ -918,23 +918,41 @@ def _memory_stats() -> dict[str, object]:
         pages = vm["pages"]
         free_pages = pages.get("Pages free", 0) + pages.get("Pages speculative", 0)
         free = min(total, max(0, free_pages * page_size))
-        used = max(0, total - free)
+        physical_used = max(0, total - free)
 
         def page_bytes(key: str) -> int:
             return max(0, pages.get(key, 0) * page_size)
+
+        wired = page_bytes("Pages wired down")
+        compressed = page_bytes("Pages occupied by compressor")
+        anonymous = page_bytes("Anonymous pages")
+        file_backed = page_bytes("File-backed pages")
+
+        # Model weights are memory-mapped files. macOS keeps their clean pages in
+        # RAM after a model exits, but those pages are immediately reclaimable
+        # under pressure. Report that cache separately from memory which is still
+        # genuinely in use so the UI does not make a stopped model look leaked.
+        in_use = min(physical_used, wired + compressed + anonymous)
+        reclaimable = min(file_backed, max(0, physical_used - in_use))
 
         return {
             "total_bytes": total,
             # Match macOS `top` PhysMem: memory which currently occupies
             # physical pages, including reclaimable file-backed model weights.
-            "used_bytes": used,
+            "used_bytes": physical_used,
             "free_bytes": free,
-            "used_ratio": used / total if total > 0 else None,
-            "wired_bytes": page_bytes("Pages wired down"),
-            "compressed_bytes": page_bytes("Pages occupied by compressor"),
+            "used_ratio": physical_used / total if total > 0 else None,
+            "physical_used_bytes": physical_used,
+            "physical_used_ratio": physical_used / total if total > 0 else None,
+            "in_use_bytes": in_use,
+            "in_use_ratio": in_use / total if total > 0 else None,
+            "reclaimable_bytes": reclaimable,
+            "wired_bytes": wired,
+            "compressed_bytes": compressed,
+            "anonymous_bytes": anonymous,
             "active_bytes": page_bytes("Pages active"),
             "inactive_bytes": page_bytes("Pages inactive"),
-            "file_backed_bytes": page_bytes("File-backed pages"),
+            "file_backed_bytes": file_backed,
             "pressure_available_ratio": _memory_pressure_available_ratio(),
         }
 
@@ -949,6 +967,9 @@ def _memory_stats() -> dict[str, object]:
             "used_bytes": used,
             "free_bytes": free,
             "used_ratio": used / total if total > 0 else None,
+            "in_use_bytes": used,
+            "in_use_ratio": used / total if total > 0 else None,
+            "pressure_available_ratio": available_ratio,
         }
 
     return {
