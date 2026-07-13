@@ -381,6 +381,24 @@ def test_rank_environment_matches_mlx_jaccl_contract(tmp_path: Path, monkeypatch
     ]
 
 
+def test_single_node_ring_uses_mlx_singleton_without_an_empty_hostfile():
+    request = RankStartRequest(
+        cluster_id="cluster-test",
+        model="/models/qwen",
+        rank=0,
+        world_size=1,
+        coordinator=True,
+        connection_mode="ring",
+        python=sys.executable,
+        ring_hosts=[["127.0.0.1:29500"]],
+    )
+
+    _, env = _rank_command_and_environment(request)
+
+    assert env["MLX_RANK"] == "0"
+    assert "MLX_HOSTFILE" not in env
+
+
 class _FakeSupervisor:
     def __init__(self):
         self.starts = []

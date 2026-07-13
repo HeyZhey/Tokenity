@@ -492,10 +492,14 @@ def _rank_command_and_environment(request: RankStartRequest) -> tuple[list[str],
     if request.connection_mode == ConnectionMode.RING:
         if request.world_size > 1 and len(request.ring_hosts) != request.world_size:
             raise HostfileError("Ring host list length must equal world size.")
-        content = json.dumps(request.ring_hosts) if request.world_size > 1 else ""
-        env["MLX_HOSTFILE"] = str(
-            _write_rank_environment_file(request.cluster_id, "ring-hosts", content)
-        )
+        if request.world_size > 1:
+            env["MLX_HOSTFILE"] = str(
+                _write_rank_environment_file(
+                    request.cluster_id,
+                    "ring-hosts",
+                    json.dumps(request.ring_hosts),
+                )
+            )
     else:
         if not request.coordinator_ip:
             raise HostfileError("JACCL coordinator IP is required.")
