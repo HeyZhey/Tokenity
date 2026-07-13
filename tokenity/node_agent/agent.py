@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -28,6 +29,16 @@ from tokenity.process.supervisor import RoleSupervisor
 
 
 DEFAULT_MODEL_ROOT = "/Users/Shared/TokenityModels"
+MODEL_ROLES = (
+    "distributed-openai",
+    "distributed-openai-rank",
+    "single-node-openai",
+    "official-mlx-lm",
+)
+
+
+class _LaunchCancelled(RuntimeError):
+    pass
 
 
 class ClusterNodePayload(BaseModel):
@@ -69,6 +80,7 @@ class StartRequest(BaseModel):
     decode_concurrency: int = Field(default=1, ge=1, le=8)
     prompt_concurrency: int = Field(default=1, ge=1, le=8)
     trust_remote_code: bool = False
+    lease_seconds: float = Field(default=30.0, ge=15.0, le=300.0)
 
 
 class StopRequest(BaseModel):
@@ -82,6 +94,18 @@ class StopRequest(BaseModel):
         "node-agent",
     ]
     timeout: float = 10.0
+
+
+class StopAllRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    timeout: float = Field(default=10.0, ge=0.1, le=30.0)
+
+
+class HeartbeatRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ttl_seconds: float = Field(default=30.0, ge=15.0, le=300.0)
 
 
 class RankStartRequest(BaseModel):
@@ -107,6 +131,7 @@ class RankStartRequest(BaseModel):
     decode_concurrency: int = Field(default=1, ge=1, le=8)
     prompt_concurrency: int = Field(default=1, ge=1, le=8)
     trust_remote_code: bool = False
+    lease_seconds: float = Field(default=30.0, ge=15.0, le=300.0)
 
 
 def create_app(
@@ -125,6 +150,101 @@ def create_app(
     stabilize_rank = rank_stabilize_fn or time.sleep
     wait_for_rank_connection = rank_connected_fn or _wait_for_rank_connection
     distributed_workers: list[str] = []
+    lifecycle_lock = threading.RLock()
+    watchdog_stop = threading.Event()
+    launch_generation = 0
+    lease_deadline: float | None = None
+    runtime_port = 8_000
+
+    def begin_launch(lease_seconds: float) -> int:
+        nonlocal launch_generation, lease_deadline
+        with lifecycle_lock:
+            launch_generation += 1
+            lease_deadline = time.monotonic() + lease_seconds
+            return launch_generation
+
+    def launch_is_current(generation: int) -> bool:
+        with lifecycle_lock:
+            return generation == launch_generation
+
+    def cancel_launch() -> None:
+        nonlocal launch_generation
+        with lifecycle_lock:
+            launch_generation += 1
+
+    def renew_lease(ttl_seconds: float) -> float:
+        nonlocal lease_deadline
+        with lifecycle_lock:
+            lease_deadline = time.monotonic() + ttl_seconds
+            return lease_deadline
+
+    def clear_lease() -> None:
+        nonlocal lease_deadline
+        with lifecycle_lock:
+            lease_deadline = None
+
+    def stop_local_model_roles(timeout: float) -> list[dict[str, object]]:
+        with lifecycle_lock:
+            port = runtime_port
+        try:
+            _post_json(f"http://127.0.0.1:{port}/v1/tokenity/stop", {}, 2.0)
+        except Exception:
+            pass
+        if hasattr(roles, "stop_all"):
+            statuses = roles.stop_all(MODEL_ROLES, timeout=timeout)  # type: ignore[union-attr]
+        else:
+            statuses = [roles.stop(role, timeout=timeout) for role in MODEL_ROLES]
+        return [status.__dict__ for status in statuses]
+
+    def stop_known_workers(timeout: float) -> list[dict[str, object]]:
+        with lifecycle_lock:
+            worker_urls = list(distributed_workers)
+            distributed_workers.clear()
+        results: list[dict[str, object]] = []
+        for agent_url in worker_urls:
+            try:
+                result = post_json(
+                    f"{agent_url}/v1/node/stop-all",
+                    {"timeout": timeout},
+                    timeout + 3,
+                )
+                results.append({"agent_url": agent_url, "result": result})
+            except Exception as exc:
+                results.append({"agent_url": agent_url, "error": str(exc)})
+        return results
+
+    def stop_everything(timeout: float, *, notify_workers: bool = True) -> dict[str, object]:
+        cancel_launch()
+        statuses: list[dict[str, object]] = []
+
+        def stop_local() -> None:
+            statuses.extend(stop_local_model_roles(timeout))
+
+        local_thread = threading.Thread(target=stop_local)
+        local_thread.start()
+        workers = stop_known_workers(timeout) if notify_workers else []
+        local_thread.join(timeout + 3)
+        clear_lease()
+        return {"statuses": statuses, "workers": workers}
+
+    def lease_watchdog() -> None:
+        while not watchdog_stop.wait(1.0):
+            with lifecycle_lock:
+                expired = lease_deadline is not None and time.monotonic() >= lease_deadline
+            if expired:
+                stop_everything(3.0, notify_workers=False)
+
+    @app.on_event("startup")
+    def startup_cleanup() -> None:
+        cleanup = getattr(roles, "cleanup_orphaned_model_processes", None)
+        if cleanup is not None:
+            cleanup()
+        threading.Thread(target=lease_watchdog, daemon=True).start()
+
+    @app.on_event("shutdown")
+    def shutdown_cleanup() -> None:
+        watchdog_stop.set()
+        stop_everything(3.0, notify_workers=False)
 
     @app.get("/v1/node/info")
     def node_info() -> dict[str, object]:
@@ -159,6 +279,15 @@ def create_app(
             "memory": _memory_stats(),
         }
 
+    @app.post("/v1/node/heartbeat")
+    def heartbeat(request: HeartbeatRequest) -> dict[str, object]:
+        deadline = renew_lease(request.ttl_seconds)
+        return {
+            "status": "ok",
+            "lease_seconds": request.ttl_seconds,
+            "deadline_monotonic": deadline,
+        }
+
     @app.post("/v1/node/start-official-mlx-lm")
     def start_official(request: StartRequest) -> dict[str, object]:
         del request
@@ -172,6 +301,7 @@ def create_app(
 
     @app.post("/v1/node/start-distributed-openai")
     def start_distributed(request: StartRequest) -> dict[str, object]:
+        nonlocal runtime_port
         if not request.dry_run and Path(request.python).resolve() != Path(sys.executable).resolve():
             raise HTTPException(
                 status_code=400,
@@ -187,6 +317,8 @@ def create_app(
         if request.dry_run:
             return {"dry_run": True, "launch_plan": plan}
 
+        runtime_port = request.port
+        generation = begin_launch(request.lease_seconds)
         local_request = rank_requests[0]
         local_command, local_env = _rank_command_and_environment(local_request)
         local_status = roles.start(
@@ -198,14 +330,20 @@ def create_app(
         if request.connection_mode != ConnectionMode.RING:
             if local_status.pid is None or not wait_for_rank(local_status.pid, request.starting_port, 45.0):
                 roles.stop("distributed-openai", timeout=5)
+                clear_lease()
                 raise HTTPException(
                     status_code=504,
                     detail="Coordinator rank did not open the JACCL port before the startup deadline.",
                 )
             stabilize_rank(3.0)
+        if not launch_is_current(generation):
+            roles.stop("distributed-openai", timeout=5)
+            raise HTTPException(status_code=409, detail="Model loading was cancelled.")
         started_workers: list[str] = []
         try:
             for node, rank_request in zip(nodes[1:], rank_requests[1:]):
+                if not launch_is_current(generation):
+                    raise _LaunchCancelled("Model loading was cancelled.")
                 agent_url = _agent_url(node)
                 post_json(
                     f"{agent_url}/v1/node/start-distributed-rank",
@@ -213,20 +351,26 @@ def create_app(
                     25.0,
                 )
                 started_workers.append(agent_url)
+                if not launch_is_current(generation):
+                    raise _LaunchCancelled("Model loading was cancelled.")
         except Exception as exc:
             for agent_url in started_workers:
                 try:
                     post_json(
-                        f"{agent_url}/v1/node/stop-role",
-                        {"role": "distributed-openai-rank", "timeout": 5},
+                        f"{agent_url}/v1/node/stop-all",
+                        {"timeout": 5},
                         8.0,
                     )
                 except Exception:
                     pass
             roles.stop("distributed-openai", timeout=5)
+            clear_lease()
+            if isinstance(exc, _LaunchCancelled):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
             raise HTTPException(status_code=502, detail=f"Could not start worker rank over HTTP: {exc}") from exc
 
-        distributed_workers[:] = started_workers
+        with lifecycle_lock:
+            distributed_workers[:] = started_workers
         return {
             "dry_run": False,
             "launch_plan": plan,
@@ -236,6 +380,7 @@ def create_app(
 
     @app.post("/v1/node/start-distributed-rank")
     def start_distributed_rank(request: RankStartRequest) -> dict[str, object]:
+        nonlocal runtime_port
         if request.rank >= request.world_size:
             raise HTTPException(status_code=400, detail="Rank must be smaller than world size.")
         if request.coordinator:
@@ -249,15 +394,21 @@ def create_app(
             command, env = _rank_command_and_environment(request)
         except HostfileError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        runtime_port = request.port
+        generation = begin_launch(request.lease_seconds)
         status = roles.start(
             "distributed-openai-rank",
             command,
             env=env,
             cwd=_distributed_code_root(),
         )
-        if status.pid is None or not wait_for_rank_connection(status.pid, request, 20.0):
+        connected = status.pid is not None and wait_for_rank_connection(status.pid, request, 20.0)
+        if not connected or not launch_is_current(generation):
             failed = roles.status("distributed-openai-rank")
             roles.stop("distributed-openai-rank", timeout=5)
+            clear_lease()
+            if not launch_is_current(generation):
+                raise HTTPException(status_code=409, detail="Model loading was cancelled.")
             message = getattr(failed, "message", None) or getattr(failed, "log_tail", None)
             raise HTTPException(
                 status_code=504,
@@ -267,23 +418,29 @@ def create_app(
 
     @app.post("/v1/node/stop-role")
     def stop_role(request: StopRequest) -> dict[str, object]:
+        cancel_launch()
         worker_results: list[dict[str, object]] = []
+        local_status: list[object] = []
+
+        def stop_local() -> None:
+            local_status.append(roles.stop(request.role, timeout=request.timeout))
+
+        local_thread = threading.Thread(target=stop_local)
+        local_thread.start()
         if request.role == "distributed-openai":
-            for agent_url in list(distributed_workers):
-                try:
-                    result = post_json(
-                        f"{agent_url}/v1/node/stop-role",
-                        {"role": "distributed-openai-rank", "timeout": request.timeout},
-                        request.timeout + 3,
-                    )
-                    worker_results.append({"agent_url": agent_url, "result": result})
-                except Exception as exc:
-                    worker_results.append({"agent_url": agent_url, "error": str(exc)})
-            distributed_workers.clear()
-        return {
-            "status": roles.stop(request.role, timeout=request.timeout).__dict__,
+            worker_results = stop_known_workers(request.timeout)
+        local_thread.join(request.timeout + 3)
+        status = local_status[0] if local_status else roles.status(request.role)
+        result = {
+            "status": status.__dict__,
             "workers": worker_results,
         }
+        clear_lease()
+        return result
+
+    @app.post("/v1/node/stop-all")
+    def stop_all(request: StopAllRequest) -> dict[str, object]:
+        return stop_everything(request.timeout)
 
     return app
 
@@ -293,6 +450,8 @@ def scan_models(root: Path) -> list[dict[str, object]]:
         return []
     models: list[dict[str, object]] = []
     for child in sorted(root.iterdir(), key=lambda item: item.name.lower()):
+        if child.name.startswith("."):
+            continue
         if not child.is_dir():
             continue
         config = _read_model_config(child / "config.json")
@@ -441,6 +600,7 @@ def _http_rank_requests(request: StartRequest, nodes: list[ClusterNode]) -> list
             decode_concurrency=request.decode_concurrency,
             prompt_concurrency=request.prompt_concurrency,
             trust_remote_code=request.trust_remote_code,
+            lease_seconds=request.lease_seconds,
         )
         for rank in range(world_size)
     ]
@@ -667,6 +827,17 @@ def _node_id() -> str:
 
 def _memory_stats() -> dict[str, object]:
     total = _total_memory_bytes()
+    available_ratio = _memory_pressure_available_ratio()
+    if total is not None and available_ratio is not None:
+        free = int(total * available_ratio)
+        used = max(0, total - free)
+        return {
+            "total_bytes": total,
+            "used_bytes": used,
+            "free_bytes": free,
+            "used_ratio": used / total if total > 0 else None,
+        }
+
     vm = _vm_stat_pages()
     if total is None or vm is None:
         return {
@@ -686,6 +857,23 @@ def _memory_stats() -> dict[str, object]:
         "free_bytes": free,
         "used_ratio": used / total if total > 0 else None,
     }
+
+
+def _memory_pressure_available_ratio() -> float | None:
+    try:
+        completed = subprocess.run(
+            ["/usr/bin/memory_pressure", "-Q"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"System-wide memory free percentage:\s*(\d+)%", completed.stdout)
+    if match is None:
+        return None
+    return min(max(int(match.group(1)) / 100.0, 0.0), 1.0)
 
 
 def _total_memory_bytes() -> int | None:

@@ -44,6 +44,15 @@ enum TokenityTransportError: LocalizedError {
 private struct ModelReadinessResponse: Decodable {
     var phase: String
     var message: String?
+    var progress: Double?
+    var progressCurrent: Int?
+    var progressTotal: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case phase, message, progress
+        case progressCurrent = "progress_current"
+        case progressTotal = "progress_total"
+    }
 }
 
 @MainActor
@@ -77,6 +86,7 @@ final class TokenityStore: ObservableObject {
     @Published var isScanningModels = false
     @Published var modelScanSummary = "Not scanned"
     @Published var modelLoadMessage = "No model loaded"
+    @Published private(set) var modelLoadProgress: Double?
     private static let initialChatSession = ChatSession.fresh()
 
     @Published var chatInput = ""
@@ -99,8 +109,11 @@ final class TokenityStore: ObservableObject {
     private let modelConfigurationsKey = "TokenityModelRuntimeConfigurations.v1"
     private let chatSessionsKey = "TokenityChatSessions.v1"
     private let mlxStartingPort = 30020
+    private let modelLeaseSeconds = 30.0
     private var loadedBackendRole: String?
     private var loadedServiceModelName: String?
+    private var activeModelLoadID: UUID?
+    private var modelLoadTask: Task<Void, Never>?
 
     init(
         dataTransport: @escaping DataTransport = TokenityStore.liveData(for:),
@@ -167,6 +180,10 @@ final class TokenityStore: ObservableObject {
 
     var isChatReady: Bool {
         phase == .running && loadedModelName != nil
+    }
+
+    var isModelLoading: Bool {
+        modelLoadStates.values.contains(.loading)
     }
 
     var canEditCluster: Bool {
@@ -337,6 +354,7 @@ final class TokenityStore: ObservableObject {
     func startStatusRefreshLoop() async {
         await refreshSelectedNodeStatus()
         while !Task.isCancelled {
+            await renewModelLeasesIfNeeded()
             try? await Task.sleep(for: .seconds(5))
             await refreshSelectedNodeStatus()
         }
@@ -391,6 +409,13 @@ final class TokenityStore: ObservableObject {
         appendLog("\(node.displayName) \(selection.contains(node.id) ? "added to" : "removed from") the cluster selection.")
     }
 
+    func beginLoadingModel(_ row: ModelLibraryRow) {
+        modelLoadTask?.cancel()
+        modelLoadTask = Task { [weak self] in
+            await self?.loadModel(row)
+        }
+    }
+
     func loadModel(_ row: ModelLibraryRow) async {
         guard phase == .running else {
             appendLog("Create a cluster before loading a model.")
@@ -420,16 +445,27 @@ final class TokenityStore: ObservableObject {
         modelLoadStates = states
         modelPath = row.representativePath
         modelLoadMessage = "Loading \(row.displayName)..."
+        modelLoadProgress = 0
         appendLog("Loading model: \(row.displayName).")
         let configuration = modelConfiguration(for: row.id)
+        let operationID = UUID()
+        activeModelLoadID = operationID
 
         do {
-            if let role = loadedBackendRole {
-                try await stopBackendRole(role)
-            }
+            // Clear stale roles on every selected Mac. This also makes switching
+            // from GLM to Qwen deterministic after the control App has restarted.
+            try await cleanupAllModelRoles()
+            try ensureActiveModelLoad(operationID)
             let role = backendRole
+            loadedBackendRole = role
             try await startBackendModel(row, role: role, configuration: configuration)
-            let serviceModelName = try await waitForModelService(modelName: row.displayName, role: role)
+            try ensureActiveModelLoad(operationID)
+            let serviceModelName = try await waitForModelService(
+                modelName: row.displayName,
+                role: role,
+                operationID: operationID
+            )
+            try ensureActiveModelLoad(operationID)
 
             states = modelLoadStates
             for key in states.keys where key != row.id {
@@ -439,18 +475,30 @@ final class TokenityStore: ObservableObject {
             modelLoadStates = states
             loadedBackendRole = role
             loadedServiceModelName = serviceModelName
+            activeModelLoadID = nil
+            modelLoadTask = nil
+            modelLoadProgress = 1
             modelLoadMessage = "\(row.displayName) is loaded."
             appendLog("Model loaded: \(row.displayName).")
-        } catch {
-            if let role = loadedBackendRole ?? (modelLoadStates[row.id] == .loading ? backendRole : nil) {
-                try? await stopBackendRole(role)
+        } catch is CancellationError {
+            try? await cleanupAllModelRoles()
+            if activeModelLoadID == operationID {
+                activeModelLoadID = nil
+                resetModelLoadState(message: "Model loading cancelled.")
+                appendLog("Model loading cancelled: \(row.displayName).")
             }
+        } catch {
+            try? await cleanupAllModelRoles()
+            guard activeModelLoadID == operationID else { return }
+            activeModelLoadID = nil
+            modelLoadTask = nil
             states = modelLoadStates
             states[row.id] = .notLoaded
             modelLoadStates = states
             modelPath = ""
             loadedBackendRole = nil
             loadedServiceModelName = nil
+            modelLoadProgress = nil
             let message = userFacingMessage(for: error)
             modelLoadMessage = message
             appendLog("Model load failed: \(message)")
@@ -458,22 +506,16 @@ final class TokenityStore: ObservableObject {
     }
 
     func stopModel(_ row: ModelLibraryRow) async {
-        if let role = loadedBackendRole {
-            do {
-                try await stopBackendRole(role)
-            } catch {
-                appendLog("Model stop request could not reach the cluster service.")
-            }
+        activeModelLoadID = nil
+        modelLoadTask?.cancel()
+        modelLoadTask = nil
+        modelLoadMessage = "Stopping \(row.displayName)..."
+        do {
+            try await cleanupAllModelRoles()
+        } catch {
+            appendLog("Some model stop requests could not reach a selected Mac: \(userFacingMessage(for: error))")
         }
-        var states = modelLoadStates
-        states[row.id] = .notLoaded
-        modelLoadStates = states
-        if loadedModelName == nil {
-            modelPath = ""
-        }
-        loadedBackendRole = nil
-        loadedServiceModelName = nil
-        modelLoadMessage = "No model loaded"
+        resetModelLoadState(message: "No model loaded")
         appendLog("Model stopped: \(row.displayName).")
     }
 
@@ -571,11 +613,25 @@ final class TokenityStore: ObservableObject {
 
     func stopCluster() async {
         phase = .stopping
-        if let role = loadedBackendRole {
-            try? await stopBackendRole(role)
+        activeModelLoadID = nil
+        modelLoadTask?.cancel()
+        modelLoadTask = nil
+        do {
+            try await cleanupAllModelRoles()
+        } catch {
+            appendLog("Cluster cleanup could not reach every selected Mac: \(userFacingMessage(for: error))")
         }
-        unloadAllModels()
+        resetModelLoadState(message: "No model loaded")
         appendLog("Cluster stopped.")
+        phase = .stopped
+    }
+
+    func shutdownForApplicationTermination() async {
+        activeModelLoadID = nil
+        modelLoadTask?.cancel()
+        modelLoadTask = nil
+        try? await cleanupAllModelRoles()
+        resetModelLoadState(message: "No model loaded")
         phase = .stopped
     }
 
@@ -674,15 +730,17 @@ final class TokenityStore: ObservableObject {
         }
     }
 
-    private func unloadAllModels() {
-        guard !modelLoadStates.isEmpty || !modelPath.isEmpty else { return }
+    private func resetModelLoadState(message: String) {
         var states = modelLoadStates
         for key in states.keys {
             states[key] = .notLoaded
         }
         modelLoadStates = states
         modelPath = ""
+        loadedBackendRole = nil
         loadedServiceModelName = nil
+        modelLoadProgress = nil
+        modelLoadMessage = message
     }
 
     private func appendLog(_ line: String) {
@@ -774,7 +832,8 @@ final class TokenityStore: ObservableObject {
             prefillStepSize: configuration.prefillStepSize,
             decodeConcurrency: configuration.decodeConcurrency,
             promptConcurrency: configuration.promptConcurrency,
-            trustRemoteCode: configuration.trustRemoteCode
+            trustRemoteCode: configuration.trustRemoteCode,
+            leaseSeconds: modelLeaseSeconds
         )
         var request = try jsonRequest(url: baseURL.appendingPathComponent(backendStartPath), body: requestBody)
         request.timeoutInterval = 40
@@ -782,8 +841,8 @@ final class TokenityStore: ObservableObject {
         try validate(response, data: data)
     }
 
-    private func stopBackendRole(_ role: String) async throws {
-        guard let baseURL = clusterControlBaseURL() else { throw TokenityTransportError.missingClusterControl }
+    private func stopBackendRole(_ role: String, on node: TokenityNode) async throws {
+        guard let baseURL = URL(string: node.agentURL) else { throw TokenityTransportError.missingClusterControl }
         var request = try jsonRequest(
             url: baseURL.appendingPathComponent("/v1/node/stop-role"),
             body: AgentStopRoleRequest(role: role, timeout: 10)
@@ -793,13 +852,71 @@ final class TokenityStore: ObservableObject {
         try validate(response, data: data)
     }
 
-    private func waitForModelService(modelName: String, role: String) async throws -> String {
+    private func cleanupAllModelRoles() async throws {
+        let roles = ["distributed-openai", "distributed-openai-rank", "single-node-openai", "official-mlx-lm"]
+        var firstError: Error?
+        for node in selectedNodes {
+            guard let baseURL = URL(string: node.agentURL) else {
+                firstError = firstError ?? TokenityTransportError.missingClusterControl
+                continue
+            }
+            do {
+                var request = try jsonRequest(
+                    url: baseURL.appendingPathComponent("/v1/node/stop-all"),
+                    body: AgentStopAllRequest(timeout: 10)
+                )
+                request.timeoutInterval = 15
+                let (data, response) = try await dataTransport(request)
+                try validate(response, data: data)
+            } catch {
+                var fallbackSucceeded = false
+                var fallbackError: Error = error
+                for role in roles {
+                    do {
+                        try await stopBackendRole(role, on: node)
+                        fallbackSucceeded = true
+                    } catch {
+                        fallbackError = error
+                    }
+                }
+                if !fallbackSucceeded {
+                    firstError = firstError ?? fallbackError
+                }
+            }
+        }
+        if let firstError {
+            throw firstError
+        }
+    }
+
+    private func renewModelLeasesIfNeeded() async {
+        guard isModelLoading || loadedModelName != nil else { return }
+        for node in selectedNodes {
+            guard let baseURL = URL(string: node.agentURL),
+                  let request = try? jsonRequest(
+                    url: baseURL.appendingPathComponent("/v1/node/heartbeat"),
+                    body: AgentHeartbeatRequest(ttlSeconds: modelLeaseSeconds)
+                  ) else { continue }
+            var heartbeat = request
+            heartbeat.timeoutInterval = 3
+            _ = try? await dataTransport(heartbeat)
+        }
+    }
+
+    private func ensureActiveModelLoad(_ operationID: UUID) throws {
+        guard !Task.isCancelled, activeModelLoadID == operationID else {
+            throw CancellationError()
+        }
+    }
+
+    private func waitForModelService(modelName: String, role: String, operationID: UUID) async throws -> String {
         guard let url = modelServiceURL(path: "/v1/models") else { throw TokenityTransportError.missingModelService }
         let deadline = Date().addingTimeInterval(600)
         let emptyModelListDeadline = Date().addingTimeInterval(20)
         var lastError: Error?
 
         repeat {
+            try ensureActiveModelLoad(operationID)
             do {
                 var request = URLRequest(url: url)
                 request.timeoutInterval = 8
@@ -810,6 +927,7 @@ final class TokenityStore: ObservableObject {
                     model.id == modelName || model.id == modelPath || URL(fileURLWithPath: model.id).lastPathComponent == modelName
                 }) {
                     if let readiness = try? await fetchModelReadiness() {
+                        updateModelLoadProgress(readiness, modelName: modelName)
                         if readiness.phase == "failed" {
                             throw TokenityTransportError.backendExited(readiness.message ?? "The model backend reported a failed readiness state.")
                         }
@@ -823,14 +941,20 @@ final class TokenityStore: ObservableObject {
                 if Date() >= emptyModelListDeadline {
                     throw TokenityTransportError.modelServiceReturnedNoModels(modelName)
                 }
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 if case TokenityTransportError.modelServiceReturnedNoModels = error {
                     throw error
                 }
                 lastError = error
             }
-            if let readiness = try? await fetchModelReadiness(), readiness.phase == "failed" {
-                throw TokenityTransportError.backendExited(readiness.message ?? "The model backend reported a failed readiness state.")
+            try ensureActiveModelLoad(operationID)
+            if let readiness = try? await fetchModelReadiness() {
+                updateModelLoadProgress(readiness, modelName: modelName)
+                if readiness.phase == "failed" {
+                    throw TokenityTransportError.backendExited(readiness.message ?? "The model backend reported a failed readiness state.")
+                }
             }
             if let status = try? await fetchBackendStatus(role: role), status.state == "stopped" || status.state == "failed" {
                 throw TokenityTransportError.backendExited(backendExitMessage(for: status))
@@ -881,6 +1005,30 @@ final class TokenityStore: ObservableObject {
         let (data, response) = try await dataTransport(request)
         try validate(response, data: data)
         return try JSONDecoder().decode(ModelReadinessResponse.self, from: data)
+    }
+
+    private func updateModelLoadProgress(_ readiness: ModelReadinessResponse, modelName: String) {
+        let phaseProgress: Double?
+        switch readiness.phase {
+        case "launching": phaseProgress = 0.01
+        case "distributed_init": phaseProgress = 0.05
+        case "loading_model": phaseProgress = readiness.progress ?? 0.1
+        case "compiling": phaseProgress = readiness.progress ?? 0.96
+        case "ready": phaseProgress = 1
+        default: phaseProgress = readiness.progress
+        }
+        if let phaseProgress {
+            let bounded = min(max(phaseProgress, 0), 1)
+            modelLoadProgress = max(modelLoadProgress ?? 0, bounded)
+        }
+        if readiness.phase == "ready" {
+            modelLoadMessage = "Finalizing \(modelName)..."
+        } else if let progress = modelLoadProgress {
+            let percent = Int((progress * 100).rounded())
+            modelLoadMessage = "Loading \(modelName)... \(percent)%"
+        } else if let message = readiness.message, !message.isEmpty {
+            modelLoadMessage = message
+        }
     }
 
     private func backendExitMessage(for status: ProcessRole) -> String {

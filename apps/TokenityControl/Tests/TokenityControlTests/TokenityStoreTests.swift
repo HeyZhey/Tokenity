@@ -237,6 +237,71 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertTrue(store.modelLoadMessage.contains("Changing queue pair"))
     }
 
+    func testStopDuringLoadingCancelsTheRequestAndCleansEverySelectedNode() async {
+        let startSeen = expectation(description: "backend start began")
+        var stopAllRequests = 0
+        let store = TokenityStore(dataTransport: { request in
+            let path = request.url?.path ?? ""
+            let payload: String
+            if path == "/v1/node/stop-all" {
+                stopAllRequests += 1
+                payload = #"{"statuses":[]}"#
+            } else if path.contains("/v1/node/start") {
+                startSeen.fulfill()
+                try await Task.sleep(for: .seconds(30))
+                payload = #"{"status":{"state":"running"}}"#
+            } else {
+                payload = #"{}"#
+            }
+            let response = HTTPURLResponse(
+                url: request.url ?? URL(string: "http://127.0.0.1")!,
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            return (Data(payload.utf8), response)
+        })
+        store.connectionMode = .ring
+        store.createCluster()
+        guard let first = store.modelLibraryRows.first else {
+            XCTFail("Expected sample model")
+            return
+        }
+
+        store.beginLoadingModel(first)
+        await fulfillment(of: [startSeen], timeout: 2)
+        await store.stopModel(first)
+        try? await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertFalse(store.isModelLoading)
+        XCTAssertNil(store.loadedModelName)
+        XCTAssertEqual(store.modelLoadMessage, "No model loaded")
+        XCTAssertGreaterThanOrEqual(stopAllRequests, store.selectedNodes.count * 2)
+    }
+
+    func testApplicationTerminationCleanupStopsAllSelectedNodes() async {
+        var stopAllHosts: Set<String> = []
+        let store = TokenityStore(dataTransport: { request in
+            if request.url?.path == "/v1/node/stop-all", let host = request.url?.host {
+                stopAllHosts.insert(host)
+            }
+            let response = HTTPURLResponse(
+                url: request.url ?? URL(string: "http://127.0.0.1")!,
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            return (Data(#"{"statuses":[]}"#.utf8), response)
+        })
+        store.connectionMode = .ring
+        store.createCluster()
+
+        await store.shutdownForApplicationTermination()
+
+        XCTAssertEqual(store.phase, .stopped)
+        XCTAssertEqual(stopAllHosts, Set(["192.168.5.23", "192.168.5.75"]))
+    }
+
     func testThinkingSplitterSeparatesThinkBlock() {
         let result = TokenityStore.splitThinking("<think>plan first</think>Final answer")
 

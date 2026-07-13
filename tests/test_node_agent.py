@@ -124,6 +124,37 @@ def test_supervisor_captures_process_output(tmp_path: Path):
         supervisor.stop("probe", timeout=1)
 
 
+def test_supervisor_replaces_a_running_role_when_the_model_command_changes(tmp_path: Path):
+    supervisor = RoleSupervisor(log_dir=tmp_path)
+    first = supervisor.start(
+        "distributed-openai",
+        [sys.executable, "-c", "import time; time.sleep(30)", "--model", "GLM"],
+    )
+    second = supervisor.start(
+        "distributed-openai",
+        [sys.executable, "-c", "import time; time.sleep(30)", "--model", "Qwen"],
+    )
+
+    try:
+        assert first.pid is not None
+        assert second.pid is not None
+        assert second.pid != first.pid
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            process_exists = subprocess.run(
+                ["/bin/ps", "-p", str(first.pid)],
+                capture_output=True,
+                check=False,
+            ).returncode == 0
+            if not process_exists:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("the old model role survived replacement")
+    finally:
+        supervisor.stop("distributed-openai", timeout=1)
+
+
 def test_supervisor_keeps_child_stdin_open(tmp_path: Path):
     supervisor = RoleSupervisor(log_dir=tmp_path)
     status = supervisor.start(
@@ -511,8 +542,26 @@ def test_distributed_start_fans_out_worker_rank_over_http():
         json={"role": "distributed-openai", "timeout": 5},
     )
     assert stop.status_code == 200
-    assert posts[-1][0] == "http://192.168.5.75:9100/v1/node/stop-role"
-    assert posts[-1][1]["role"] == "distributed-openai-rank"
+    assert posts[-1][0] == "http://192.168.5.75:9100/v1/node/stop-all"
+    assert posts[-1][1]["timeout"] == 5
+
+
+def test_stop_all_stops_every_model_role_and_heartbeat_renews_lease():
+    supervisor = _FakeSupervisor()
+    client = TestClient(create_app(rdma_probe_fn=fake_rdma_probe, supervisor=supervisor))
+
+    heartbeat = client.post("/v1/node/heartbeat", json={"ttl_seconds": 45})
+    stop = client.post("/v1/node/stop-all", json={"timeout": 2})
+
+    assert heartbeat.status_code == 200
+    assert heartbeat.json()["lease_seconds"] == 45
+    assert stop.status_code == 200
+    assert {role for role, _ in supervisor.stops} == {
+        "distributed-openai",
+        "distributed-openai-rank",
+        "single-node-openai",
+        "official-mlx-lm",
+    }
 
 
 def test_remote_rank_rejects_a_caller_selected_python_executable():

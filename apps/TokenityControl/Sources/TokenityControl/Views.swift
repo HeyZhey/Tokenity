@@ -875,9 +875,10 @@ struct ModelsPage: View {
                         ModelLoadRow(
                             row: row,
                             selectedNodeCount: store.selectedNodes.count,
-                            clusterIsReady: store.phase == .running,
+                            clusterIsReady: store.phase == .running && !store.isModelLoading,
+                            loadingProgress: row.loadState == .loading ? store.modelLoadProgress : nil,
                             configurationAction: { configurationTarget = row },
-                            loadAction: { Task { await store.loadModel(row) } },
+                            loadAction: { store.beginLoadingModel(row) },
                             stopAction: { Task { await store.stopModel(row) } }
                         )
                     }
@@ -905,6 +906,7 @@ private struct ModelLoadRow: View {
     let row: ModelLibraryRow
     let selectedNodeCount: Int
     let clusterIsReady: Bool
+    let loadingProgress: Double?
     let configurationAction: () -> Void
     let loadAction: () -> Void
     let stopAction: () -> Void
@@ -944,6 +946,21 @@ private struct ModelLoadRow: View {
                     .font(.tokenityText(11))
                     .foregroundStyle(theme.secondaryText)
                     .lineLimit(1)
+                if row.loadState == .loading {
+                    HStack(spacing: 8) {
+                        if let loadingProgress {
+                            ProgressView(value: loadingProgress, total: 1)
+                            Text("\(Int((loadingProgress * 100).rounded()))%")
+                                .frame(width: 36, alignment: .trailing)
+                        } else {
+                            ProgressView()
+                            Text("Preparing ranks...")
+                        }
+                    }
+                    .font(.tokenityText(11, weight: .medium))
+                    .foregroundStyle(theme.secondaryText)
+                    .accessibilityLabel("Model loading progress")
+                }
             }
 
             Spacer(minLength: 0)
@@ -964,10 +981,11 @@ private struct ModelLoadRow: View {
                 }
             case .loading:
                 Button {
+                    stopAction()
                 } label: {
-                    Label("Loading", systemImage: "hourglass")
+                    Label("Stop", systemImage: "stop.fill")
                 }
-                .disabled(true)
+                .help("Cancel loading and release model memory on every selected Mac")
             case .notLoaded:
                 Button {
                     loadAction()

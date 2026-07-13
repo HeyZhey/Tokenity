@@ -569,6 +569,7 @@ struct AgentStartModelRequest: Encodable {
     var decodeConcurrency: Int
     var promptConcurrency: Int
     var trustRemoteCode: Bool
+    var leaseSeconds: Double = 30
 
     enum CodingKeys: String, CodingKey {
         case model, nodes, host, port
@@ -581,12 +582,25 @@ struct AgentStartModelRequest: Encodable {
         case decodeConcurrency = "decode_concurrency"
         case promptConcurrency = "prompt_concurrency"
         case trustRemoteCode = "trust_remote_code"
+        case leaseSeconds = "lease_seconds"
     }
 }
 
 struct AgentStopRoleRequest: Encodable {
     var role: String
     var timeout: Double
+}
+
+struct AgentStopAllRequest: Encodable {
+    var timeout: Double
+}
+
+struct AgentHeartbeatRequest: Encodable {
+    var ttlSeconds: Double
+
+    enum CodingKeys: String, CodingKey {
+        case ttlSeconds = "ttl_seconds"
+    }
 }
 
 struct OpenAIChatChunk: Decodable {

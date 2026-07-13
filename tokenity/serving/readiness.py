@@ -24,6 +24,9 @@ class ReadinessState:
     backend: str = "single"
     model: str | None = None
     message: str | None = None
+    progress: float | None = None
+    progress_current: int | None = None
+    progress_total: int | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -33,4 +36,7 @@ class ReadinessState:
             "backend": self.backend,
             "model": self.model,
             "message": self.message,
+            "progress": self.progress,
+            "progress_current": self.progress_current,
+            "progress_total": self.progress_total,
         }

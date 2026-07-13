@@ -6,6 +6,8 @@ from fastapi.testclient import TestClient
 
 from tokenity.serving.distributed_openai import (
     TokenityDistributedRuntime,
+    _report_load_progress,
+    _set_active_load_state,
     _stream_payload,
     create_app,
 )
@@ -75,3 +77,17 @@ def test_stream_payload_keeps_reasoning_separate_from_answer():
     assert reasoning["choices"][0]["delta"] == {"reasoning_content": "check the plan"}
     assert answer is not None
     assert answer["choices"][0]["delta"] == {"content": "Final answer"}
+
+
+def test_readiness_reports_real_parameter_load_progress():
+    state = ReadinessState(model="/models/qwen")
+    _set_active_load_state(state)
+    try:
+        _report_load_progress(25, 100)
+    finally:
+        _set_active_load_state(None)
+
+    payload = state.to_dict()
+    assert payload["progress_current"] == 25
+    assert payload["progress_total"] == 100
+    assert 0.3 < payload["progress"] < 0.4

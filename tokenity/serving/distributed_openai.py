@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import gc
 import json
 import logging
 import os
+import signal
 import threading
 import time
 import uuid
@@ -45,6 +47,44 @@ class _GenerationResult:
     prompt_tokens: int
     completion_tokens: int
     prompt_cache_tokens: int | None
+
+
+_LOAD_PROGRESS_LOCK = threading.Lock()
+_ACTIVE_LOAD_STATE: ReadinessState | None = None
+_ACTIVE_LOAD_CANCEL: threading.Event | None = None
+
+
+class _ModelLoadCancelled(SystemExit):
+    pass
+
+
+def _set_active_load_state(
+    state: ReadinessState | None,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    global _ACTIVE_LOAD_STATE, _ACTIVE_LOAD_CANCEL
+    with _LOAD_PROGRESS_LOCK:
+        _ACTIVE_LOAD_STATE = state
+        _ACTIVE_LOAD_CANCEL = cancel_event
+
+
+def _load_was_cancelled() -> bool:
+    with _LOAD_PROGRESS_LOCK:
+        cancel_event = _ACTIVE_LOAD_CANCEL
+    return cancel_event is not None and cancel_event.is_set()
+
+
+def _report_load_progress(current: int, total: int) -> None:
+    with _LOAD_PROGRESS_LOCK:
+        state = _ACTIVE_LOAD_STATE
+    if state is None or total <= 0:
+        return
+    state.progress_current = current
+    state.progress_total = total
+    # Reserve the first 10% for distributed initialization and the final 5%
+    # for provider publication/compilation.
+    state.progress = min(0.95, 0.1 + (0.85 * current / total))
+    state.message = f"Loading model parameters ({current}/{total})."
 
 
 @dataclass
@@ -188,7 +228,10 @@ def _eval_parameters_in_chunks(mx: Any, flattened_parameters: list[tuple[str, An
         total_chunks,
         chunk_size,
     )
+    _report_load_progress(0, total_chunks)
     for start in range(0, len(flattened_parameters), chunk_size):
+        if _load_was_cancelled():
+            raise _ModelLoadCancelled("Tokenity model loading was cancelled.")
         chunk = flattened_parameters[start : start + chunk_size]
         chunk_index = start // chunk_size + 1
         should_log = chunk_index == 1 or chunk_index == total_chunks or chunk_index % log_interval == 0
@@ -200,6 +243,9 @@ def _eval_parameters_in_chunks(mx: Any, flattened_parameters: list[tuple[str, An
                 _describe_eval_chunk(chunk),
             )
         mx.eval([value for _, value in chunk])
+        if _load_was_cancelled():
+            raise _ModelLoadCancelled("Tokenity model loading was cancelled.")
+        _report_load_progress(chunk_index, total_chunks)
         if should_log:
             logging.warning(
                 "Tokenity chunked sharded_load finished chunk %s/%s.",
@@ -296,9 +342,13 @@ class TokenityDistributedRuntime:
         self._generator: Any = None
         self._group: Any = None
         self._load_monitor: threading.Thread | None = None
+        self._stop_event = threading.Event()
 
     def start(self) -> None:
         self.state.phase = ReadinessPhase.DISTRIBUTED_INIT
+        self.state.progress = 0.02
+        self.state.message = "Initializing the MLX distributed group."
+        _set_active_load_state(self.state, self._stop_event)
         try:
             import mlx.core as mx  # type: ignore
 
@@ -309,6 +359,7 @@ class TokenityDistributedRuntime:
         except Exception as exc:  # pragma: no cover - depends on target MLX runtime
             self.state.phase = ReadinessPhase.FAILED
             self.state.message = f"MLX distributed init failed: {exc}"
+            _set_active_load_state(None)
             raise
 
         self.state.rank = int(self._group.rank())
@@ -316,6 +367,7 @@ class TokenityDistributedRuntime:
         self.state.backend = "mlx-distributed" if self.state.world_size > 1 else "single"
 
         self.state.phase = ReadinessPhase.LOADING_MODEL
+        self.state.progress = 0.1
         self._symbols = _MLXServerSymbols.load()
         args = self._server_args()
         self._provider = self._symbols.ModelProvider(args)
@@ -331,12 +383,47 @@ class TokenityDistributedRuntime:
 
     def join(self) -> None:
         if self._generator is not None:
-            self._generator.join()
+            try:
+                self._generator.join()
+            finally:
+                self._release_memory()
+
+    def request_stop(self) -> None:
+        self._stop_event.set()
+        self.state.phase = ReadinessPhase.STOPPING
+        self.state.message = "Stopping model runtime and releasing MLX memory."
+        if self._generator is not None:
+            self._generator._stop = True
 
     def stop(self) -> None:
+        self.request_stop()
         if self._generator is not None:
             self.state.phase = ReadinessPhase.STOPPING
-            self._generator.stop_and_join()
+            self.state.message = "Stopping model runtime and releasing MLX memory."
+            try:
+                self._generator.stop_and_join()
+            finally:
+                self._release_memory()
+
+    def _release_memory(self) -> None:
+        clear_mlx_cache = self.state.rank == 0
+        _set_active_load_state(None)
+        self._generator = None
+        self._provider = None
+        self._symbols = None
+        self._group = None
+        gc.collect()
+        if not clear_mlx_cache:
+            # Worker ranks can block in a distributed Metal cache teardown
+            # after rank 0 has already exited. Process exit releases their
+            # allocations without requiring a cross-rank cache operation.
+            return
+        try:
+            import mlx.core as mx  # type: ignore
+
+            mx.clear_cache()
+        except Exception:
+            logging.exception("Tokenity could not clear the MLX memory cache during shutdown")
 
     def accepts_model(self, model: str) -> bool:
         return model in {"default_model", self.model, self.model_id}
@@ -544,11 +631,15 @@ class TokenityDistributedRuntime:
             if getattr(self._provider, "model", None) is not None:
                 if self.state.phase == ReadinessPhase.LOADING_MODEL:
                     self.state.phase = ReadinessPhase.READY
+                    self.state.progress = 1.0
+                    self.state.progress_current = self.state.progress_total
                     self.state.message = "Runtime is accepting generation requests."
+                    _set_active_load_state(None)
                 return
             if generation_thread is not None and not generation_thread.is_alive():
                 self.state.phase = ReadinessPhase.FAILED
                 self.state.message = "MLX-LM generation thread exited before the model finished loading."
+                _set_active_load_state(None)
                 return
             time.sleep(0.5)
 
@@ -601,6 +692,14 @@ def create_app(
             "status": "ok" if state.phase != ReadinessPhase.FAILED else "failed",
             "phase": state.phase.value,
         }
+
+    @app.post("/v1/tokenity/stop")
+    def request_stop() -> dict[str, object]:
+        if runtime is not None:
+            runtime.request_stop()
+        state.phase = ReadinessPhase.STOPPING
+        state.message = "Stopping model runtime and releasing MLX memory."
+        return {"status": "stopping"}
 
     @app.get("/v1/models")
     def models() -> dict[str, object]:
@@ -769,10 +868,16 @@ def serve(
         logging.exception("Tokenity distributed runtime failed during startup")
         state.phase = ReadinessPhase.FAILED
         state.message = f"Tokenity distributed runtime failed: {exc}"
+        _set_active_load_state(None)
         if require_mlx:
             raise
 
     if runtime is not None and not runtime.is_rank0():
+        def request_rank_stop(_signum: int, _frame: Any) -> None:
+            runtime.request_stop()
+
+        signal.signal(signal.SIGTERM, request_rank_stop)
+        signal.signal(signal.SIGINT, request_rank_stop)
         runtime.join()
         return
 
@@ -780,4 +885,5 @@ def serve(
         create_app(model=model, require_mlx=require_mlx, runtime=runtime),
         host=host,
         port=port,
+        timeout_graceful_shutdown=5,
     )
