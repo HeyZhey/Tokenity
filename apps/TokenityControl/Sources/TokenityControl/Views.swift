@@ -673,14 +673,24 @@ struct ChatPage: View {
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(1...4)
                 .onSubmit {
-                    Task { await store.sendChatMessage() }
+                    store.beginSendingChatMessage()
                 }
             Button {
-                Task { await store.sendChatMessage() }
+                if store.isChatRunning {
+                    store.cancelChatGeneration()
+                } else {
+                    store.beginSendingChatMessage()
+                }
             } label: {
-                Label(store.isChatRunning ? "Sending" : "Send", systemImage: "paperplane.fill")
+                Label(
+                    store.isChatRunning ? "Stop" : "Send",
+                    systemImage: store.isChatRunning ? "stop.circle.fill" : "paperplane.fill"
+                )
             }
-            .disabled(store.chatInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || store.isChatRunning || !store.isChatReady)
+            .disabled(
+                !store.isChatRunning
+                    && (store.chatInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !store.isChatReady)
+            )
         }
     }
 

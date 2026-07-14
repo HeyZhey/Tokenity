@@ -35,8 +35,9 @@ fit across the combined unified memory of several machines.
 - Model inventory with format, quantization, size, architecture, and shard metadata.
 - GLM-5.2 cross-layer DSA indexer compatibility based on upstream mlx-lm PR #1410.
 - Per-model runtime and sampling configuration.
-- Streaming Chat with expanded reasoning, automatic scrolling, metrics, and separate history sessions.
+- Streaming Chat with expanded reasoning, automatic scrolling, metrics, separate history sessions, and immediate cancellation.
 - Automatic non-streaming recovery when a macOS streaming connection fails before the first token.
+- Model unload, cluster stop, and app shutdown cancel the active generation before backend teardown.
 - OpenAI-compatible API for Cherry Studio, Msty, scripts, and other local clients.
 - Node-level RDMA, memory, process, and model diagnostics.
 - Reproducible Python and Swift verification in one command.
@@ -195,6 +196,11 @@ Tokenity Chat provides:
 - First-response time, total time, and approximate token rate.
 - Independent persistent conversation sessions in a collapsible history sidebar.
 - Protection against carrying incomplete or failed turns into the next prompt.
+- A **Stop** control for active generation; unloading a model, stopping the cluster,
+  or closing Tokenity also cancels the request immediately and excludes the
+  incomplete turn from future context.
+- A bounded SSE buffer with backpressure, preventing a fast producer from
+  leaving stale tokens queued in the UI after cancellation.
 - Automatic non-streaming fallback if the native streaming connection fails
   before any model output arrives.
 

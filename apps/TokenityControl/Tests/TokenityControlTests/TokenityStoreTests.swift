@@ -655,6 +655,67 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertTrue(store.chatMessages.last?.content.contains("did not finish a final answer") ?? false)
     }
 
+    func testModelUnloadCancelsActiveChatAndIgnoresLateStreamChunks() async {
+        var streamContinuation: AsyncThrowingStream<String, Error>.Continuation?
+        var fallbackChatRequests = 0
+        let suiteName = "TokenityStoreTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = TokenityStore(
+            dataTransport: { request in
+                if request.url?.path == "/v1/chat/completions" {
+                    fallbackChatRequests += 1
+                }
+                return try await Self.successfulModelTransport(request)
+            },
+            lineStreamTransport: { _ in
+                AsyncThrowingStream { continuation in
+                    streamContinuation = continuation
+                }
+            },
+            userDefaults: defaults
+        )
+        guard let first = store.modelLibraryRows.first else {
+            XCTFail("Expected sample model")
+            return
+        }
+        store.connectionMode = .ring
+        store.createCluster()
+        await store.loadModel(first)
+        fallbackChatRequests = 0
+        store.chatInput = "Keep generating until I unload the model."
+
+        store.beginSendingChatMessage()
+        for _ in 0..<100 where !store.isChatRunning || streamContinuation == nil {
+            await Task.yield()
+        }
+        XCTAssertTrue(store.isChatRunning)
+        XCTAssertNotNil(streamContinuation)
+
+        streamContinuation?.yield("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"partial thought\"},\"finish_reason\":null}]}")
+        for _ in 0..<100 where !(store.chatMessages.last?.thinking.contains("partial thought") ?? false) {
+            await Task.yield()
+        }
+        XCTAssertTrue(store.chatMessages.last?.thinking.contains("partial thought") ?? false)
+
+        await store.stopModel(first)
+        let contentAfterUnload = store.chatMessages.last?.content
+        let thinkingAfterUnload = store.chatMessages.last?.thinking
+
+        streamContinuation?.yield("data: {\"choices\":[{\"delta\":{\"content\":\"late output that must be ignored\"},\"finish_reason\":null}]}")
+        streamContinuation?.yield("data: [DONE]")
+        streamContinuation?.finish()
+        for _ in 0..<10 { await Task.yield() }
+
+        XCTAssertFalse(store.isChatRunning)
+        XCTAssertNil(store.loadedModelName)
+        XCTAssertEqual(store.chatMessages.last?.content, contentAfterUnload)
+        XCTAssertEqual(store.chatMessages.last?.thinking, thinkingAfterUnload)
+        XCTAssertTrue(contentAfterUnload?.contains("model was unloaded") ?? false)
+        XCTAssertEqual(store.chatMessages.suffix(2).map(\.includeInContext), [false, false])
+        XCTAssertEqual(fallbackChatRequests, 0)
+    }
+
     func testChatRequestExcludesWelcomeMessageAndUsesModelConfiguration() async throws {
         var streamedRequest: URLRequest?
         let suiteName = "TokenityStoreTests.\(UUID().uuidString)"

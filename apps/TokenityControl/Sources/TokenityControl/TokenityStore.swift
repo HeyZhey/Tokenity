@@ -124,6 +124,11 @@ final class TokenityStore: ObservableObject {
     private var legacyNativeMTPFallback: NativeMTPReadiness?
     private var activeModelLoadID: UUID?
     private var modelLoadTask: Task<Void, Never>?
+    private var activeChatRequestID: UUID?
+    private var activeChatUserIndex: Int?
+    private var activeChatAssistantIndex: Int?
+    private var chatTask: Task<Void, Never>?
+    private var chatTaskID: UUID?
 
     init(
         dataTransport: @escaping DataTransport = TokenityStore.liveData(for:),
@@ -494,6 +499,12 @@ final class TokenityStore: ObservableObject {
             }
         }
 
+        let cancelledChatTask = cancelActiveChat(
+            message: "Generation stopped because another model started loading.",
+            logReason: "model load"
+        )
+        if let cancelledChatTask { await cancelledChatTask.value }
+
         var states = modelLoadStates
         for key in states.keys where key != row.id {
             states[key] = .notLoaded
@@ -565,6 +576,11 @@ final class TokenityStore: ObservableObject {
     }
 
     func stopModel(_ row: ModelLibraryRow) async {
+        let cancelledChatTask = cancelActiveChat(
+            message: "Generation stopped because the model was unloaded.",
+            logReason: "model unload"
+        )
+        if let cancelledChatTask { await cancelledChatTask.value }
         activeModelLoadID = nil
         modelLoadTask?.cancel()
         modelLoadTask = nil
@@ -588,6 +604,28 @@ final class TokenityStore: ObservableObject {
         appendLog("Model stopped: \(row.displayName).")
     }
 
+    func beginSendingChatMessage() {
+        let prompt = chatInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty, !isChatRunning, chatTask == nil else { return }
+        guard loadedModelName != nil, phase == .running else {
+            appendLog("Chat is waiting for a running cluster and loaded model.")
+            return
+        }
+        let taskID = UUID()
+        chatTaskID = taskID
+        chatTask = Task { [weak self] in
+            await self?.sendChatMessage()
+            self?.finishChatTask(taskID)
+        }
+    }
+
+    func cancelChatGeneration() {
+        cancelActiveChat(
+            message: "Generation stopped by the user.",
+            logReason: "user request"
+        )
+    }
+
     func sendChatMessage() async {
         let prompt = chatInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty, !isChatRunning else { return }
@@ -603,11 +641,22 @@ final class TokenityStore: ObservableObject {
         let userIndex = chatMessages.count - 1
         chatMessages.append(ChatMessage(role: .assistant, content: "", thinking: "Preparing response..."))
         let assistantIndex = chatMessages.count - 1
+        let requestID = UUID()
+        activeChatRequestID = requestID
+        activeChatUserIndex = userIndex
+        activeChatAssistantIndex = assistantIndex
         isChatRunning = true
         chatMetrics = .empty
         chatScrollRevision += 1
         defer {
-            isChatRunning = false
+            if activeChatRequestID == requestID {
+                activeChatRequestID = nil
+                activeChatUserIndex = nil
+                activeChatAssistantIndex = nil
+                chatTask = nil
+                chatTaskID = nil
+                isChatRunning = false
+            }
             syncActiveChatSession()
         }
 
@@ -622,24 +671,42 @@ final class TokenityStore: ObservableObject {
                 configuration: configuration,
                 userIndex: userIndex,
                 assistantIndex: assistantIndex,
+                requestID: requestID,
                 start: start,
                 firstTokenAt: &firstTokenAt,
                 tokenEstimate: &tokenEstimate
             )
+            try ensureActiveChatRequest(requestID)
             finishChatMetrics(start: start, firstTokenAt: firstTokenAt, tokenEstimate: tokenEstimate)
+        } catch is CancellationError {
+            finishCancelledChatIfActive(
+                requestID,
+                message: "Generation stopped before completion.",
+                logReason: "request cancellation"
+            )
         } catch let streamingError {
             if !assistantMessageHasVisibleOutput(at: assistantIndex) {
                 do {
+                    try ensureActiveChatRequest(requestID)
                     chatMessages[assistantIndex].thinking = "Retrying without streaming..."
                     try await completeClusterChat(
                         serviceModelName: serviceModelName,
                         configuration: configuration,
                         assistantIndex: assistantIndex,
+                        requestID: requestID,
                         firstTokenAt: &firstTokenAt,
                         tokenEstimate: &tokenEstimate
                     )
+                    try ensureActiveChatRequest(requestID)
                     finishChatMetrics(start: start, firstTokenAt: firstTokenAt, tokenEstimate: tokenEstimate)
                     appendLog("Streaming chat connection failed, then recovered with a non-streaming response: \(userFacingMessage(for: streamingError))")
+                    return
+                } catch is CancellationError {
+                    finishCancelledChatIfActive(
+                        requestID,
+                        message: "Generation stopped before completion.",
+                        logReason: "request cancellation"
+                    )
                     return
                 } catch let fallbackError {
                     chatMessages[userIndex].includeInContext = false
@@ -682,6 +749,11 @@ final class TokenityStore: ObservableObject {
 
     func stopCluster() async {
         phase = .stopping
+        let cancelledChatTask = cancelActiveChat(
+            message: "Generation stopped because the cluster was stopped.",
+            logReason: "cluster stop"
+        )
+        if let cancelledChatTask { await cancelledChatTask.value }
         activeModelLoadID = nil
         modelLoadTask?.cancel()
         modelLoadTask = nil
@@ -696,6 +768,11 @@ final class TokenityStore: ObservableObject {
     }
 
     func shutdownForApplicationTermination() async {
+        let cancelledChatTask = cancelActiveChat(
+            message: "Generation stopped because Tokenity is closing.",
+            logReason: "application termination"
+        )
+        if let cancelledChatTask { await cancelledChatTask.value }
         activeModelLoadID = nil
         modelLoadTask?.cancel()
         modelLoadTask = nil
@@ -1295,10 +1372,12 @@ final class TokenityStore: ObservableObject {
         configuration: ModelRuntimeConfiguration,
         userIndex: Int,
         assistantIndex: Int,
+        requestID: UUID,
         start: Date,
         firstTokenAt: inout Date?,
         tokenEstimate: inout Int
     ) async throws {
+        try ensureActiveChatRequest(requestID)
         guard let url = modelServiceURL(path: "/v1/chat/completions") else {
             throw TokenityTransportError.missingModelService
         }
@@ -1325,6 +1404,7 @@ final class TokenityStore: ObservableObject {
         var finishReason: String?
 
         for try await line in lineStreamTransport(request) {
+            try ensureActiveChatRequest(requestID)
             guard line.hasPrefix("data:") else { continue }
             let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
             if payload == "[DONE]" { break }
@@ -1354,6 +1434,7 @@ final class TokenityStore: ObservableObject {
                 didReceiveThinking = didReceiveThinking || chatMessages[assistantIndex].thinking != thinkingBefore
             }
         }
+        try ensureActiveChatRequest(requestID)
         if !didReceiveContent && didReceiveThinking {
             chatMessages[userIndex].includeInContext = false
             chatMessages[assistantIndex].includeInContext = false
@@ -1373,9 +1454,11 @@ final class TokenityStore: ObservableObject {
         serviceModelName: String,
         configuration: ModelRuntimeConfiguration,
         assistantIndex: Int,
+        requestID: UUID,
         firstTokenAt: inout Date?,
         tokenEstimate: inout Int
     ) async throws {
+        try ensureActiveChatRequest(requestID)
         guard let url = modelServiceURL(path: "/v1/chat/completions") else {
             throw TokenityTransportError.missingModelService
         }
@@ -1394,6 +1477,7 @@ final class TokenityStore: ObservableObject {
         )
         request.timeoutInterval = 600
         let (data, response) = try await dataTransport(request)
+        try ensureActiveChatRequest(requestID)
         try validate(response, data: data)
         let decoded = try JSONDecoder().decode(OpenAIChatResponse.self, from: data)
         guard let message = decoded.choices.first?.message else {
@@ -1440,6 +1524,54 @@ final class TokenityStore: ObservableObject {
         let thinking = message.thinking.trimmingCharacters(in: .whitespacesAndNewlines)
         let placeholders: Set<String> = ["Preparing response...", "Waiting for first response..."]
         return !content.isEmpty || (!thinking.isEmpty && !placeholders.contains(thinking))
+    }
+
+    private func ensureActiveChatRequest(_ requestID: UUID) throws {
+        guard !Task.isCancelled, activeChatRequestID == requestID else {
+            throw CancellationError()
+        }
+    }
+
+    @discardableResult
+    private func cancelActiveChat(message: String, logReason: String) -> Task<Void, Never>? {
+        guard let requestID = activeChatRequestID else { return nil }
+        let task = chatTask
+        task?.cancel()
+        finishCancelledChatIfActive(requestID, message: message, logReason: logReason)
+        return task
+    }
+
+    private func finishCancelledChatIfActive(_ requestID: UUID, message: String, logReason: String) {
+        guard activeChatRequestID == requestID else { return }
+        if let userIndex = activeChatUserIndex, chatMessages.indices.contains(userIndex) {
+            chatMessages[userIndex].includeInContext = false
+        }
+        if let assistantIndex = activeChatAssistantIndex, chatMessages.indices.contains(assistantIndex) {
+            chatMessages[assistantIndex].includeInContext = false
+            let thinking = chatMessages[assistantIndex].thinking.trimmingCharacters(in: .whitespacesAndNewlines)
+            if thinking == "Preparing response..." || thinking == "Waiting for first response..." || thinking == "Retrying without streaming..." {
+                chatMessages[assistantIndex].thinking = ""
+            }
+            let content = chatMessages[assistantIndex].content.trimmingCharacters(in: .whitespacesAndNewlines)
+            chatMessages[assistantIndex].content = content.isEmpty
+                ? message
+                : "\(chatMessages[assistantIndex].content)\n\n\(message)"
+        }
+        activeChatRequestID = nil
+        activeChatUserIndex = nil
+        activeChatAssistantIndex = nil
+        chatTask = nil
+        chatTaskID = nil
+        isChatRunning = false
+        chatScrollRevision += 1
+        syncActiveChatSession()
+        appendLog("Chat generation cancelled for \(logReason).")
+    }
+
+    private func finishChatTask(_ taskID: UUID) {
+        guard chatTaskID == taskID else { return }
+        chatTask = nil
+        chatTaskID = nil
     }
 
     private func appendAssistantContent(_ rawToken: String, assistantIndex: Int) {
@@ -1502,7 +1634,7 @@ final class TokenityStore: ObservableObject {
     }
 
     private nonisolated static func liveLineStream(for request: URLRequest) -> AsyncThrowingStream<String, Error> {
-        AsyncThrowingStream { continuation in
+        AsyncThrowingStream(bufferingPolicy: .bufferingOldest(16)) { continuation in
             let task = Task {
                 do {
                     let (bytes, response) = try await URLSession.shared.bytes(for: request)
@@ -1513,7 +1645,19 @@ final class TokenityStore: ObservableObject {
                         throw TokenityTransportError.httpStatus(httpResponse.statusCode, nil)
                     }
                     for try await line in bytes.lines {
-                        continuation.yield(line)
+                        retry: while !Task.isCancelled {
+                            switch continuation.yield(line) {
+                            case .enqueued:
+                                break retry
+                            case .dropped:
+                                try await Task.sleep(for: .milliseconds(1))
+                            case .terminated:
+                                return
+                            @unknown default:
+                                return
+                            }
+                        }
+                        try Task.checkCancellation()
                     }
                     continuation.finish()
                 } catch {
