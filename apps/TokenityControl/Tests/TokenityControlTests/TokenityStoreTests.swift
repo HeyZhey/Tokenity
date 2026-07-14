@@ -42,11 +42,19 @@ final class TokenityStoreTests: XCTestCase {
             JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any]
         )
         let nodes = try XCTUnwrap(object["nodes"] as? [[String: Any]])
-        let nativeMTP = try XCTUnwrap(object["native_mtp"] as? [String: Any])
 
         XCTAssertEqual(nodes.first?["agent_url"] as? String, "http://192.168.5.75:9100")
         XCTAssertNil(nodes.first?["ssh"])
-        XCTAssertEqual(nativeMTP["mode"] as? String, "off")
+        XCTAssertNil(object["native_mtp"])
+
+        var autoRequest = request
+        autoRequest.nativeMTP = NativeMTPConfiguration(mode: .auto)
+        let autoObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(autoRequest)) as? [String: Any]
+        )
+        let nativeMTP = try XCTUnwrap(autoObject["native_mtp"] as? [String: Any])
+
+        XCTAssertEqual(nativeMTP["mode"] as? String, "auto")
         XCTAssertEqual(nativeMTP["max_depth"] as? Int, 1)
         XCTAssertEqual(nativeMTP["head_placement"] as? String, "replicated")
     }
@@ -138,6 +146,97 @@ final class TokenityStoreTests: XCTestCase {
             await store.stopModel(first)
         }
         XCTAssertNil(store.loadedModelName)
+    }
+
+    func testModelLoadOmitsOffForLegacyAgentAndAutoFallsBack() async throws {
+        var startBodies: [[String: Any]] = []
+        let store = TokenityStore(dataTransport: { request in
+            let path = request.url?.path ?? ""
+            if path.contains("/v1/node/start") {
+                let body = try XCTUnwrap(
+                    JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any]
+                )
+                startBodies.append(body)
+                if body["native_mtp"] != nil {
+                    let response = HTTPURLResponse(
+                        url: request.url ?? URL(string: "http://127.0.0.1")!,
+                        statusCode: 422,
+                        httpVersion: nil,
+                        headerFields: nil
+                    )!
+                    let payload = #"{"detail":[{"msg":"Extra inputs are not permitted"}]}"#
+                    return (Data(payload.utf8), response)
+                }
+            }
+            return try await Self.successfulModelTransport(request)
+        })
+        store.connectionMode = .ring
+        store.createCluster()
+        let model = try XCTUnwrap(store.modelLibraryRows.first)
+
+        await store.loadModel(model)
+        XCTAssertNotNil(store.loadedModelName)
+        XCTAssertEqual(startBodies.count, 1)
+        XCTAssertNil(startBodies[0]["native_mtp"])
+
+        await store.stopModel(model)
+        store.nativeMTPMode = .auto
+        await store.loadModel(model)
+
+        XCTAssertNotNil(store.loadedModelName)
+        XCTAssertEqual(startBodies.count, 3)
+        XCTAssertNotNil(startBodies[1]["native_mtp"])
+        XCTAssertNil(startBodies[2]["native_mtp"])
+        XCTAssertEqual(store.nativeMTPRuntime?.fallbackReason, "unsupported_backend")
+        XCTAssertTrue(store.logs.contains { $0.contains("Auto is falling back") })
+    }
+
+    func testNativeMTPRequiredDoesNotFallBackForLegacyAgent() async throws {
+        var startBodies: [[String: Any]] = []
+        let store = TokenityStore(dataTransport: { request in
+            let path = request.url?.path ?? ""
+            if path.contains("/v1/node/start") {
+                let body = try XCTUnwrap(
+                    JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any]
+                )
+                startBodies.append(body)
+                let response = HTTPURLResponse(
+                    url: request.url ?? URL(string: "http://127.0.0.1")!,
+                    statusCode: 422,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!
+                let payload = #"{"detail":[{"msg":"Extra inputs are not permitted"}]}"#
+                return (Data(payload.utf8), response)
+            }
+            return try await Self.successfulModelTransport(request)
+        })
+        store.connectionMode = .ring
+        for nodeIndex in store.nodes.indices {
+            for modelIndex in store.nodes[nodeIndex].models.indices {
+                store.nodes[nodeIndex].models[modelIndex].nativeMTP = NativeMTPCapability(
+                    status: "supported",
+                    modelType: "qwen3_5_text",
+                    declaredLayers: 1,
+                    weightsPresent: true,
+                    reason: nil,
+                    message: nil,
+                    tensorFormat: "safetensors-index",
+                    tensorKeyDigest: "same",
+                    missingGroups: []
+                )
+            }
+        }
+        store.nativeMTPMode = .required
+        store.createCluster()
+        let model = try XCTUnwrap(store.modelLibraryRows.first)
+
+        await store.loadModel(model)
+
+        XCTAssertNil(store.loadedModelName)
+        XCTAssertEqual(startBodies.count, 1)
+        XCTAssertNotNil(startBodies[0]["native_mtp"])
+        XCTAssertTrue(store.modelLoadMessage.contains("Restart the installed Tokenity Node Agent"))
     }
 
     func testRDMALoadRefreshesNodeInfoAndBlocksInactiveLink() async {

@@ -698,7 +698,10 @@ struct AgentStartModelRequest: Encodable {
     var promptConcurrency: Int
     var trustRemoteCode: Bool
     var leaseSeconds: Double = 30
-    var nativeMTP: NativeMTPConfiguration = NativeMTPConfiguration()
+    // Omit the field for standard decoding so a new Control app can still
+    // load models through pre-MTP Node Agents. New Agents already default a
+    // missing field to off.
+    var nativeMTP: NativeMTPConfiguration? = nil
 
     enum CodingKeys: String, CodingKey {
         case model, nodes, host, port

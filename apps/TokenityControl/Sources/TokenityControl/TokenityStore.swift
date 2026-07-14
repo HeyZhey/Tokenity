@@ -10,6 +10,7 @@ enum TokenityTransportError: LocalizedError {
     case backendExited(String)
     case noChatContent
     case rdmaNotReady(String)
+    case nativeMTPAgentUpgradeRequired
 
     var errorDescription: String? {
         switch self {
@@ -37,6 +38,8 @@ enum TokenityTransportError: LocalizedError {
             return "The model service returned no answer text."
         case .rdmaNotReady(let message):
             return message
+        case .nativeMTPAgentUpgradeRequired:
+            return "Native MTP Required needs the current Node Agent. Restart the installed Tokenity Node Agent on every selected Mac, then try again."
         }
     }
 }
@@ -118,6 +121,7 @@ final class TokenityStore: ObservableObject {
     private let modelLeaseSeconds = 30.0
     private var loadedBackendRole: String?
     private var loadedServiceModelName: String?
+    private var legacyNativeMTPFallback: NativeMTPReadiness?
     private var activeModelLoadID: UUID?
     private var modelLoadTask: Task<Void, Never>?
 
@@ -500,6 +504,7 @@ final class TokenityStore: ObservableObject {
         modelLoadMessage = "Loading \(row.displayName)..."
         modelLoadProgress = 0
         nativeMTPRuntime = nil
+        legacyNativeMTPFallback = nil
         appendLog("Loading model: \(row.displayName).")
         let configuration = modelConfiguration(for: row.id)
         let operationID = UUID()
@@ -818,6 +823,7 @@ final class TokenityStore: ObservableObject {
         loadedServiceModelName = nil
         modelLoadProgress = nil
         nativeMTPRuntime = nil
+        legacyNativeMTPFallback = nil
         modelLoadMessage = message
     }
 
@@ -936,28 +942,69 @@ final class TokenityStore: ObservableObject {
         configuration: ModelRuntimeConfiguration
     ) async throws {
         guard let baseURL = clusterControlBaseURL() else { throw TokenityTransportError.missingClusterControl }
-        let requestBody = AgentStartModelRequest(
-            model: row.representativePath,
-            nodes: (backendMode == .singleNode ? Array(selectedNodes.prefix(1)) : selectedNodes)
-                .map(agentNodePayload(for:)),
-            connectionMode: backendMode == .singleNode ? ConnectionMode.ring.cliValue : connectionMode.cliValue,
-            startingPort: mlxStartingPort,
-            host: "0.0.0.0",
-            port: 8000,
-            dryRun: false,
-            maxTokens: configuration.maximumOutputTokens,
-            promptCacheSize: configuration.promptCacheSize,
-            prefillStepSize: configuration.prefillStepSize,
-            decodeConcurrency: configuration.decodeConcurrency,
-            promptConcurrency: configuration.promptConcurrency,
-            trustRemoteCode: configuration.trustRemoteCode,
-            leaseSeconds: modelLeaseSeconds,
-            nativeMTP: effectiveNativeMTPConfiguration
-        )
-        var request = try jsonRequest(url: baseURL.appendingPathComponent(backendStartPath), body: requestBody)
-        request.timeoutInterval = 40
-        let (data, response) = try await dataTransport(request)
-        try validate(response, data: data)
+        let nativeMTP = effectiveNativeMTPConfiguration
+
+        func requestBody(nativeMTP: NativeMTPConfiguration?) -> AgentStartModelRequest {
+            AgentStartModelRequest(
+                model: row.representativePath,
+                nodes: (backendMode == .singleNode ? Array(selectedNodes.prefix(1)) : selectedNodes)
+                    .map(agentNodePayload(for:)),
+                connectionMode: backendMode == .singleNode ? ConnectionMode.ring.cliValue : connectionMode.cliValue,
+                startingPort: mlxStartingPort,
+                host: "0.0.0.0",
+                port: 8000,
+                dryRun: false,
+                maxTokens: configuration.maximumOutputTokens,
+                promptCacheSize: configuration.promptCacheSize,
+                prefillStepSize: configuration.prefillStepSize,
+                decodeConcurrency: configuration.decodeConcurrency,
+                promptConcurrency: configuration.promptConcurrency,
+                trustRemoteCode: configuration.trustRemoteCode,
+                leaseSeconds: modelLeaseSeconds,
+                nativeMTP: nativeMTP
+            )
+        }
+
+        func send(_ body: AgentStartModelRequest) async throws {
+            var request = try jsonRequest(url: baseURL.appendingPathComponent(backendStartPath), body: body)
+            request.timeoutInterval = 40
+            let (data, response) = try await dataTransport(request)
+            try validate(response, data: data)
+        }
+
+        do {
+            // A missing field is equivalent to off for both old and new
+            // Agents, so standard decoding stays backward compatible.
+            try await send(requestBody(nativeMTP: nativeMTP.mode == .off ? nil : nativeMTP))
+        } catch TokenityTransportError.httpStatus(let status, let detail)
+            where status == 422 && isUnsupportedNativeMTPField(detail) {
+            switch nativeMTP.mode {
+            case .auto:
+                appendLog("The running Node Agent predates Native MTP. Auto is falling back to standard decoding for this load.")
+                legacyNativeMTPFallback = NativeMTPReadiness(
+                    requestedMode: NativeMTPMode.auto.rawValue,
+                    enabled: false,
+                    status: "unsupported",
+                    effectiveMode: "standard",
+                    fallbackReason: "unsupported_backend",
+                    message: "The running Node Agent predates Native MTP; standard decoding is active.",
+                    proposedTokens: 0,
+                    acceptedTokens: 0,
+                    acceptanceRate: nil
+                )
+                nativeMTPRuntime = legacyNativeMTPFallback
+                try await send(requestBody(nativeMTP: nil))
+            case .required:
+                throw TokenityTransportError.nativeMTPAgentUpgradeRequired
+            case .off:
+                throw TokenityTransportError.httpStatus(status, detail)
+            }
+        }
+    }
+
+    private func isUnsupportedNativeMTPField(_ detail: String?) -> Bool {
+        let normalized = detail?.lowercased() ?? ""
+        return normalized.contains("extra inputs") && normalized.contains("not permitted")
     }
 
     private func stopBackendRole(_ role: String, on node: TokenityNode) async throws {
@@ -1127,7 +1174,7 @@ final class TokenityStore: ObservableObject {
     }
 
     private func updateModelLoadProgress(_ readiness: ModelReadinessResponse, modelName: String) {
-        nativeMTPRuntime = readiness.nativeMTP
+        nativeMTPRuntime = readiness.nativeMTP ?? legacyNativeMTPFallback
         let phaseProgress: Double?
         switch readiness.phase {
         case "launching": phaseProgress = 0.01
