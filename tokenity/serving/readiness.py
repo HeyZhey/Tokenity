@@ -27,6 +27,7 @@ class ReadinessState:
     progress: float | None = None
     progress_current: int | None = None
     progress_total: int | None = None
+    native_mtp: dict[str, object] | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -39,4 +40,5 @@ class ReadinessState:
             "progress": self.progress,
             "progress_current": self.progress_current,
             "progress_total": self.progress_total,
+            "native_mtp": self.native_mtp,
         }

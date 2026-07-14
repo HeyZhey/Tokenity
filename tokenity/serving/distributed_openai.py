@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+
+from tokenity.inference.native_mtp import NativeMTPConfig
+from tokenity.inference.native_mtp.runtime import (
+    NativeMTPRuntimeController,
+    NativeMTPStartupError,
+    attach_controller,
+    controller_for,
+)
 
 from .readiness import ReadinessPhase, ReadinessState
 
@@ -99,7 +108,10 @@ class _MLXServerSymbols:
     SamplingArguments: type
 
     @classmethod
-    def load(cls) -> "_MLXServerSymbols":
+    def load(
+        cls,
+        native_mtp: NativeMTPRuntimeController | None = None,
+    ) -> "_MLXServerSymbols":
         import mlx_lm.server as server  # type: ignore
 
         from tokenity.mlx.glm_moe_dsa_compat import install_glm_moe_dsa_compat
@@ -108,6 +120,8 @@ class _MLXServerSymbols:
             logging.warning(
                 "Tokenity installed GLM-5.2 cross-layer indexer sharing compatibility from mlx-lm PR #1410."
             )
+        if native_mtp is not None:
+            attach_controller(server, native_mtp)
         _install_chunked_sharded_load(server)
         from mlx_lm.server import (  # type: ignore
             CompletionRequest,
@@ -139,6 +153,17 @@ def _install_chunked_sharded_load(server: Any) -> None:
     from mlx.utils import tree_flatten  # type: ignore
     from mlx_lm.utils import _download, load_model, load_tokenizer  # type: ignore
 
+    original_load = server.load
+
+    def tokenity_load(*args: Any, **kwargs: Any) -> Any:
+        controller = controller_for(server)
+        scope = controller.construction_scope() if controller is not None else nullcontext()
+        with scope:
+            result = original_load(*args, **kwargs)
+        if controller is not None:
+            controller.validate_loaded_model(result[0])
+        return result
+
     def tokenity_sharded_load(
         repo: str,
         pipeline_group: Any = None,
@@ -149,60 +174,65 @@ def _install_chunked_sharded_load(server: Any) -> None:
     ) -> Any:
         import mlx.core as mx  # type: ignore
 
-        model_path = _download(
-            repo,
-            allow_patterns=[
-                "*.json",
-                "*.py",
-                "tokenizer.model",
-                "*.tiktoken",
-                "tiktoken.model",
-                "*.txt",
-                "*.jsonl",
-                "*.jinja",
-            ],
-        )
-        model, config = load_model(model_path, lazy=True, strict=False)
+        controller = controller_for(server)
+        scope = controller.construction_scope() if controller is not None else nullcontext()
+        with scope:
+            model_path = _download(
+                repo,
+                allow_patterns=[
+                    "*.json",
+                    "*.py",
+                    "tokenizer.model",
+                    "*.tiktoken",
+                    "tiktoken.model",
+                    "*.txt",
+                    "*.jsonl",
+                    "*.jinja",
+                ],
+            )
+            model, config = load_model(model_path, lazy=True, strict=False)
 
-        has_pipelining = hasattr(model, "model") and hasattr(model.model, "pipeline")
-        has_tensor_parallel = hasattr(model, "shard")
-        if pipeline_group is not None and not has_pipelining:
-            raise ValueError("The model does not support pipelining but a pipeline_group was provided")
-        if tensor_group is not None and not has_tensor_parallel:
-            raise ValueError("The model does not support tensor parallelism but a tensor_group was provided")
-        if not has_pipelining and not has_tensor_parallel:
-            raise ValueError("The model does not support any sharding")
-        if pipeline_group is tensor_group is None:
-            if has_tensor_parallel:
-                tensor_group = mx.distributed.init()
-            elif has_pipelining:
-                pipeline_group = mx.distributed.init()
+            has_pipelining = hasattr(model, "model") and hasattr(model.model, "pipeline")
+            has_tensor_parallel = hasattr(model, "shard")
+            if pipeline_group is not None and not has_pipelining:
+                raise ValueError("The model does not support pipelining but a pipeline_group was provided")
+            if tensor_group is not None and not has_tensor_parallel:
+                raise ValueError("The model does not support tensor parallelism but a tensor_group was provided")
+            if not has_pipelining and not has_tensor_parallel:
+                raise ValueError("The model does not support any sharding")
+            if pipeline_group is tensor_group is None:
+                if has_tensor_parallel:
+                    tensor_group = mx.distributed.init()
+                elif has_pipelining:
+                    pipeline_group = mx.distributed.init()
 
-        if pipeline_group is not None:
-            model.model.pipeline(pipeline_group)
-            with open(model_path / "model.safetensors.index.json", "r") as handle:
-                weight_index = json.load(handle)["weight_map"]
-            local_files = set()
-            for key, _ in tree_flatten(model.parameters()):
-                file_name = weight_index.get(key)
-                if file_name is None:
-                    raise ValueError("Pipeline loading is only supported for MLX converted models.")
-                local_files.add(file_name)
-            _download(repo, allow_patterns=local_files)
-        else:
-            _download(repo)
+            if pipeline_group is not None:
+                model.model.pipeline(pipeline_group)
+                with open(model_path / "model.safetensors.index.json", "r") as handle:
+                    weight_index = json.load(handle)["weight_map"]
+                local_files = set()
+                for key, _ in tree_flatten(model.parameters()):
+                    file_name = weight_index.get(key)
+                    if file_name is None:
+                        raise ValueError("Pipeline loading is only supported for MLX converted models.")
+                    local_files.add(file_name)
+                _download(repo, allow_patterns=local_files)
+            else:
+                _download(repo)
 
-        tokenizer = load_tokenizer(
-            model_path,
-            tokenizer_config or {"trust_remote_code": True},
-            eos_token_ids=config.get("eos_token_id", None),
-        )
-        model, _ = load_model(model_path, lazy=True, strict=False)
-        if tensor_group is not None:
-            model.shard(tensor_group)
-        if pipeline_group is not None:
-            model.model.pipeline(pipeline_group)
+            tokenizer = load_tokenizer(
+                model_path,
+                tokenizer_config or {"trust_remote_code": True},
+                eos_token_ids=config.get("eos_token_id", None),
+            )
+            model, _ = load_model(model_path, lazy=True, strict=False)
+            if tensor_group is not None and int(tensor_group.size()) > 1:
+                model.shard(tensor_group)
+            if pipeline_group is not None:
+                model.model.pipeline(pipeline_group)
         _eval_parameters_in_chunks(mx, tree_flatten(model.parameters()))
+        if controller is not None:
+            controller.validate_loaded_model(model)
         if _bool_env("TOKENITY_MLX_LOAD_POST_BARRIER", False):
             logging.warning("Tokenity chunked sharded_load running post-load distributed all_sum barrier.")
             mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
@@ -213,6 +243,7 @@ def _install_chunked_sharded_load(server: Any) -> None:
             return model, tokenizer, config
         return model, tokenizer
 
+    server.load = tokenity_load
     server.sharded_load = tokenity_sharded_load
     server._tokenity_chunked_sharded_load = True
 
@@ -350,6 +381,7 @@ class TokenityDistributedRuntime:
         prefill_step_size: int = 2_048,
         decode_concurrency: int = 1,
         prompt_concurrency: int = 1,
+        native_mtp: NativeMTPConfig | dict[str, Any] | None = None,
     ) -> None:
         self.model = model
         self.model_id = (api_identifier or "").strip() or Path(model).name or model
@@ -360,6 +392,16 @@ class TokenityDistributedRuntime:
         self.prefill_step_size = prefill_step_size
         self.decode_concurrency = decode_concurrency
         self.prompt_concurrency = prompt_concurrency
+        self.native_mtp = NativeMTPRuntimeController(
+            model=model,
+            config=(
+                native_mtp
+                if isinstance(native_mtp, NativeMTPConfig)
+                else NativeMTPConfig.from_mapping(native_mtp)
+            ),
+            decode_concurrency=decode_concurrency,
+        )
+        self.state.native_mtp = self.native_mtp.telemetry
         self.process_isolated_shutdown = _requires_process_isolated_shutdown(model)
         self._symbols: _MLXServerSymbols | None = None
         self._provider: Any = None
@@ -390,9 +432,12 @@ class TokenityDistributedRuntime:
         self.state.world_size = int(self._group.size())
         self.state.backend = "mlx-distributed" if self.state.world_size > 1 else "single"
 
+        self.native_mtp.prepare(mx, self._group)
+        self.state.native_mtp = self.native_mtp.telemetry
+
         self.state.phase = ReadinessPhase.LOADING_MODEL
         self.state.progress = 0.1
-        self._symbols = _MLXServerSymbols.load()
+        self._symbols = _MLXServerSymbols.load(self.native_mtp)
         args = self._server_args()
         self._provider = self._symbols.ModelProvider(args)
         self._map_model_aliases(self._provider)
@@ -568,6 +613,12 @@ class TokenityDistributedRuntime:
             raise RuntimeError(self.state.message or "Model is still loading.")
         if not self.accepts_model(request.model):
             raise ValueError(f"Model is not loaded: {request.model}")
+        if request.seed is not None and self.native_mtp.enabled:
+            self.native_mtp.record_seeded_fallback()
+            logging.info(
+                "Native MTP request fallback: native_mtp_reason=seeded_sequential_path seed=%s",
+                request.seed,
+            )
         self.state.phase = ReadinessPhase.PREFILL_PENDING
         completion_request = self._symbols.CompletionRequest(
             "chat",
@@ -883,6 +934,7 @@ def serve(
     prefill_step_size: int = 2_048,
     decode_concurrency: int = 1,
     prompt_concurrency: int = 1,
+    native_mtp: NativeMTPConfig | dict[str, Any] | None = None,
 ) -> None:
     import uvicorn
 
@@ -899,6 +951,7 @@ def serve(
             prefill_step_size=prefill_step_size,
             decode_concurrency=decode_concurrency,
             prompt_concurrency=prompt_concurrency,
+            native_mtp=native_mtp,
         )
         runtime.start()
     except Exception as exc:  # pragma: no cover - depends on target MLX runtime
@@ -906,7 +959,7 @@ def serve(
         state.phase = ReadinessPhase.FAILED
         state.message = f"Tokenity distributed runtime failed: {exc}"
         _set_active_load_state(None)
-        if require_mlx:
+        if require_mlx or isinstance(exc, NativeMTPStartupError):
             raise
 
     if runtime is not None and not runtime.is_rank0():
