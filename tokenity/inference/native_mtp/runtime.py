@@ -13,6 +13,7 @@ import hashlib
 import importlib
 import inspect
 import logging
+import glob as glob_module
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -104,16 +105,48 @@ def is_native_mtp_construction_active() -> bool:
 
 
 @contextmanager
-def native_mtp_construction_scope(enabled: bool) -> Iterator[None]:
-    """Serialize model construction and restore the prior activation flag."""
+def native_mtp_construction_scope(
+    enabled: bool,
+    model_path: str | Path | None = None,
+) -> Iterator[None]:
+    """Serialize construction and expose the sidecar head only when enabled.
+
+    mlx-lm 0.31.x discovers local weights with ``model*.safetensors`` rather
+    than the index.  The assembled head deliberately lives in
+    ``mtp.safetensors`` so an ``off`` load remains byte-for-byte equivalent to
+    loading the original target checkpoint.  During an enabled construction
+    only, this narrowly-scoped glob wrapper adds that one validated sidecar.
+    """
 
     global _CONSTRUCTION_ACTIVE
     with _CONSTRUCTION_LOCK:
         previous = _CONSTRUCTION_ACTIVE
+        previous_glob = glob_module.glob
         _CONSTRUCTION_ACTIVE = bool(enabled)
+        if enabled and model_path is not None:
+            root = Path(model_path).resolve()
+            sidecar = root / "mtp.safetensors"
+
+            def native_mtp_glob(pattern: Any, *args: Any, **kwargs: Any) -> list[str]:
+                discovered = list(previous_glob(pattern, *args, **kwargs))
+                candidate = Path(pattern)
+                if (
+                    candidate.name == "model*.safetensors"
+                    and candidate.parent.resolve() == root
+                    and sidecar.is_file()
+                    and str(sidecar) not in discovered
+                ):
+                    discovered.append(str(sidecar))
+                return discovered
+
+            native_mtp_glob._tokenity_original_glob = previous_glob  # type: ignore[attr-defined]
+            glob_module.glob = native_mtp_glob
+        elif hasattr(previous_glob, "_tokenity_original_glob"):
+            glob_module.glob = previous_glob._tokenity_original_glob  # type: ignore[attr-defined]
         try:
             yield
         finally:
+            glob_module.glob = previous_glob
             _CONSTRUCTION_ACTIVE = previous
 
 
@@ -135,6 +168,12 @@ class NativeMTPRuntimeController:
                 "accepted_tokens": 0,
                 "acceptance_rate": None,
                 "seeded_sequential_requests": 0,
+                "verify_cycles": 0,
+                "emitted_verify_tokens": 0,
+                "emitted_tokens_per_verify_cycle": None,
+                "head_time_seconds": 0.0,
+                "verify_time_seconds": 0.0,
+                "rollback_time_seconds": 0.0,
             }
         )
 
@@ -205,7 +244,7 @@ class NativeMTPRuntimeController:
         return self.decision
 
     def construction_scope(self) -> Iterator[None]:
-        return native_mtp_construction_scope(self.enabled)
+        return native_mtp_construction_scope(self.enabled, self.model)
 
     def validate_loaded_model(self, model: Any) -> None:
         if not self.enabled:
@@ -274,6 +313,12 @@ class NativeMTPRuntimeController:
                 "accepted_tokens",
                 "acceptance_rate",
                 "seeded_sequential_requests",
+                "verify_cycles",
+                "emitted_verify_tokens",
+                "emitted_tokens_per_verify_cycle",
+                "head_time_seconds",
+                "verify_time_seconds",
+                "rollback_time_seconds",
             )
         }
         self.telemetry.clear()

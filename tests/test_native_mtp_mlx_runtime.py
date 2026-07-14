@@ -171,6 +171,10 @@ class NativeMTPMLXRuntimeTests(unittest.TestCase):
         self.assertEqual(native_mtp, standard)
         self.assertEqual(len(native_mtp), 12)
         self.assertGreater(int(self.telemetry["proposed_tokens"]), 0)
+        self.assertGreater(int(self.telemetry["verify_cycles"]), 0)
+        self.assertGreater(int(self.telemetry["emitted_verify_tokens"]), 0)
+        self.assertGreater(float(self.telemetry["head_time_seconds"]), 0)
+        self.assertGreater(float(self.telemetry["verify_time_seconds"]), 0)
 
     def test_stop_sequence_and_cancellation_do_not_over_emit(self):
         baseline = self._run(active=False, max_tokens=10)
@@ -227,6 +231,19 @@ class NativeMTPMLXRuntimeTests(unittest.TestCase):
             if ".mtp." in f".{key}."
         )
         controller.validate_loaded_model(self.model)
+
+    def test_sanitize_accepts_backbone_and_mtp_weight_files_separately(self):
+        backbone = {"model.embed_tokens.weight": mx.zeros((32, 32))}
+        mtp = {"mtp.norm.weight": mx.ones((32,))}
+
+        self.assertEqual(
+            set(self.model.language_model.sanitize(backbone)),
+            set(backbone),
+        )
+        self.assertEqual(
+            set(self.model.language_model.sanitize(mtp)),
+            set(mtp),
+        )
 
     def test_stochastic_acceptance_and_residual_preserve_target_marginal(self):
         target = mx.array([0.6, 0.3, 0.1])

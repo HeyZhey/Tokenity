@@ -344,9 +344,6 @@ def _patch_text_model(transaction: PatchTransaction, qwen: Any) -> None:
         return [KVCache()] if hasattr(self, "mtp") else []
 
     def sanitize(self: Any, weights: dict[str, Any]) -> dict[str, Any]:
-        has_mtp = any("mtp." in key for key in weights)
-        if hasattr(self, "mtp") and not has_mtp:
-            raise ValueError("Native MTP construction received no mtp.* tensors")
         if not hasattr(self, "mtp"):
             weights = {key: value for key, value in weights.items() if "mtp." not in key}
 

@@ -177,7 +177,7 @@ def test_auto_decode_concurrency_falls_back_with_structured_reason(tmp_path: Pat
     assert controller.telemetry["effective_mode"] == "standard"
 
 
-def test_patch_transaction_and_construction_scope_restore_prior_state():
+def test_patch_transaction_and_construction_scope_restore_prior_state(tmp_path: Path):
     class Target:
         existing = "before"
 
@@ -190,12 +190,31 @@ def test_patch_transaction_and_construction_scope_restore_prior_state():
     assert not hasattr(Target, "new")
 
     assert is_native_mtp_construction_active() is False
-    with native_mtp_construction_scope(True):
+    model_file = tmp_path / "model.safetensors"
+    sidecar = tmp_path / "mtp.safetensors"
+    model_file.touch()
+    sidecar.touch()
+
+    import glob
+
+    pattern = str(tmp_path / "model*.safetensors")
+    assert glob.glob(pattern) == [str(model_file)]
+    with native_mtp_construction_scope(True, tmp_path):
         assert is_native_mtp_construction_active() is True
+        assert set(glob.glob(pattern)) == {str(model_file), str(sidecar)}
         with native_mtp_construction_scope(False):
             assert is_native_mtp_construction_active() is False
+            assert glob.glob(pattern) == [str(model_file)]
         assert is_native_mtp_construction_active() is True
+        assert set(glob.glob(pattern)) == {str(model_file), str(sidecar)}
     assert is_native_mtp_construction_active() is False
+    assert glob.glob(pattern) == [str(model_file)]
+
+    with pytest.raises(RuntimeError, match="scope failure"):
+        with native_mtp_construction_scope(True, tmp_path):
+            assert str(sidecar) in glob.glob(pattern)
+            raise RuntimeError("scope failure")
+    assert glob.glob(pattern) == [str(model_file)]
 
 
 def test_node_models_and_rank_propagation_expose_nested_native_mtp(tmp_path: Path):

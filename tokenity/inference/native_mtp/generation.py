@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import math
 import importlib
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
@@ -231,6 +232,7 @@ def _post_init(batch: Any, telemetry: dict[str, object]) -> None:
     next_main = _uint32(sampler(next_logprobs))
 
     mtp_cache = batch.model.make_mtp_cache()
+    head_started = time.perf_counter()
     head_logits = batch.model.mtp_forward(
         hidden[:, -1:, :],
         next_main.reshape(1, 1),
@@ -242,6 +244,7 @@ def _post_init(batch: Any, telemetry: dict[str, object]) -> None:
     draft_logprobs = _logprobs(head_logits)
     draft_token = _uint32(sampler(draft_logprobs))
     mx.eval(main_token, next_main, draft_token)
+    _record_duration(telemetry, "head_time_seconds", head_started)
 
     state = _MTPState(uid=batch.uids[0], telemetry=telemetry)
     state.mtp_cache = mtp_cache
@@ -261,7 +264,13 @@ def _mtp_next(batch: Any, state: _MTPState) -> list[Any]:
     if not state.queue:
         raise RuntimeError("Native MTP verify cycle produced no output token")
     token, logprobs, source, cached = state.queue.popleft()
-    del source
+    if source in {"draft", "bonus", "verify"}:
+        emitted = int(state.telemetry.get("emitted_verify_tokens", 0)) + 1
+        cycles = int(state.telemetry.get("verify_cycles", 0))
+        state.telemetry["emitted_verify_tokens"] = emitted
+        state.telemetry["emitted_tokens_per_verify_cycle"] = (
+            emitted / cycles if cycles else None
+        )
     state.last_uncached_token = None if cached else token
     return _emit(batch, state, token, logprobs, cached)
 
@@ -279,6 +288,7 @@ def _verify_cycle(batch: Any, state: _MTPState) -> None:
 
     # The previously emitted uncached token is the confirmed first row here.
     state.last_uncached_token = None
+    verify_started = time.perf_counter()
     cache_rollback.set_undo_armed(True)
     try:
         logits, hidden = batch.model(
@@ -309,6 +319,7 @@ def _verify_cycle(batch: Any, state: _MTPState) -> None:
             state.draft_id,
         )
         accepted = probability >= 1 or float(mx.random.uniform(shape=()).item()) < probability
+    _record_duration(state.telemetry, "verify_time_seconds", verify_started)
 
     _record_proposal(state.telemetry, accepted)
     hidden_confirmed = hidden[:, 0:1, :]
@@ -326,7 +337,10 @@ def _verify_cycle(batch: Any, state: _MTPState) -> None:
         state.queue.append((int(bonus_token.item()), bonus_logprobs.squeeze(0), "bonus", False))
         state.next_main = bonus_token
     else:
-        if not cache_rollback.restore_after_rejection(batch.prompt_cache):
+        rollback_started = time.perf_counter()
+        restored = cache_rollback.restore_after_rejection(batch.prompt_cache)
+        _record_duration(state.telemetry, "rollback_time_seconds", rollback_started)
+        if not restored:
             raise RuntimeError("Native MTP could not roll back every hybrid cache layer")
         if processors is not None:
             buffer = batch._token_context[0]
@@ -363,6 +377,7 @@ def _step_head(
 
     sampler = _sampler(batch)
     processors = _processors(batch)
+    head_started = time.perf_counter()
     logits = batch.model.mtp_forward(
         hidden,
         next_main.reshape(1, 1),
@@ -378,6 +393,7 @@ def _step_head(
     token = _uint32(sampler(logprobs))
     accept_logprobs = filtered_logprobs(sampler, logprobs)
     mx.eval(token)
+    _record_duration(state.telemetry, "head_time_seconds", head_started)
     return token, logprobs.squeeze(0), accept_logprobs.squeeze(0)
 
 
@@ -475,9 +491,21 @@ def _commit_last_uncached(batch: Any, state: _MTPState) -> None:
 def _record_proposal(telemetry: dict[str, object], accepted: bool) -> None:
     proposed = int(telemetry.get("proposed_tokens", 0)) + 1
     accepted_count = int(telemetry.get("accepted_tokens", 0)) + int(accepted)
+    cycles = int(telemetry.get("verify_cycles", 0)) + 1
     telemetry["proposed_tokens"] = proposed
     telemetry["accepted_tokens"] = accepted_count
     telemetry["acceptance_rate"] = accepted_count / proposed
+    telemetry["verify_cycles"] = cycles
+    emitted = int(telemetry.get("emitted_verify_tokens", 0))
+    telemetry["emitted_tokens_per_verify_cycle"] = emitted / cycles
+
+
+def _record_duration(
+    telemetry: dict[str, object],
+    key: str,
+    started: float,
+) -> None:
+    telemetry[key] = float(telemetry.get(key, 0.0)) + (time.perf_counter() - started)
 
 
 def _uint32(value: Any) -> Any:
