@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from tokenity.mlx.hostfile import ClusterNode, ConnectionMode
+from tokenity.inference.native_mtp import NativeMTPConfig
 from tokenity.mlx.launcher import (
     build_distributed_openai_launch_plan,
     build_official_mlx_lm_launch_plan,
@@ -72,6 +73,7 @@ def test_distributed_plan_forwards_model_runtime_configuration():
         decode_concurrency=2,
         prompt_concurrency=3,
         trust_remote_code=True,
+        native_mtp=NativeMTPConfig(mode="auto"),
     )
 
     command = plan.command
@@ -82,6 +84,11 @@ def test_distributed_plan_forwards_model_runtime_configuration():
     assert command[command.index("--decode-concurrency") + 1] == "2"
     assert command[command.index("--prompt-concurrency") + 1] == "3"
     assert "--trust-remote-code" in command
+    separator = command.index("--")
+    assert command.index("--native-mtp-mode") > separator
+    assert command[command.index("--native-mtp-mode") + 1] == "auto"
+    assert command[command.index("--native-mtp-max-depth") + 1] == "1"
+    assert command[command.index("--native-mtp-head-placement") + 1] == "replicated"
 
 
 def test_distributed_plan_can_wrap_launcher_in_local_ssh(monkeypatch):

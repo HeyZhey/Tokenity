@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .hostfile import ClusterNode, ConnectionMode, build_hostfile
+from tokenity.inference.native_mtp import NativeMTPConfig
 
 
 @dataclass
@@ -93,9 +94,11 @@ def build_distributed_openai_launch_plan(
     decode_concurrency: int = 1,
     prompt_concurrency: int = 1,
     trust_remote_code: bool = False,
+    native_mtp: NativeMTPConfig | None = None,
 ) -> LaunchPlan:
     hostfile = build_hostfile(nodes, connection_mode)
     backend = _mlx_backend(connection_mode)
+    native_mtp = native_mtp or NativeMTPConfig()
     command = [
         _mlx_launch_executable(python),
         "--hostfile",
@@ -146,6 +149,12 @@ def build_distributed_openai_launch_plan(
         str(decode_concurrency),
         "--prompt-concurrency",
         str(prompt_concurrency),
+        "--native-mtp-mode",
+        native_mtp.mode,
+        "--native-mtp-max-depth",
+        str(native_mtp.max_depth),
+        "--native-mtp-head-placement",
+        native_mtp.head_placement,
     ]
     if api_identifier:
         command.extend(["--api-identifier", api_identifier])

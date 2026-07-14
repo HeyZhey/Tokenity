@@ -42,9 +42,64 @@ final class TokenityStoreTests: XCTestCase {
             JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any]
         )
         let nodes = try XCTUnwrap(object["nodes"] as? [[String: Any]])
+        let nativeMTP = try XCTUnwrap(object["native_mtp"] as? [String: Any])
 
         XCTAssertEqual(nodes.first?["agent_url"] as? String, "http://192.168.5.75:9100")
         XCTAssertNil(nodes.first?["ssh"])
+        XCTAssertEqual(nativeMTP["mode"] as? String, "off")
+        XCTAssertEqual(nativeMTP["max_depth"] as? Int, 1)
+        XCTAssertEqual(nativeMTP["head_placement"] as? String, "replicated")
+    }
+
+    func testNativeMTPRequiredBlocksKnownMissingWeightsAndAutoWarns() {
+        let store = TokenityStore()
+        for index in store.nodes.indices {
+            for modelIndex in store.nodes[index].models.indices {
+                store.nodes[index].models[modelIndex].nativeMTP = NativeMTPCapability(
+                    status: "missing_weights",
+                    modelType: "qwen3_5_moe_text",
+                    declaredLayers: 1,
+                    weightsPresent: false,
+                    reason: "checkpoint_missing_mtp_weights",
+                    message: "The checkpoint declares MTP but contains no MTP tensors.",
+                    tensorFormat: "safetensors-index",
+                    tensorKeyDigest: "same",
+                    missingGroups: []
+                )
+            }
+        }
+
+        store.nativeMTPMode = .required
+        XCTAssertTrue(store.launchPreview.readinessIssues.contains { $0.contains("Native MTP is required") })
+
+        store.nativeMTPMode = .auto
+        XCTAssertTrue(store.launchPreview.readinessIssues.allSatisfy { !$0.contains("Native MTP is required") })
+        XCTAssertTrue(store.launchPreview.warnings.contains { $0.contains("Auto falls back") })
+    }
+
+    func testNativeMTPNodeMismatchAndUnsupportedBackendForceOff() {
+        let store = TokenityStore()
+        for index in store.nodes.indices {
+            for modelIndex in store.nodes[index].models.indices {
+                store.nodes[index].models[modelIndex].nativeMTP = NativeMTPCapability(
+                    status: "supported",
+                    modelType: "qwen3_5_moe_text",
+                    declaredLayers: 1,
+                    weightsPresent: true,
+                    reason: nil,
+                    message: nil,
+                    tensorFormat: "safetensors-index",
+                    tensorKeyDigest: "digest-\(index)",
+                    missingGroups: []
+                )
+            }
+        }
+        XCTAssertEqual(store.aggregatedNativeMTPCapability?.status, "node_mismatch")
+
+        store.nativeMTPMode = .auto
+        store.backendMode = .singleNode
+        XCTAssertEqual(store.effectiveNativeMTPConfiguration.mode, .off)
+        XCTAssertFalse(store.canEditNativeMTP)
     }
 
     func testClusterSelectionCanChangeBeforeCreation() {

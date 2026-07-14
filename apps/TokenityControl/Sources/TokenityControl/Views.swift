@@ -244,6 +244,76 @@ struct ClusterPage: View {
                 }
             }
 
+            InfoGroup(title: "Inference Acceleration") {
+                InfoRow(label: "Native MTP") {
+                    HStack(spacing: 10) {
+                        Picker("Native MTP", selection: $store.nativeMTPMode) {
+                            ForEach(NativeMTPMode.allCases) { mode in
+                                Text(mode.title).tag(mode)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                        .frame(maxWidth: 300)
+                        .disabled(!store.canEditNativeMTP)
+                        Spacer(minLength: 0)
+                        if !store.canEditNativeMTP {
+                            Text(store.backendMode == .distributed ? "Stop cluster to edit" : "Distributed backend only")
+                                .font(.tokenityText(11))
+                                .foregroundStyle(theme.tertiaryText)
+                        }
+                    }
+                }
+                InfoRow(label: "Capability") {
+                    if let capability = store.aggregatedNativeMTPCapability {
+                        HStack(spacing: 8) {
+                            StatusPill(
+                                text: capability.displayStatus,
+                                tone: capability.status == "supported" ? .good : capability.status == "unknown" ? .neutral : .warning
+                            )
+                            Text(capability.message ?? capability.modelType ?? "Static checkpoint metadata inspected")
+                                .foregroundStyle(theme.secondaryText)
+                                .lineLimit(2)
+                        }
+                    } else {
+                        Text("Scan Models to inspect checkpoint capability on selected Macs.")
+                            .foregroundStyle(theme.secondaryText)
+                    }
+                }
+                InfoRow(label: "MVP boundary") {
+                    Text("Depth 1 · Replicated head · Singleton decode")
+                        .foregroundStyle(theme.secondaryText)
+                }
+                if store.nativeMTPMode == .auto {
+                    InfoRow(label: "Auto fallback") {
+                        Text("The server uses standard decoding if model weights, runtime shape, or topology are incompatible.")
+                            .foregroundStyle(theme.warning)
+                    }
+                }
+                if let runtime = store.nativeMTPRuntime {
+                    InfoRow(label: "Runtime") {
+                        HStack(spacing: 8) {
+                            StatusPill(text: runtime.enabled ? "Enabled" : "Standard decode", tone: runtime.enabled ? .good : .neutral)
+                            Text("Requested \(runtime.requestedMode) · Effective \(runtime.effectiveMode ?? (runtime.enabled ? "native_mtp" : "standard"))")
+                                .foregroundStyle(theme.secondaryText)
+                        }
+                    }
+                    if let reason = runtime.fallbackReason {
+                        InfoRow(label: "Fallback reason") {
+                            Text("\(reason) · \(runtime.message ?? "Server declined Native MTP")")
+                                .foregroundStyle(theme.warning)
+                        }
+                    }
+                    if let proposed = runtime.proposedTokens,
+                       let accepted = runtime.acceptedTokens {
+                        InfoRow(label: "Acceptance") {
+                            Text("\(accepted)/\(proposed) drafts · \(Int(((runtime.acceptanceRate ?? 0) * 100).rounded()))%")
+                                .foregroundStyle(theme.secondaryText)
+                        }
+                    }
+                }
+            }
+
             if !store.launchPreview.readinessIssues.isEmpty {
                 InfoGroup(title: "Readiness") {
                     ForEach(store.launchPreview.readinessIssues, id: \.self) { issue in
@@ -938,6 +1008,12 @@ private struct ModelLoadRow: View {
                     if let architecture = row.architecture {
                         Text("· \(architecture)")
                             .lineLimit(1)
+                    }
+                    if let nativeMTP = row.nativeMTP {
+                        StatusPill(
+                            text: "MTP \(nativeMTP.displayStatus)",
+                            tone: nativeMTP.status == "supported" ? .good : .neutral
+                        )
                     }
                 }
                 .font(.tokenityText(11))

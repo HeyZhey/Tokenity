@@ -23,6 +23,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
 from tokenity import __version__
+from tokenity.inference.native_mtp import scan_native_mtp_capability
 from tokenity.mlx.hostfile import ClusterNode, ConnectionMode, HostfileError, build_hostfile
 from tokenity.mlx.rdma_probe import RDMAProbeResult, probe_rdma
 from tokenity.process.supervisor import RoleSupervisor
@@ -81,6 +82,15 @@ class StartRequest(BaseModel):
     prompt_concurrency: int = Field(default=1, ge=1, le=8)
     trust_remote_code: bool = False
     lease_seconds: float = Field(default=30.0, ge=15.0, le=300.0)
+    native_mtp: "NativeMTPRequest" = Field(default_factory=lambda: NativeMTPRequest())
+
+
+class NativeMTPRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["off", "auto", "required"] = "off"
+    max_depth: Literal[1] = 1
+    head_placement: Literal["replicated"] = "replicated"
 
 
 class StopRequest(BaseModel):
@@ -132,6 +142,7 @@ class RankStartRequest(BaseModel):
     prompt_concurrency: int = Field(default=1, ge=1, le=8)
     trust_remote_code: bool = False
     lease_seconds: float = Field(default=30.0, ge=15.0, le=300.0)
+    native_mtp: NativeMTPRequest = Field(default_factory=NativeMTPRequest)
 
 
 def create_app(
@@ -565,6 +576,7 @@ def scan_models(root: Path) -> list[dict[str, object]]:
                     "size_bytes": _directory_size(child),
                     "architecture": architecture,
                     "shard_count": len(gguf_files) + len(safetensors),
+                    "native_mtp": scan_native_mtp_capability(child).to_dict(),
                 }
             )
     return models
@@ -686,6 +698,7 @@ def _http_rank_requests(request: StartRequest, nodes: list[ClusterNode]) -> list
             prompt_concurrency=request.prompt_concurrency,
             trust_remote_code=request.trust_remote_code,
             lease_seconds=request.lease_seconds,
+            native_mtp=request.native_mtp,
         )
         for rank in range(world_size)
     ]
@@ -793,6 +806,12 @@ def _rank_command(request: RankStartRequest) -> list[str]:
         str(request.decode_concurrency),
         "--prompt-concurrency",
         str(request.prompt_concurrency),
+        "--native-mtp-mode",
+        request.native_mtp.mode,
+        "--native-mtp-max-depth",
+        str(request.native_mtp.max_depth),
+        "--native-mtp-head-placement",
+        request.native_mtp.head_placement,
     ]
     if request.api_identifier:
         command.extend(["--api-identifier", request.api_identifier])

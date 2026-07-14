@@ -49,6 +49,17 @@ def _build_parser() -> argparse.ArgumentParser:
     distributed_serve.add_argument("--decode-concurrency", type=int, default=1)
     distributed_serve.add_argument("--prompt-concurrency", type=int, default=1)
     distributed_serve.add_argument(
+        "--native-mtp-mode",
+        choices=("off", "auto", "required"),
+        default="off",
+    )
+    distributed_serve.add_argument("--native-mtp-max-depth", type=int, choices=(1,), default=1)
+    distributed_serve.add_argument(
+        "--native-mtp-head-placement",
+        choices=("replicated",),
+        default="replicated",
+    )
+    distributed_serve.add_argument(
         "--require-mlx",
         action="store_true",
         help="Fail readiness if MLX/MLX-LM imports are unavailable.",
@@ -91,6 +102,11 @@ def _run_distributed_serve(args: argparse.Namespace) -> int:
         prefill_step_size=args.prefill_step_size,
         decode_concurrency=args.decode_concurrency,
         prompt_concurrency=args.prompt_concurrency,
+        native_mtp={
+            "mode": args.native_mtp_mode,
+            "max_depth": args.native_mtp_max_depth,
+            "head_placement": args.native_mtp_head_placement,
+        },
     )
     return 0
 

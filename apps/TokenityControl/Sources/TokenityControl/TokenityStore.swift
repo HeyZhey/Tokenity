@@ -47,11 +47,13 @@ private struct ModelReadinessResponse: Decodable {
     var progress: Double?
     var progressCurrent: Int?
     var progressTotal: Int?
+    var nativeMTP: NativeMTPReadiness?
 
     enum CodingKeys: String, CodingKey {
         case phase, message, progress
         case progressCurrent = "progress_current"
         case progressTotal = "progress_total"
+        case nativeMTP = "native_mtp"
     }
 }
 
@@ -74,6 +76,9 @@ final class TokenityStore: ObservableObject {
     @Published var connectionMode: ConnectionMode = .jaccl {
         didSet { rebuildLaunchPreview() }
     }
+    @Published var nativeMTPMode: NativeMTPMode = .off {
+        didSet { rebuildLaunchPreview() }
+    }
     @Published var phase: ClusterPhase = .stopped
     @Published private(set) var modelPath: String = ""
     @Published private(set) var coordinatorID: String = "mac-a" {
@@ -87,6 +92,7 @@ final class TokenityStore: ObservableObject {
     @Published var modelScanSummary = "Not scanned"
     @Published var modelLoadMessage = "No model loaded"
     @Published private(set) var modelLoadProgress: Double?
+    @Published private(set) var nativeMTPRuntime: NativeMTPReadiness?
     private static let initialChatSession = ChatSession.fresh()
 
     @Published var chatInput = ""
@@ -198,6 +204,26 @@ final class TokenityStore: ObservableObject {
         phase == .stopped || phase == .failed
     }
 
+    var canEditNativeMTP: Bool {
+        backendMode == .distributed && canEditCluster
+    }
+
+    var aggregatedNativeMTPCapability: NativeMTPCapability? {
+        if let loadedModelName,
+           let loaded = modelLibraryRows.first(where: { $0.id == loadedModelName }) {
+            return loaded.nativeMTP
+        }
+        return modelLibraryRows.first?.nativeMTP
+    }
+
+    var effectiveNativeMTPConfiguration: NativeMTPConfiguration {
+        NativeMTPConfiguration(
+            mode: backendMode == .distributed ? nativeMTPMode : .off,
+            maxDepth: 1,
+            headPlacement: "replicated"
+        )
+    }
+
     func modelConfiguration(for modelID: String) -> ModelRuntimeConfiguration {
         modelConfigurations[modelID, default: .default]
     }
@@ -281,6 +307,10 @@ final class TokenityStore: ObservableObject {
             let modelEntries = entries.map(\.1)
             let representative = modelEntries.first
             let path = representative?.path ?? "\(modelRoot)/\(modelID)"
+            let nativeMTP = aggregateNativeMTPCapability(
+                modelEntries.compactMap(\.nativeMTP),
+                expectedCount: entries.count
+            )
             return ModelLibraryRow(
                 id: modelID,
                 displayName: modelID,
@@ -292,7 +322,8 @@ final class TokenityStore: ObservableObject {
                 quantization: modelEntries.compactMap(\.quantization).first,
                 sizeBytes: modelEntries.compactMap(\.sizeBytes).max(),
                 architecture: modelEntries.compactMap(\.architecture).first,
-                shardCount: modelEntries.compactMap(\.shardCount).max()
+                shardCount: modelEntries.compactMap(\.shardCount).max(),
+                nativeMTP: nativeMTP
             )
         }
     }
@@ -394,6 +425,10 @@ final class TokenityStore: ObservableObject {
             }
         }
         nodes = updatedNodes
+        if loadedModelName != nil,
+           let readiness = try? await fetchModelReadiness() {
+            nativeMTPRuntime = readiness.nativeMTP
+        }
         rebuildLaunchPreview()
     }
 
@@ -429,6 +464,16 @@ final class TokenityStore: ObservableObject {
             appendLog("Create a cluster before loading a model.")
             return
         }
+        if nativeMTPMode == .required,
+           backendMode == .distributed,
+           let capability = row.nativeMTP,
+           capability.status != "supported",
+           capability.status != "unknown" {
+            let detail = capability.message ?? capability.displayStatus
+            modelLoadMessage = "Native MTP required mode is incompatible: \(detail)"
+            appendLog(modelLoadMessage)
+            return
+        }
         guard clusterControlBaseURL() != nil else {
             modelLoadMessage = "Selected cluster Mac is not reachable."
             appendLog("Model load blocked because the selected cluster Mac is not reachable.")
@@ -454,6 +499,7 @@ final class TokenityStore: ObservableObject {
         modelPath = row.representativePath
         modelLoadMessage = "Loading \(row.displayName)..."
         modelLoadProgress = 0
+        nativeMTPRuntime = nil
         appendLog("Loading model: \(row.displayName).")
         let configuration = modelConfiguration(for: row.id)
         let operationID = UUID()
@@ -524,6 +570,7 @@ final class TokenityStore: ObservableObject {
         states[row.id] = .unloading
         modelLoadStates = states
         modelLoadProgress = nil
+        nativeMTPRuntime = nil
         modelLoadMessage = "Unloading \(row.displayName) and releasing memory on all Macs..."
         appendLog("Unloading model: \(row.displayName).")
         do {
@@ -668,17 +715,30 @@ final class TokenityStore: ObservableObject {
 
     func rebuildLaunchPreview() {
         let nodes = selectedNodes
-        let readiness = readinessIssues(for: nodes)
+        var readiness = readinessIssues(for: nodes)
+        if backendMode == .distributed,
+           nativeMTPMode == .required,
+           let capability = aggregatedNativeMTPCapability,
+           capability.status != "supported",
+           capability.status != "unknown" {
+            readiness.append(
+                "Native MTP is required, but the selected model capability is \(capability.displayStatus.lowercased())."
+            )
+        }
         let readinessText = readiness.isEmpty ? "Ready to create" : "Needs attention"
         let summary = [
             LaunchSummaryItem(title: "Backend", value: backendMode.rawValue),
             LaunchSummaryItem(title: "Connection", value: connectionMode.rawValue),
             LaunchSummaryItem(title: "Selected Macs", value: "\(nodes.count)"),
+            LaunchSummaryItem(title: "Native MTP", value: effectiveNativeMTPConfiguration.mode.title),
             LaunchSummaryItem(title: "Readiness", value: readinessText),
         ]
-        let warnings = backendMode == .official
+        var warnings = backendMode == .official
             ? ["Experimental mode is best for compatibility checks. Use Tokenity Distributed Server as the stable target."]
             : ["Tokenity Distributed Server verifies readiness with a real chat probe before marking a model loaded."]
+        if backendMode == .distributed && nativeMTPMode == .auto {
+            warnings.append("Native MTP Auto falls back to standard decoding when the model, checkpoint, or runtime is incompatible.")
+        }
         launchPreview = LaunchPreview(
             summary: summary,
             networkPlan: networkPlan(for: nodes),
@@ -757,7 +817,48 @@ final class TokenityStore: ObservableObject {
         loadedBackendRole = nil
         loadedServiceModelName = nil
         modelLoadProgress = nil
+        nativeMTPRuntime = nil
         modelLoadMessage = message
+    }
+
+    private func aggregateNativeMTPCapability(
+        _ capabilities: [NativeMTPCapability],
+        expectedCount: Int
+    ) -> NativeMTPCapability? {
+        guard !capabilities.isEmpty else { return nil }
+        guard capabilities.count == expectedCount, let first = capabilities.first else {
+            return NativeMTPCapability(
+                status: "unknown",
+                modelType: nil,
+                declaredLayers: 0,
+                weightsPresent: false,
+                reason: nil,
+                message: "One or more selected Macs did not report Native MTP capability.",
+                tensorFormat: nil,
+                tensorKeyDigest: nil,
+                missingGroups: nil
+            )
+        }
+        let agrees = capabilities.dropFirst().allSatisfy {
+            $0.status == first.status
+                && $0.modelType == first.modelType
+                && $0.declaredLayers == first.declaredLayers
+                && $0.tensorKeyDigest == first.tensorKeyDigest
+        }
+        guard agrees else {
+            return NativeMTPCapability(
+                status: "node_mismatch",
+                modelType: first.modelType,
+                declaredLayers: first.declaredLayers,
+                weightsPresent: false,
+                reason: "node_mismatch",
+                message: "Selected Macs report different Native MTP checkpoint metadata.",
+                tensorFormat: first.tensorFormat,
+                tensorKeyDigest: nil,
+                missingGroups: nil
+            )
+        }
+        return first
     }
 
     private func appendLog(_ line: String) {
@@ -850,7 +951,8 @@ final class TokenityStore: ObservableObject {
             decodeConcurrency: configuration.decodeConcurrency,
             promptConcurrency: configuration.promptConcurrency,
             trustRemoteCode: configuration.trustRemoteCode,
-            leaseSeconds: modelLeaseSeconds
+            leaseSeconds: modelLeaseSeconds,
+            nativeMTP: effectiveNativeMTPConfiguration
         )
         var request = try jsonRequest(url: baseURL.appendingPathComponent(backendStartPath), body: requestBody)
         request.timeoutInterval = 40
@@ -1025,6 +1127,7 @@ final class TokenityStore: ObservableObject {
     }
 
     private func updateModelLoadProgress(_ readiness: ModelReadinessResponse, modelName: String) {
+        nativeMTPRuntime = readiness.nativeMTP
         let phaseProgress: Double?
         switch readiness.phase {
         case "launching": phaseProgress = 0.01

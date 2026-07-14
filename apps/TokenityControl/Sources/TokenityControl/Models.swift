@@ -123,6 +123,89 @@ enum ModelLoadState: String, Hashable {
     case unloading = "Unloading"
 }
 
+enum NativeMTPMode: String, CaseIterable, Codable, Identifiable {
+    case off
+    case auto
+    case required
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .off: return "Off"
+        case .auto: return "Auto"
+        case .required: return "Required"
+        }
+    }
+}
+
+struct NativeMTPConfiguration: Codable, Hashable {
+    var mode: NativeMTPMode = .off
+    var maxDepth: Int = 1
+    var headPlacement: String = "replicated"
+
+    enum CodingKeys: String, CodingKey {
+        case mode
+        case maxDepth = "max_depth"
+        case headPlacement = "head_placement"
+    }
+}
+
+struct NativeMTPCapability: Codable, Hashable {
+    var status: String
+    var modelType: String?
+    var declaredLayers: Int
+    var weightsPresent: Bool
+    var reason: String?
+    var message: String?
+    var tensorFormat: String?
+    var tensorKeyDigest: String?
+    var missingGroups: [String]?
+
+    enum CodingKeys: String, CodingKey {
+        case status, reason, message
+        case modelType = "model_type"
+        case declaredLayers = "declared_layers"
+        case weightsPresent = "weights_present"
+        case tensorFormat = "tensor_format"
+        case tensorKeyDigest = "tensor_key_digest"
+        case missingGroups = "missing_groups"
+    }
+
+    var displayStatus: String {
+        switch status {
+        case "supported": return "Supported"
+        case "missing_weights": return "Weights missing"
+        case "incomplete_weights": return "Weights incomplete"
+        case "unsupported": return "Unsupported"
+        case "node_mismatch": return "Node mismatch"
+        default: return "Unknown"
+        }
+    }
+}
+
+struct NativeMTPReadiness: Codable, Hashable {
+    var requestedMode: String
+    var enabled: Bool
+    var status: String
+    var effectiveMode: String?
+    var fallbackReason: String?
+    var message: String?
+    var proposedTokens: Int?
+    var acceptedTokens: Int?
+    var acceptanceRate: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case enabled, status, message
+        case requestedMode = "requested_mode"
+        case effectiveMode = "effective_mode"
+        case fallbackReason = "fallback_reason"
+        case proposedTokens = "proposed_tokens"
+        case acceptedTokens = "accepted_tokens"
+        case acceptanceRate = "acceptance_rate"
+    }
+}
+
 struct RDMAStatus: Codable, Hashable {
     var rdmaEnabled: Bool
     var rdmaDevices: [String]
@@ -180,11 +263,13 @@ struct ModelEntry: Codable, Hashable, Identifiable {
     var sizeBytes: Int64? = nil
     var architecture: String? = nil
     var shardCount: Int? = nil
+    var nativeMTP: NativeMTPCapability? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, path, format, quantization, architecture
         case sizeBytes = "size_bytes"
         case shardCount = "shard_count"
+        case nativeMTP = "native_mtp"
     }
 }
 
@@ -444,6 +529,7 @@ struct ModelLibraryRow: Identifiable, Hashable {
     var sizeBytes: Int64?
     var architecture: String?
     var shardCount: Int?
+    var nativeMTP: NativeMTPCapability?
 
     var sizeText: String {
         guard let sizeBytes else { return "Size unknown" }
@@ -612,6 +698,7 @@ struct AgentStartModelRequest: Encodable {
     var promptConcurrency: Int
     var trustRemoteCode: Bool
     var leaseSeconds: Double = 30
+    var nativeMTP: NativeMTPConfiguration = NativeMTPConfiguration()
 
     enum CodingKeys: String, CodingKey {
         case model, nodes, host, port
@@ -625,6 +712,7 @@ struct AgentStartModelRequest: Encodable {
         case promptConcurrency = "prompt_concurrency"
         case trustRemoteCode = "trust_remote_code"
         case leaseSeconds = "lease_seconds"
+        case nativeMTP = "native_mtp"
     }
 }
 
