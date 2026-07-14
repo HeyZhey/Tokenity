@@ -73,7 +73,8 @@ payloads. Each model entry includes `native_mtp` with one of:
 Static model-library capability is intentionally kept out of OpenAI
 `GET /v1/models`. Runtime state is published by `GET /v1/readiness` under
 `native_mtp`, including requested mode, effective mode, enabled state,
-fallback reason, decision fingerprint, patch ABI, and acceptance counters.
+fallback reason, decision fingerprint, patch ABI, acceptance counters,
+emitted tokens per verify cycle, and cumulative head/verify/rollback time.
 
 Common reason codes include:
 
@@ -119,6 +120,30 @@ GatedDeltaNet state. Stochastic acceptance uses `min(1, p/q)` and samples a
 rejection from normalized `max(p-q, 0)`, using the same temperature and
 top-p/top-k/min-p filtered distributions as the request sampler.
 
+## Split-checkpoint assembly
+
+The mlx-community Qwen3.5 MTP release is a split drafter rather than a target
+checkpoint containing namespaced `mtp.*` tensors. Tokenity does not load an
+external draft model at runtime. The repository instead provides an explicit,
+offline assembler:
+
+```bash
+python scripts/assemble-native-mtp-checkpoint.py \
+  --target /path/to/Qwen3.5-4B-MLX-4bit \
+  --draft /path/to/Qwen3.5-4B-MTP-4bit \
+  --output /path/to/Qwen3.5-4B-Native-MTP-4bit
+```
+
+The assembler validates the two configurations, keeps the target checkpoint
+unchanged, namespaces the draft tensors under `language_model.mtp`, and
+dequantizes only the MTP fusion `fc` projection to BF16 to match mlx-lm's
+module definition. The head is written to `mtp.safetensors`, outside stock
+mlx-lm's `model*.safetensors` glob. Tokenity exposes that sidecar only inside
+an enabled construction scope. Consequently, `mode=off` loads exactly the
+original target files and cannot trigger qwen3_5's MTP-aware sanitize path.
+The output includes `tokenity-native-mtp.json` with source hashes and storage
+provenance, and the assembler refuses to overwrite an existing directory.
+
 ## Validation scope
 
 The repository includes control-plane tests plus Apple-Silicon synthetic
@@ -127,7 +152,7 @@ greedy parity, stochastic marginal correctness, hybrid-cache rollback,
 maximum tokens, stop sequences, cancellation, lazy activation, late-join
 protection, and random-head rejection.
 
-The currently installed target checkpoint
+The pre-existing large checkpoint
 `Qwen3.5-122B-A10B-4bit` declares one MTP layer but its safetensors index
 contains no MTP tensors. Its correct result is therefore:
 
@@ -136,6 +161,11 @@ contains no MTP tensors. Its correct result is therefore:
 - `required`: startup failure with the same reason.
 
 That checkpoint cannot provide a real Native MTP throughput or acceptance
-measurement. A real compatible checkpoint must be supplied separately; do
-not treat synthetic results as real model or multi-Mac performance evidence.
+measurement. It was retained as the missing-weight fail-closed test case.
 
+With explicit user approval, the 4B split target and MTP repositories were
+downloaded, pinned, assembled, checksum-verified on both Macs, and exercised
+with real model weights at world sizes one and two. See
+`docs/native-mtp-validation-2026-07-14.md` for sources, exact scope, parity,
+Ring/JACCL performance, memory, and cleanup evidence. Synthetic tests remain
+clearly separate from those real-checkpoint results.
