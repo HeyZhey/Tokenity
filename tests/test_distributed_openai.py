@@ -7,7 +7,11 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 from tokenity.serving.distributed_openai import (
+    _LoadEvalPolicy,
     TokenityDistributedRuntime,
+    _eval_parameters_in_chunks,
+    _load_eval_policy,
+    _parameter_eval_chunks,
     _requires_process_isolated_shutdown,
     _report_load_progress,
     _set_active_load_state,
@@ -94,6 +98,65 @@ def test_readiness_reports_real_parameter_load_progress():
     assert payload["progress_current"] == 25
     assert payload["progress_total"] == 100
     assert 0.3 < payload["progress"] < 0.4
+
+
+def test_adaptive_load_policy_bypasses_legacy_agent_throttling(monkeypatch):
+    monkeypatch.delenv("TOKENITY_MLX_LOAD_POLICY", raising=False)
+    monkeypatch.setenv("TOKENITY_MLX_LOAD_EVAL_CHUNK_SIZE", "1")
+    monkeypatch.setenv("TOKENITY_MLX_LOAD_EVAL_SLEEP_SECONDS", "0.05")
+
+    policy = _load_eval_policy()
+
+    assert policy.name == "adaptive"
+    assert policy.max_leaves == 64
+    assert policy.target_bytes == 256 * 1024 * 1024
+    assert policy.sleep_seconds == 0
+
+
+def test_fixed_load_policy_preserves_explicit_memory_throttling(monkeypatch):
+    monkeypatch.setenv("TOKENITY_MLX_LOAD_POLICY", "fixed")
+    monkeypatch.setenv("TOKENITY_MLX_LOAD_EVAL_CHUNK_SIZE", "3")
+    monkeypatch.setenv("TOKENITY_MLX_LOAD_EVAL_SLEEP_SECONDS", "0.125")
+
+    policy = _load_eval_policy()
+
+    assert policy.name == "fixed"
+    assert policy.max_leaves == 3
+    assert policy.target_bytes is None
+    assert policy.sleep_seconds == 0.125
+
+
+def test_adaptive_parameter_chunks_respect_leaf_and_byte_limits():
+    parameters = [(str(index), SimpleNamespace(nbytes=size)) for index, size in enumerate([4, 4, 4, 20, 1])]
+    policy = _LoadEvalPolicy(name="adaptive", max_leaves=4, target_bytes=10, sleep_seconds=0)
+
+    chunks = _parameter_eval_chunks(parameters, policy)
+
+    assert [[value.nbytes for _, value in chunk] for chunk in chunks] == [[4, 4], [4], [20], [1]]
+
+
+def test_adaptive_parameter_eval_batches_without_per_leaf_sleep(monkeypatch):
+    monkeypatch.setenv("TOKENITY_MLX_LOAD_POLICY", "adaptive")
+    monkeypatch.setenv("TOKENITY_MLX_LOAD_ADAPTIVE_MAX_LEAVES", "64")
+    monkeypatch.setenv("TOKENITY_MLX_LOAD_ADAPTIVE_TARGET_BYTES", str(1024 * 1024))
+    monkeypatch.setattr(
+        "tokenity.serving.distributed_openai.time.sleep",
+        lambda _: (_ for _ in ()).throw(AssertionError("adaptive loading must not sleep")),
+    )
+
+    class FakeMLX:
+        def __init__(self):
+            self.eval_sizes = []
+
+        def eval(self, values):
+            self.eval_sizes.append(len(values))
+
+    mx = FakeMLX()
+    parameters = [(str(index), SimpleNamespace(nbytes=1)) for index in range(130)]
+
+    _eval_parameters_in_chunks(mx, parameters)
+
+    assert mx.eval_sizes == [64, 64, 2]
 
 
 def test_stop_endpoint_requests_natural_server_exit():

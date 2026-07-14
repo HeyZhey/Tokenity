@@ -176,6 +176,15 @@ loaded. Available controls include:
 The Models page can identify MLX, GGUF, and Transformers-style inventories,
 but the distributed inference path currently validated by this project is MLX-LM.
 
+Model parameter materialization uses an adaptive policy by default. Each
+`mx.eval` batch is bounded by both 64 parameter leaves and 256 MiB of logical
+tensor data, with no artificial per-batch sleep. This keeps small checkpoints
+fast while bounding the working set for large checkpoints. Operators diagnosing
+extreme memory pressure can opt back into the conservative fixed policy by
+setting `TOKENITY_MLX_LOAD_POLICY=fixed`, together with
+`TOKENITY_MLX_LOAD_EVAL_CHUNK_SIZE` and
+`TOKENITY_MLX_LOAD_EVAL_SLEEP_SECONDS`.
+
 ## Chat
 
 Tokenity Chat provides:

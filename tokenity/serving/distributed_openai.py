@@ -58,6 +58,14 @@ class _GenerationResult:
     prompt_cache_tokens: int | None
 
 
+@dataclass(frozen=True)
+class _LoadEvalPolicy:
+    name: str
+    max_leaves: int
+    target_bytes: int | None
+    sleep_seconds: float
+
+
 _LOAD_PROGRESS_LOCK = threading.Lock()
 _ACTIVE_LOAD_STATE: ReadinessState | None = None
 _ACTIVE_LOAD_CANCEL: threading.Event | None = None
@@ -249,22 +257,27 @@ def _install_chunked_sharded_load(server: Any) -> None:
 
 
 def _eval_parameters_in_chunks(mx: Any, flattened_parameters: list[tuple[str, Any]]) -> None:
-    chunk_size = _positive_int_env("TOKENITY_MLX_LOAD_EVAL_CHUNK_SIZE", 1)
+    policy = _load_eval_policy()
     log_interval = _positive_int_env("TOKENITY_MLX_LOAD_EVAL_LOG_INTERVAL", 100)
-    sleep_seconds = _nonnegative_float_env("TOKENITY_MLX_LOAD_EVAL_SLEEP_SECONDS", 0.05)
-    total_chunks = (len(flattened_parameters) + chunk_size - 1) // chunk_size
+    chunks = _parameter_eval_chunks(flattened_parameters, policy)
+    total_chunks = len(chunks)
+    total_bytes = sum(_array_nbytes(value) or 0 for _, value in flattened_parameters)
+    started_at = time.monotonic()
     logging.warning(
-        "Tokenity chunked sharded_load evaluating %s parameter leaves in %s chunks of %s.",
+        "Tokenity sharded_load evaluating %s parameter leaves (%s bytes) in %s %s chunks "
+        "(max leaves=%s, target bytes=%s, sleep=%.3fs).",
         len(flattened_parameters),
+        total_bytes,
         total_chunks,
-        chunk_size,
+        policy.name,
+        policy.max_leaves,
+        policy.target_bytes,
+        policy.sleep_seconds,
     )
     _report_load_progress(0, total_chunks)
-    for start in range(0, len(flattened_parameters), chunk_size):
+    for chunk_index, chunk in enumerate(chunks, start=1):
         if _load_was_cancelled():
             raise _ModelLoadCancelled("Tokenity model loading was cancelled.")
-        chunk = flattened_parameters[start : start + chunk_size]
-        chunk_index = start // chunk_size + 1
         should_log = chunk_index == 1 or chunk_index == total_chunks or chunk_index % log_interval == 0
         if should_log:
             logging.warning(
@@ -283,8 +296,64 @@ def _eval_parameters_in_chunks(mx: Any, flattened_parameters: list[tuple[str, An
                 chunk_index,
                 total_chunks,
             )
-        if sleep_seconds:
-            time.sleep(sleep_seconds)
+        if policy.sleep_seconds:
+            time.sleep(policy.sleep_seconds)
+    elapsed = time.monotonic() - started_at
+    gib_per_second = (total_bytes / (1024**3) / elapsed) if total_bytes and elapsed > 0 else 0.0
+    logging.warning(
+        "Tokenity sharded_load materialized %s parameter leaves in %.3fs (%.3f GiB/s).",
+        len(flattened_parameters),
+        elapsed,
+        gib_per_second,
+    )
+
+
+def _load_eval_policy() -> _LoadEvalPolicy:
+    # Pre-upgrade Agents always forward the old numeric defaults (one leaf and
+    # a 50 ms sleep). Require an explicit policy marker before honoring those
+    # values so deploying the new runtime immediately fixes legacy Agents.
+    mode = os.environ.get("TOKENITY_MLX_LOAD_POLICY", "adaptive").strip().lower()
+    if mode == "fixed":
+        return _LoadEvalPolicy(
+            name="fixed",
+            max_leaves=_positive_int_env("TOKENITY_MLX_LOAD_EVAL_CHUNK_SIZE", 1),
+            target_bytes=None,
+            sleep_seconds=_nonnegative_float_env("TOKENITY_MLX_LOAD_EVAL_SLEEP_SECONDS", 0.05),
+        )
+    if mode not in {"", "adaptive"}:
+        logging.warning("Unknown TOKENITY_MLX_LOAD_POLICY=%r; using adaptive loading.", mode)
+    return _LoadEvalPolicy(
+        name="adaptive",
+        max_leaves=_positive_int_env("TOKENITY_MLX_LOAD_ADAPTIVE_MAX_LEAVES", 64),
+        target_bytes=_positive_int_env("TOKENITY_MLX_LOAD_ADAPTIVE_TARGET_BYTES", 256 * 1024 * 1024),
+        sleep_seconds=0.0,
+    )
+
+
+def _parameter_eval_chunks(
+    flattened_parameters: list[tuple[str, Any]],
+    policy: _LoadEvalPolicy,
+) -> list[list[tuple[str, Any]]]:
+    chunks: list[list[tuple[str, Any]]] = []
+    chunk: list[tuple[str, Any]] = []
+    chunk_bytes = 0
+    for parameter in flattened_parameters:
+        parameter_bytes = _array_nbytes(parameter[1]) or 0
+        exceeds_leaf_limit = len(chunk) >= policy.max_leaves
+        exceeds_byte_limit = (
+            policy.target_bytes is not None
+            and bool(chunk)
+            and chunk_bytes + parameter_bytes > policy.target_bytes
+        )
+        if exceeds_leaf_limit or exceeds_byte_limit:
+            chunks.append(chunk)
+            chunk = []
+            chunk_bytes = 0
+        chunk.append(parameter)
+        chunk_bytes += parameter_bytes
+    if chunk:
+        chunks.append(chunk)
+    return chunks
 
 
 def _positive_int_env(name: str, default: int) -> int:

@@ -737,6 +737,13 @@ def _rank_command_and_environment(request: RankStartRequest) -> tuple[list[str],
         "PATH": _distributed_path(request.python),
         "PYTHONPATH": _distributed_code_root(),
         "MLX_METAL_FAST_SYNCH": os.environ.get("MLX_METAL_FAST_SYNCH", "1"),
+        "TOKENITY_MLX_LOAD_POLICY": os.environ.get("TOKENITY_MLX_LOAD_POLICY", "adaptive"),
+        "TOKENITY_MLX_LOAD_ADAPTIVE_MAX_LEAVES": os.environ.get(
+            "TOKENITY_MLX_LOAD_ADAPTIVE_MAX_LEAVES", "64"
+        ),
+        "TOKENITY_MLX_LOAD_ADAPTIVE_TARGET_BYTES": os.environ.get(
+            "TOKENITY_MLX_LOAD_ADAPTIVE_TARGET_BYTES", str(256 * 1024 * 1024)
+        ),
         "TOKENITY_MLX_LOAD_EVAL_CHUNK_SIZE": os.environ.get("TOKENITY_MLX_LOAD_EVAL_CHUNK_SIZE", "1"),
         "TOKENITY_MLX_LOAD_EVAL_LOG_INTERVAL": os.environ.get("TOKENITY_MLX_LOAD_EVAL_LOG_INTERVAL", "100"),
         "TOKENITY_MLX_LOAD_EVAL_SLEEP_SECONDS": os.environ.get("TOKENITY_MLX_LOAD_EVAL_SLEEP_SECONDS", "0.05"),

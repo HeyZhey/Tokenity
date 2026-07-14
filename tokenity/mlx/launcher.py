@@ -114,6 +114,14 @@ def build_distributed_openai_launch_plan(
         "--env",
         f"MLX_METAL_FAST_SYNCH={os.environ.get('MLX_METAL_FAST_SYNCH', '1')}",
         "--env",
+        f"TOKENITY_MLX_LOAD_POLICY={os.environ.get('TOKENITY_MLX_LOAD_POLICY', 'adaptive')}",
+        "--env",
+        "TOKENITY_MLX_LOAD_ADAPTIVE_MAX_LEAVES="
+        f"{os.environ.get('TOKENITY_MLX_LOAD_ADAPTIVE_MAX_LEAVES', '64')}",
+        "--env",
+        "TOKENITY_MLX_LOAD_ADAPTIVE_TARGET_BYTES="
+        f"{os.environ.get('TOKENITY_MLX_LOAD_ADAPTIVE_TARGET_BYTES', str(256 * 1024 * 1024))}",
+        "--env",
         f"TOKENITY_MLX_LOAD_EVAL_CHUNK_SIZE={os.environ.get('TOKENITY_MLX_LOAD_EVAL_CHUNK_SIZE', '1')}",
         "--env",
         f"TOKENITY_MLX_LOAD_EVAL_LOG_INTERVAL={os.environ.get('TOKENITY_MLX_LOAD_EVAL_LOG_INTERVAL', '100')}",

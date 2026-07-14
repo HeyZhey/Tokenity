@@ -52,6 +52,9 @@ def test_distributed_plan_uses_runtime_python_for_tokenity_server():
     path_env = env_values[0]
     assert path_env.startswith("PATH=/Users/Shared/TokenityRuntime/current/.venv/bin")
     assert "MLX_METAL_FAST_SYNCH=1" in env_values
+    assert "TOKENITY_MLX_LOAD_POLICY=adaptive" in env_values
+    assert "TOKENITY_MLX_LOAD_ADAPTIVE_MAX_LEAVES=64" in env_values
+    assert "TOKENITY_MLX_LOAD_ADAPTIVE_TARGET_BYTES=268435456" in env_values
     assert "TOKENITY_MLX_LOAD_EVAL_CHUNK_SIZE=1" in env_values
     assert "TOKENITY_MLX_LOAD_EVAL_LOG_INTERVAL=100" in env_values
     assert "TOKENITY_MLX_LOAD_EVAL_SLEEP_SECONDS=0.05" in env_values

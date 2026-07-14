@@ -511,6 +511,9 @@ def test_rank_environment_matches_mlx_jaccl_contract(tmp_path: Path, monkeypatch
 
     assert command[:4] == ["/runtime/bin/python", "-m", "tokenity", "distributed-openai"]
     assert env["MLX_RANK"] == "1"
+    assert env["TOKENITY_MLX_LOAD_POLICY"] == "adaptive"
+    assert env["TOKENITY_MLX_LOAD_ADAPTIVE_MAX_LEAVES"] == "64"
+    assert env["TOKENITY_MLX_LOAD_ADAPTIVE_TARGET_BYTES"] == "268435456"
     assert env["MLX_JACCL_COORDINATOR"] == "192.168.0.1:30020"
     assert json.loads(Path(env["MLX_IBV_DEVICES"]).read_text()) == [
         [None, "rdma_en4"],
