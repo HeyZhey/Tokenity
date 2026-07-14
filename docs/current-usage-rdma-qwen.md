@@ -2,6 +2,11 @@
 
 Updated: 2026-07-12
 
+Native MTP remains off by default. See [Tokenity Native MTP MVP](native-mtp.md)
+for the `off`/`auto`/`required` contract. The current
+`Qwen3.5-122B-A10B-4bit` checkpoint declares an MTP layer but contains no MTP
+tensors, so `auto` must fall back and `required` must fail before readiness.
+
 This is the current product workflow for two-Mac inference. It uses Node Agent
 HTTP commands and does not require SSH, machine usernames, passwords, or keys.
 

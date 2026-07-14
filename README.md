@@ -296,6 +296,8 @@ busy; stop the existing model role before launching it again.
 
 ## Documentation
 
+- [Native MTP MVP](docs/native-mtp.md)
+
 - [Stable baseline](docs/stable-baseline.md)
 - [HTTP Node Agent protocol](docs/http-node-agent.md)
 - [GLM-5.2 compatibility](docs/glm-5.2-compat.md)
