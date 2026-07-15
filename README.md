@@ -34,7 +34,7 @@ fit across the combined unified memory of several machines.
 - Live readiness phases for distributed initialization, model loading, and generation.
 - Model inventory with format, quantization, size, architecture, and shard metadata.
 - GLM-5.2 cross-layer DSA indexer compatibility based on upstream mlx-lm PR #1410.
-- Per-model runtime and sampling configuration.
+- Per-model runtime, thinking-mode, and sampling configuration with Qwen3.5 presets.
 - Streaming Chat with expanded reasoning, automatic scrolling, metrics, separate history sessions, and immediate cancellation.
 - Automatic non-streaming recovery when a macOS streaming connection fails before the first token.
 - Model unload, cluster stop, and app shutdown cancel the active generation before backend teardown.
@@ -168,7 +168,15 @@ Configuration is stored per model and applied the next time that model is
 loaded. Available controls include:
 
 - Maximum output tokens — default `32768`, valid up to `262144`.
-- Temperature, top-p, top-k, and min-p sampling.
+- Thinking mode — **Auto**, **On**, or **Off**. Qwen3.5 uses the tokenizer's
+  `enable_thinking` chat-template switch, so disabling thinking does not rely on
+  a natural-language instruction.
+- Temperature, top-p, top-k, min-p, presence penalty, and repetition penalty.
+- Official Qwen3.5 sampling presets are enabled by default: thinking uses
+  `temperature=1.0`, `top_p=0.95`, `top_k=20`, `presence_penalty=1.5`; non-thinking
+  uses `temperature=0.7`, `top_p=0.8`, `top_k=20`, `presence_penalty=1.5`.
+  Sampling fields remain editable; changing any field automatically switches
+  that model from the official preset to custom sampling.
 - Prompt cache size.
 - Prefill step size.
 - Decode and prompt concurrency.
@@ -176,6 +184,9 @@ loaded. Available controls include:
 
 The Models page can identify MLX, GGUF, and Transformers-style inventories,
 but the distributed inference path currently validated by this project is MLX-LM.
+Checkpoints whose `model_type` is `qwen3_5_mtp` are marked **Draft only** and
+rejected by both the UI and Node Agent. These weights are speculative-decoding
+draft weights, not standalone chat models.
 
 Model parameter materialization uses an adaptive policy by default. Each
 `mx.eval` batch is bounded by both 64 parameter leaves and 256 MiB of logical
@@ -201,6 +212,11 @@ Tokenity Chat provides:
   incomplete turn from future context.
 - A bounded SSE buffer with backpressure, preventing a fast producer from
   leaving stale tokens queued in the UI after cancellation.
+- Coalesced token rendering (at most about 20 UI updates per second) so long
+  reasoning streams do not monopolize the macOS main thread.
+- Server- and client-side repeated-output detection. A cycling response is
+  stopped automatically, its partial turn is excluded from future context, and
+  the UI reports why generation ended.
 - Automatic non-streaming fallback if the native streaming connection fails
   before any model output arrives.
 

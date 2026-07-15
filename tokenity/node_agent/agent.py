@@ -26,6 +26,7 @@ from tokenity import __version__
 from tokenity.inference.native_mtp import scan_native_mtp_capability
 from tokenity.mlx.hostfile import ClusterNode, ConnectionMode, HostfileError, build_hostfile
 from tokenity.mlx.rdma_probe import RDMAProbeResult, probe_rdma
+from tokenity.model_inspection import model_usage_metadata, standalone_model_issue
 from tokenity.process.supervisor import RoleSupervisor
 
 
@@ -379,6 +380,8 @@ def create_app(
     @app.post("/v1/node/start-distributed-openai")
     def start_distributed(request: StartRequest) -> dict[str, object]:
         nonlocal runtime_port
+        if issue := standalone_model_issue(request.model):
+            raise HTTPException(status_code=400, detail=issue)
         if not request.dry_run and Path(request.python).resolve() != Path(sys.executable).resolve():
             raise HTTPException(
                 status_code=400,
@@ -458,6 +461,8 @@ def create_app(
     @app.post("/v1/node/start-distributed-rank")
     def start_distributed_rank(request: RankStartRequest) -> dict[str, object]:
         nonlocal runtime_port
+        if issue := standalone_model_issue(request.model):
+            raise HTTPException(status_code=400, detail=issue)
         if request.rank >= request.world_size:
             raise HTTPException(status_code=400, detail="Rank must be smaller than world size.")
         if request.coordinator:
@@ -577,6 +582,7 @@ def scan_models(root: Path) -> list[dict[str, object]]:
                     "architecture": architecture,
                     "shard_count": len(gguf_files) + len(safetensors),
                     "native_mtp": scan_native_mtp_capability(child).to_dict(),
+                    **model_usage_metadata(config),
                 }
             )
     return models

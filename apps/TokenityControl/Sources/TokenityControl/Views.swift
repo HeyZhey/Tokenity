@@ -1025,6 +1025,9 @@ private struct ModelLoadRow: View {
                             tone: nativeMTP.status == "supported" ? .good : .neutral
                         )
                     }
+                    if !row.standaloneLoadable {
+                        StatusPill(text: "Draft only", tone: .warning)
+                    }
                 }
                 .font(.tokenityText(11))
                 .foregroundStyle(theme.secondaryText)
@@ -1093,8 +1096,8 @@ private struct ModelLoadRow: View {
                 } label: {
                     Label("Load", systemImage: "play.fill")
                 }
-                .disabled(!clusterIsReady || row.nodes.count < selectedNodeCount)
-                .help(!clusterIsReady ? "Create a cluster before loading a model" : "Load model")
+                .disabled(!clusterIsReady || row.nodes.count < selectedNodeCount || !row.standaloneLoadable)
+                .help(loadButtonHelp)
             }
         }
         .padding(.horizontal, 12)
@@ -1113,6 +1116,15 @@ private struct ModelLoadRow: View {
         case .loading, .unloading: return .warning
         case .notLoaded: return .danger
         }
+    }
+
+    private var loadButtonHelp: String {
+        if !row.standaloneLoadable {
+            return row.loadBlockReason ?? "This draft checkpoint cannot be loaded as a standalone chat model."
+        }
+        if !clusterIsReady { return "Create a cluster before loading a model" }
+        if row.nodes.count < selectedNodeCount { return "The model must be available on every selected Mac" }
+        return "Load model"
     }
 
     private var stateColor: Color {
@@ -1162,16 +1174,41 @@ private struct ModelConfigurationSheet: View {
                 }
 
                 Section("Generation") {
+                    LabeledContent("Thinking Mode") {
+                        Picker("Thinking Mode", selection: $draft.thinkingMode) {
+                            ForEach(ModelThinkingMode.allCases) { mode in
+                                Text(mode.title).tag(mode)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                        .frame(width: 260)
+                    }
+                    if row.isQwen35 {
+                        Toggle("Use Qwen3.5 recommended sampling", isOn: $draft.useRecommendedSampling)
+                        if draft.useRecommendedSampling {
+                            Text(recommendedSamplingSummary)
+                                .font(.tokenityText(11))
+                                .foregroundStyle(.secondary)
+                        }
+                        Text("Adjusting any sampling field switches this model to custom sampling.")
+                            .font(.tokenityText(11))
+                            .foregroundStyle(.secondary)
+                    }
                     integerField(
                         "Max Output Tokens",
                         value: $draft.maximumOutputTokens,
                         range: 1...262_144,
                         help: "Maximum reasoning and answer tokens for each chat completion."
                     )
-                    decimalField("Temperature", value: $draft.temperature, range: 0...2)
-                    decimalField("Top P", value: $draft.topP, range: 0...1)
-                    integerField("Top K", value: $draft.topK, range: 0...1_000)
-                    decimalField("Min P", value: $draft.minP, range: 0...1)
+                    Group {
+                        decimalField("Temperature", value: customSamplingBinding(\.temperature), range: 0...2)
+                        decimalField("Top P", value: customSamplingBinding(\.topP), range: 0...1)
+                        integerField("Top K", value: customSamplingBinding(\.topK), range: 0...1_000)
+                        decimalField("Min P", value: customSamplingBinding(\.minP), range: 0...1)
+                        decimalField("Presence Penalty", value: customSamplingBinding(\.presencePenalty), range: -2...2)
+                        decimalField("Repetition Penalty", value: customSamplingBinding(\.repetitionPenalty), range: 0...2)
+                    }
                 }
 
                 Section("Distributed Runtime") {
@@ -1213,7 +1250,44 @@ private struct ModelConfigurationSheet: View {
                 }
             }
         }
-        .frame(width: 600, height: 600)
+        .frame(width: 620, height: 720)
+    }
+
+    private var recommendedSamplingSummary: String {
+        let sampling = draft.resolvedSampling(forQwen35: true)
+        return String(
+            format: "Official %@ preset: temperature %.2g · top-p %.2g · top-k %d · presence %.2g · repetition %.2g",
+            draft.thinkingMode == .disabled ? "non-thinking" : "thinking",
+            sampling.temperature,
+            sampling.topP,
+            sampling.topK,
+            sampling.presencePenalty,
+            sampling.repetitionPenalty
+        )
+    }
+
+    private func customSamplingBinding<Value>(
+        _ keyPath: WritableKeyPath<ModelRuntimeConfiguration, Value>
+    ) -> Binding<Value> {
+        Binding(
+            get: { draft[keyPath: keyPath] },
+            set: { value in
+                switchToCustomSamplingIfNeeded()
+                draft[keyPath: keyPath] = value
+            }
+        )
+    }
+
+    private func switchToCustomSamplingIfNeeded() {
+        guard row.isQwen35, draft.useRecommendedSampling else { return }
+        let recommended = draft.resolvedSampling(forQwen35: true)
+        draft.temperature = recommended.temperature
+        draft.topP = recommended.topP
+        draft.topK = recommended.topK
+        draft.minP = recommended.minP
+        draft.presencePenalty = recommended.presencePenalty
+        draft.repetitionPenalty = recommended.repetitionPenalty
+        draft.useRecommendedSampling = false
     }
 
     @ViewBuilder

@@ -743,6 +743,7 @@ final class TokenityStoreTests: XCTestCase {
         configuration.topP = 0.9
         configuration.topK = 40
         configuration.minP = 0.05
+        configuration.useRecommendedSampling = false
         store.updateModelConfiguration(configuration, for: first.id)
         store.connectionMode = .ring
         store.createCluster()
@@ -892,6 +893,145 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertEqual(row?.sizeText, "64 GB")
         XCTAssertEqual(row?.architecture, "QwenMoeForCausalLM")
         XCTAssertEqual(row?.shardCount, 10)
+    }
+
+    func testLegacyModelConfigurationMigratesThinkingAndPenaltyDefaults() throws {
+        let legacy = #"{"maximumOutputTokens":4096,"temperature":0,"topP":1,"topK":0,"minP":0,"promptCacheSize":4,"prefillStepSize":2048,"decodeConcurrency":1,"promptConcurrency":1,"trustRemoteCode":false}"#
+
+        let configuration = try JSONDecoder().decode(
+            ModelRuntimeConfiguration.self,
+            from: Data(legacy.utf8)
+        )
+
+        XCTAssertEqual(configuration.thinkingMode, .automatic)
+        XCTAssertTrue(configuration.useRecommendedSampling)
+        XCTAssertEqual(configuration.presencePenalty, 0)
+        XCTAssertEqual(configuration.repetitionPenalty, 1)
+    }
+
+    func testQwen35RecommendedNonThinkingPresetIsSentToChatAPI() async throws {
+        var streamedRequest: URLRequest?
+        let store = TokenityStore(
+            dataTransport: Self.successfulModelTransport,
+            lineStreamTransport: { request in
+                streamedRequest = request
+                return AsyncThrowingStream { continuation in
+                    continuation.yield("data: {\"choices\":[{\"delta\":{\"content\":\"OK\"},\"finish_reason\":null}]}")
+                    continuation.yield("data: [DONE]")
+                    continuation.finish()
+                }
+            }
+        )
+        let model = try XCTUnwrap(store.modelLibraryRows.first)
+        var configuration = store.modelConfiguration(for: model.id)
+        configuration.thinkingMode = .disabled
+        configuration.useRecommendedSampling = true
+        store.updateModelConfiguration(configuration, for: model.id)
+        store.connectionMode = .ring
+        store.createCluster()
+        await store.loadModel(model)
+        store.chatInput = "Answer directly."
+
+        await store.sendChatMessage()
+
+        let body = try XCTUnwrap(streamedRequest?.httpBody)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let template = try XCTUnwrap(object["chat_template_kwargs"] as? [String: Bool])
+        XCTAssertEqual(template["enable_thinking"], false)
+        XCTAssertEqual(object["temperature"] as? Double, 0.7)
+        XCTAssertEqual(object["top_p"] as? Double, 0.8)
+        XCTAssertEqual(object["top_k"] as? Int, 20)
+        XCTAssertEqual(object["presence_penalty"] as? Double, 1.5)
+        XCTAssertEqual(object["repetition_penalty"] as? Double, 1)
+    }
+
+    func testMTPDraftCheckpointCannotBeLoadedFromControlUI() async throws {
+        var startRequests = 0
+        let store = TokenityStore(dataTransport: { request in
+            if request.url?.path.contains("/v1/node/start") == true {
+                startRequests += 1
+            }
+            return try await Self.successfulModelTransport(request)
+        })
+        for nodeIndex in store.nodes.indices where store.selectedNodeIDs.contains(store.nodes[nodeIndex].id) {
+            store.nodes[nodeIndex].models = [
+                ModelEntry(
+                    id: "Qwen3.5-4B-MTP-4bit",
+                    path: "/models/Qwen3.5-4B-MTP-4bit",
+                    architecture: "Qwen3_5MTPForCausalLM"
+                )
+            ]
+        }
+        store.connectionMode = .ring
+        store.createCluster()
+        let model = try XCTUnwrap(store.modelLibraryRows.first)
+
+        await store.loadModel(model)
+
+        XCTAssertNil(store.loadedModelName)
+        XCTAssertEqual(startRequests, 0)
+        XCTAssertTrue(store.modelLoadMessage.contains("standalone chat model"))
+    }
+
+    func testRepeatedStreamOutputStopsWithoutNonStreamingFallback() async throws {
+        var fallbackRequests = 0
+        let phrase = "wait while I reconsider the instruction. "
+        let store = TokenityStore(
+            dataTransport: { request in
+                if request.url?.path == "/v1/chat/completions" {
+                    fallbackRequests += 1
+                }
+                return try await Self.successfulModelTransport(request)
+            },
+            lineStreamTransport: { _ in
+                AsyncThrowingStream { continuation in
+                    for _ in 0..<3 {
+                        let escaped = phrase.replacingOccurrences(of: "\"", with: "\\\"")
+                        continuation.yield("data: {\"choices\":[{\"delta\":{\"content\":\"\(escaped)\"},\"finish_reason\":null}]}")
+                    }
+                    continuation.finish()
+                }
+            }
+        )
+        let model = try XCTUnwrap(store.modelLibraryRows.first)
+        store.connectionMode = .ring
+        store.createCluster()
+        await store.loadModel(model)
+        fallbackRequests = 0
+        store.chatInput = "Trigger the guard."
+
+        await store.sendChatMessage()
+
+        XCTAssertFalse(store.isChatRunning)
+        XCTAssertEqual(fallbackRequests, 0)
+        XCTAssertTrue(store.chatMessages.last?.content.contains("repeated output was detected") ?? false)
+        XCTAssertEqual(store.chatMessages.suffix(2).map(\.includeInContext), [false, false])
+    }
+
+    func testStreamingTokensAreCoalescedIntoFewUIUpdates() async throws {
+        let store = TokenityStore(
+            dataTransport: Self.successfulModelTransport,
+            lineStreamTransport: { _ in
+                AsyncThrowingStream { continuation in
+                    for index in 0..<100 {
+                        continuation.yield("data: {\"choices\":[{\"delta\":{\"content\":\"token\(index) \"},\"finish_reason\":null}]}")
+                    }
+                    continuation.yield("data: [DONE]")
+                    continuation.finish()
+                }
+            }
+        )
+        let model = try XCTUnwrap(store.modelLibraryRows.first)
+        store.connectionMode = .ring
+        store.createCluster()
+        await store.loadModel(model)
+        store.chatInput = "Stream quickly."
+        let revisionBefore = store.chatScrollRevision
+
+        await store.sendChatMessage()
+
+        XCTAssertTrue(store.chatMessages.last?.content.contains("token99") ?? false)
+        XCTAssertLessThanOrEqual(store.chatScrollRevision - revisionBefore, 5)
     }
 
     func testExternalAPIUsesCoordinatorAddress() {

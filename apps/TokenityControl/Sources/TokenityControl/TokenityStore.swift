@@ -11,6 +11,7 @@ enum TokenityTransportError: LocalizedError {
     case noChatContent
     case rdmaNotReady(String)
     case nativeMTPAgentUpgradeRequired
+    case repetitiveOutput
 
     var errorDescription: String? {
         switch self {
@@ -40,7 +41,66 @@ enum TokenityTransportError: LocalizedError {
             return message
         case .nativeMTPAgentUpgradeRequired:
             return "Native MTP Required needs the current Node Agent. Restart the installed Tokenity Node Agent on every selected Mac, then try again."
+        case .repetitiveOutput:
+            return "Generation stopped because repeated output was detected."
         }
+    }
+}
+
+struct ChatRepetitionDetector {
+    private var rawText = ""
+    private var uncheckedCharacterCount = 0
+    private let windowCharacters = 8_192
+    private let minimumUnitBytes = 24
+    private let maximumUnitBytes = 512
+    private let repetitions = 3
+
+    mutating func observe(_ text: String) -> Bool {
+        guard !text.isEmpty else { return false }
+        rawText = String((rawText + text).suffix(windowCharacters))
+        uncheckedCharacterCount += text.count
+        guard uncheckedCharacterCount >= minimumUnitBytes else { return false }
+        uncheckedCharacterCount = 0
+
+        let normalized = rawText
+            .lowercased()
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+        let words = normalized.split(separator: " ")
+        let maximumWords = min(64, words.count / repetitions)
+        if maximumWords >= 4 {
+            for width in 4...maximumWords {
+                let blockStart = words.count - width
+                let block = words[blockStart..<words.count]
+                var repeats = true
+                for repetition in 2...repetitions {
+                    let start = words.count - (width * repetition)
+                    if !words[start..<(start + width)].elementsEqual(block) {
+                        repeats = false
+                        break
+                    }
+                }
+                if repeats { return true }
+            }
+        }
+        let bytes = Array(normalized.utf8)
+        let maximum = min(maximumUnitBytes, bytes.count / repetitions)
+        guard maximum >= minimumUnitBytes else { return false }
+
+        for width in minimumUnitBytes...maximum {
+            let blockStart = bytes.count - width
+            let block = bytes[blockStart..<bytes.count]
+            var repeats = true
+            for repetition in 2...repetitions {
+                let start = bytes.count - (width * repetition)
+                if !bytes[start..<(start + width)].elementsEqual(block) {
+                    repeats = false
+                    break
+                }
+            }
+            if repeats { return true }
+        }
+        return false
     }
 }
 
@@ -320,6 +380,11 @@ final class TokenityStore: ObservableObject {
                 modelEntries.compactMap(\.nativeMTP),
                 expectedCount: entries.count
             )
+            let draftOnlyEntry = modelEntries.first {
+                $0.standaloneLoadable == false
+                    || $0.modelType?.lowercased() == "qwen3_5_mtp"
+                    || $0.architecture?.lowercased().contains("qwen3_5mtp") == true
+            }
             return ModelLibraryRow(
                 id: modelID,
                 displayName: modelID,
@@ -332,7 +397,10 @@ final class TokenityStore: ObservableObject {
                 sizeBytes: modelEntries.compactMap(\.sizeBytes).max(),
                 architecture: modelEntries.compactMap(\.architecture).first,
                 shardCount: modelEntries.compactMap(\.shardCount).max(),
-                nativeMTP: nativeMTP
+                nativeMTP: nativeMTP,
+                modelType: modelEntries.compactMap(\.modelType).first,
+                standaloneLoadable: draftOnlyEntry == nil,
+                loadBlockReason: draftOnlyEntry?.loadBlockReason ?? (draftOnlyEntry == nil ? nil : "Qwen3.5 MTP weights are a speculative-decoding draft model and cannot be loaded as a standalone chat model. Load the matching Qwen3.5 base model instead.")
             )
         }
     }
@@ -471,6 +539,12 @@ final class TokenityStore: ObservableObject {
     func loadModel(_ row: ModelLibraryRow) async {
         guard phase == .running else {
             appendLog("Create a cluster before loading a model.")
+            return
+        }
+        guard row.standaloneLoadable else {
+            let message = row.loadBlockReason ?? "This checkpoint is draft-only and cannot be loaded as a standalone chat model."
+            modelLoadMessage = message
+            appendLog("Model load blocked: \(message)")
             return
         }
         if nativeMTPMode == .required,
@@ -684,6 +758,23 @@ final class TokenityStore: ObservableObject {
                 message: "Generation stopped before completion.",
                 logReason: "request cancellation"
             )
+        } catch TokenityTransportError.repetitiveOutput {
+            chatMessages[userIndex].includeInContext = false
+            chatMessages[assistantIndex].includeInContext = false
+            let placeholder = chatMessages[assistantIndex].thinking
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if placeholder == "Preparing response..." || placeholder == "Waiting for first response..." {
+                chatMessages[assistantIndex].thinking = ""
+            }
+            let notice = "Generation stopped because repeated output was detected."
+            let content = chatMessages[assistantIndex].content
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            chatMessages[assistantIndex].content = content.isEmpty
+                ? notice
+                : "\(chatMessages[assistantIndex].content)\n\n\(notice)"
+            chatScrollRevision += 1
+            finishChatMetrics(start: start, firstTokenAt: firstTokenAt, tokenEstimate: tokenEstimate)
+            appendLog("Chat generation stopped automatically after repeated output was detected.")
         } catch let streamingError {
             if !assistantMessageHasVisibleOutput(at: assistantIndex) {
                 do {
@@ -1210,14 +1301,38 @@ final class TokenityStore: ObservableObject {
 
     private func probeModelService(modelName: String) async throws {
         guard let url = modelServiceURL(path: "/v1/chat/completions") else { throw TokenityTransportError.missingModelService }
-        var request = try jsonRequest(
-            url: url,
-            body: OpenAIChatRequest(
+        let normalizedModelName = modelName.lowercased()
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: ".", with: "")
+            .replacingOccurrences(of: "-", with: "")
+        let isQwen35 = modelLibraryRows.first(where: { $0.id == modelName })?.isQwen35
+            ?? normalizedModelName.contains("qwen35")
+        let probeBody: OpenAIChatRequest
+        if isQwen35 {
+            probeBody = OpenAIChatRequest(
+                model: modelName,
+                messages: [OpenAIChatRequest.Message(role: "user", content: "Reply with OK.")],
+                stream: false,
+                maxTokens: 16,
+                temperature: 0.7,
+                topP: 0.8,
+                topK: 20,
+                minP: 0,
+                presencePenalty: 1.5,
+                repetitionPenalty: 1,
+                chatTemplateKwargs: ["enable_thinking": false]
+            )
+        } else {
+            probeBody = OpenAIChatRequest(
                 model: modelName,
                 messages: [OpenAIChatRequest.Message(role: "user", content: "Reply with OK.")],
                 stream: false,
                 maxTokens: 16
             )
+        }
+        var request = try jsonRequest(
+            url: url,
+            body: probeBody
         )
         request.timeoutInterval = 120
         let (data, response) = try await dataTransport(request)
@@ -1386,15 +1501,10 @@ final class TokenityStore: ObservableObject {
         request.timeoutInterval = 600
         request.addValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(
-            OpenAIChatRequest(
+            chatCompletionRequest(
                 model: serviceModelName,
-                messages: chatRequestMessages(),
                 stream: true,
-                maxTokens: configuration.maximumOutputTokens,
-                temperature: configuration.temperature,
-                topP: configuration.topP,
-                topK: configuration.topK,
-                minP: configuration.minP
+                configuration: configuration
             )
         )
 
@@ -1402,6 +1512,32 @@ final class TokenityStore: ObservableObject {
         var didReceiveContent = false
         var didReceiveThinking = false
         var finishReason: String?
+        var repetitionDetector = ChatRepetitionDetector()
+        var pendingThinking = ""
+        var pendingContent = ""
+        var lastUIFlush = Date()
+
+        func flushPendingTokens() {
+            guard !pendingThinking.isEmpty || !pendingContent.isEmpty else { return }
+            let contentBefore = chatMessages[assistantIndex].content
+            let thinkingBefore = chatMessages[assistantIndex].thinking
+            if !pendingThinking.isEmpty {
+                chatMessages[assistantIndex].thinking = appendToken(
+                    pendingThinking,
+                    to: chatMessages[assistantIndex].thinking
+                )
+            }
+            if !pendingContent.isEmpty {
+                appendAssistantContent(pendingContent, assistantIndex: assistantIndex)
+            }
+            didReceiveContent = didReceiveContent || chatMessages[assistantIndex].content != contentBefore
+            didReceiveThinking = didReceiveThinking || chatMessages[assistantIndex].thinking != thinkingBefore
+            pendingThinking = ""
+            pendingContent = ""
+            lastUIFlush = Date()
+            chatScrollRevision += 1
+        }
+        defer { flushPendingTokens() }
 
         for try await line in lineStreamTransport(request) {
             try ensureActiveChatRequest(requestID)
@@ -1415,26 +1551,43 @@ final class TokenityStore: ObservableObject {
             if let reason = choice?.finishReason {
                 finishReason = reason
             }
+            var shouldFlushImmediately = false
             let thinking = delta?.reasoningContent ?? delta?.reasoning
             if let thinking, !thinking.isEmpty {
-                chatMessages[assistantIndex].thinking = appendToken(thinking, to: chatMessages[assistantIndex].thinking)
-                chatScrollRevision += 1
-                if firstTokenAt == nil { firstTokenAt = Date() }
+                if repetitionDetector.observe(thinking) {
+                    flushPendingTokens()
+                    throw TokenityTransportError.repetitiveOutput
+                }
+                pendingThinking += thinking
+                if firstTokenAt == nil {
+                    firstTokenAt = Date()
+                    shouldFlushImmediately = true
+                }
                 tokenEstimate += estimateTokens(thinking)
                 didReceiveThinking = true
             }
             if let content = delta?.content, !content.isEmpty {
-                if firstTokenAt == nil { firstTokenAt = Date() }
-                let contentBefore = chatMessages[assistantIndex].content
-                let thinkingBefore = chatMessages[assistantIndex].thinking
-                appendAssistantContent(content, assistantIndex: assistantIndex)
-                chatScrollRevision += 1
+                if repetitionDetector.observe(content) {
+                    flushPendingTokens()
+                    throw TokenityTransportError.repetitiveOutput
+                }
+                if firstTokenAt == nil {
+                    firstTokenAt = Date()
+                    shouldFlushImmediately = true
+                }
+                pendingContent += content
                 tokenEstimate += estimateTokens(content)
-                didReceiveContent = didReceiveContent || chatMessages[assistantIndex].content != contentBefore
-                didReceiveThinking = didReceiveThinking || chatMessages[assistantIndex].thinking != thinkingBefore
+            }
+            let pendingBytes = pendingThinking.utf8.count + pendingContent.utf8.count
+            if shouldFlushImmediately || pendingBytes >= 4_096 || Date().timeIntervalSince(lastUIFlush) >= 0.05 {
+                flushPendingTokens()
             }
         }
+        flushPendingTokens()
         try ensureActiveChatRequest(requestID)
+        if finishReason == "tokenity_repetition" {
+            throw TokenityTransportError.repetitiveOutput
+        }
         if !didReceiveContent && didReceiveThinking {
             chatMessages[userIndex].includeInContext = false
             chatMessages[assistantIndex].includeInContext = false
@@ -1464,15 +1617,10 @@ final class TokenityStore: ObservableObject {
         }
         var request = try jsonRequest(
             url: url,
-            body: OpenAIChatRequest(
+            body: chatCompletionRequest(
                 model: serviceModelName,
-                messages: chatRequestMessages(),
                 stream: false,
-                maxTokens: configuration.maximumOutputTokens,
-                temperature: configuration.temperature,
-                topP: configuration.topP,
-                topK: configuration.topK,
-                minP: configuration.minP
+                configuration: configuration
             )
         )
         request.timeoutInterval = 600
@@ -1507,6 +1655,9 @@ final class TokenityStore: ObservableObject {
             chatMessages[assistantIndex].content = "The model returned reasoning but did not finish a final answer. Try again if you need the final response."
         }
         chatScrollRevision += 1
+        if decoded.choices.first?.finishReason == "tokenity_repetition" {
+            throw TokenityTransportError.repetitiveOutput
+        }
     }
 
     private func chatRequestMessages() -> [OpenAIChatRequest.Message] {
@@ -1515,6 +1666,43 @@ final class TokenityStore: ObservableObject {
             .filter { $0.includeInContext && !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             .suffix(10)
             .map { OpenAIChatRequest.Message(role: $0.role.rawValue, content: $0.content) }
+    }
+
+    private func chatCompletionRequest(
+        model: String,
+        stream: Bool,
+        configuration: ModelRuntimeConfiguration
+    ) -> OpenAIChatRequest {
+        let modelID = loadedModelName ?? model
+        let row = modelLibraryRows.first { $0.id == modelID }
+        let normalizedID = modelID.lowercased()
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: ".", with: "")
+            .replacingOccurrences(of: "-", with: "")
+        let isQwen35 = row?.isQwen35 ?? normalizedID.contains("qwen35")
+        let sampling = configuration.resolvedSampling(forQwen35: isQwen35)
+        let templateArguments: [String: Bool]?
+        switch configuration.thinkingMode {
+        case .automatic:
+            templateArguments = nil
+        case .enabled:
+            templateArguments = ["enable_thinking": true]
+        case .disabled:
+            templateArguments = ["enable_thinking": false]
+        }
+        return OpenAIChatRequest(
+            model: model,
+            messages: chatRequestMessages(),
+            stream: stream,
+            maxTokens: configuration.maximumOutputTokens,
+            temperature: sampling.temperature,
+            topP: sampling.topP,
+            topK: sampling.topK,
+            minP: sampling.minP,
+            presencePenalty: sampling.presencePenalty,
+            repetitionPenalty: sampling.repetitionPenalty,
+            chatTemplateKwargs: templateArguments
+        )
     }
 
     private func assistantMessageHasVisibleOutput(at index: Int) -> Bool {

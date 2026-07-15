@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 import json
 from types import SimpleNamespace
@@ -7,7 +8,9 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 from tokenity.serving.distributed_openai import (
+    ChatCompletionRequest,
     _LoadEvalPolicy,
+    _RepetitionDetector,
     TokenityDistributedRuntime,
     _eval_parameters_in_chunks,
     _load_eval_policy,
@@ -84,6 +87,91 @@ def test_stream_payload_keeps_reasoning_separate_from_answer():
     assert reasoning["choices"][0]["delta"] == {"reasoning_content": "check the plan"}
     assert answer is not None
     assert answer["choices"][0]["delta"] == {"content": "Final answer"}
+
+
+def test_generation_arguments_forward_presence_and_repetition_penalties():
+    runtime = TokenityDistributedRuntime(
+        model="/models/qwen",
+        state=ReadinessState(model="/models/qwen"),
+    )
+    runtime._symbols = SimpleNamespace(  # noqa: SLF001 - request mapping regression
+        GenerationArguments=SimpleNamespace,
+        ModelDescription=SimpleNamespace,
+        SamplingArguments=SimpleNamespace,
+        LogitsProcessorArguments=SimpleNamespace,
+    )
+
+    arguments = runtime._generation_args(  # noqa: SLF001
+        ChatCompletionRequest(
+            model="qwen",
+            messages=[{"role": "user", "content": "hello"}],
+            presence_penalty=1.5,
+            repetition_penalty=1.1,
+            chat_template_kwargs={"enable_thinking": False},
+        )
+    )
+
+    assert arguments.logits.presence_penalty == 1.5
+    assert arguments.logits.repetition_penalty == 1.1
+    assert arguments.chat_template_kwargs == {"enable_thinking": False}
+
+
+def test_repetition_detector_stops_contiguous_output_cycle():
+    detector = _RepetitionDetector()
+    phrase = "wait while I reconsider the instruction. "
+
+    assert detector.observe(phrase) is False
+    assert detector.observe(phrase) is False
+    assert detector.observe(phrase) is True
+
+
+def test_stream_reports_repetition_finish_reason_and_stops_generation_context():
+    phrase = "wait while I reconsider the instruction. "
+    stopped = threading.Event()
+    context = SimpleNamespace(stop=stopped.set)
+    responses = iter(
+        SimpleNamespace(text=phrase, state="content", finish_reason=None)
+        for _ in range(3)
+    )
+    runtime = TokenityDistributedRuntime(
+        model="/models/qwen",
+        state=ReadinessState(model="/models/qwen"),
+    )
+    runtime._begin_generation = lambda _: (context, responses)  # type: ignore[method-assign]  # noqa: SLF001
+
+    async def collect() -> list[str]:
+        request = ChatCompletionRequest(
+            model="qwen",
+            messages=[{"role": "user", "content": "loop"}],
+            stream=True,
+        )
+        return [event async for event in runtime.stream(request)]
+
+    events = asyncio.run(collect())
+
+    assert any('"finish_reason": "tokenity_repetition"' in event for event in events)
+    assert events[-1] == "data: [DONE]\n\n"
+    assert stopped.is_set()
+
+
+def test_runtime_rejects_qwen35_mtp_draft_checkpoint_before_mlx_init(tmp_path):
+    draft = tmp_path / "Qwen3.5-4B-MTP-4bit"
+    draft.mkdir()
+    (draft / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5_mtp"}),
+        encoding="utf-8",
+    )
+    state = ReadinessState(model=str(draft))
+    runtime = TokenityDistributedRuntime(model=str(draft), state=state)
+
+    try:
+        runtime.start()
+    except ValueError as exc:
+        assert "draft model" in str(exc)
+    else:
+        raise AssertionError("draft-only MTP checkpoint must be rejected")
+
+    assert state.phase.value == "failed"
 
 
 def test_readiness_reports_real_parameter_load_progress():

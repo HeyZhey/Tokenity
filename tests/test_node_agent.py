@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 import tokenity.node_agent.agent as agent_module
 from tokenity.mlx.rdma_probe import RDMAProbeResult
 from tokenity.mlx.glm_moe_dsa_compat import derive_indexer_types
-from tokenity.node_agent.agent import RankStartRequest, _rank_command_and_environment, create_app
+from tokenity.node_agent.agent import RankStartRequest, _rank_command_and_environment, create_app, scan_models
 from tokenity.process.supervisor import RoleStatus, RoleSupervisor
 
 
@@ -454,6 +454,31 @@ def test_distributed_dry_run_forwards_runtime_configuration():
     assert command[command.index("--decode-concurrency") + 1] == "2"
     assert command[command.index("--prompt-concurrency") + 1] == "3"
     assert "--trust-remote-code" in command
+
+
+def test_model_scan_marks_qwen35_mtp_as_draft_only_and_start_rejects_it(tmp_path: Path):
+    draft = tmp_path / "Qwen3.5-4B-MTP-4bit"
+    draft.mkdir()
+    (draft / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5_mtp", "architectures": ["Qwen3_5MTPForCausalLM"]}),
+        encoding="utf-8",
+    )
+    (draft / "model.safetensors").write_bytes(b"draft")
+
+    scanned = scan_models(tmp_path)
+
+    assert scanned[0]["model_type"] == "qwen3_5_mtp"
+    assert scanned[0]["standalone_loadable"] is False
+    assert "draft model" in str(scanned[0]["load_block_reason"])
+
+    client = TestClient(create_app(rdma_probe_fn=fake_rdma_probe))
+    response = client.post(
+        "/v1/node/start-distributed-openai",
+        json={"model": str(draft), "connection_mode": "ring", "dry_run": True},
+    )
+
+    assert response.status_code == 400
+    assert "cannot be loaded as a standalone chat model" in response.json()["detail"]
 
 
 def test_cluster_payload_rejects_legacy_ssh_fields():

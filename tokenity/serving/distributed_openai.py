@@ -28,6 +28,7 @@ from tokenity.inference.native_mtp.runtime import (
     attach_controller,
     controller_for,
 )
+from tokenity.model_inspection import standalone_model_issue
 
 from .readiness import ReadinessPhase, ReadinessState
 
@@ -41,6 +42,8 @@ class ChatCompletionRequest(BaseModel):
     top_p: float | None = Field(default=None, ge=0, le=1)
     top_k: int | None = Field(default=None, ge=0)
     min_p: float | None = Field(default=None, ge=0, le=1)
+    presence_penalty: float | None = Field(default=None, ge=-2, le=2)
+    repetition_penalty: float | None = Field(default=None, ge=0, le=2)
     stop: str | list[str] | None = None
     seed: int | None = None
     tools: list[Any] | None = None
@@ -56,6 +59,52 @@ class _GenerationResult:
     prompt_tokens: int
     completion_tokens: int
     prompt_cache_tokens: int | None
+
+
+class _RepetitionDetector:
+    """Detect a generated suffix cycling through the same text several times."""
+
+    def __init__(
+        self,
+        *,
+        window_chars: int = 8_192,
+        minimum_unit_chars: int = 24,
+        maximum_unit_chars: int = 512,
+        repetitions: int = 3,
+    ) -> None:
+        self.window_chars = window_chars
+        self.minimum_unit_chars = minimum_unit_chars
+        self.maximum_unit_chars = maximum_unit_chars
+        self.repetitions = repetitions
+        self._raw = ""
+        self._unchecked_chars = 0
+
+    def observe(self, text: str) -> bool:
+        if not text:
+            return False
+        self._raw = (self._raw + text)[-self.window_chars :]
+        self._unchecked_chars += len(text)
+        if self._unchecked_chars < self.minimum_unit_chars:
+            return False
+        self._unchecked_chars = 0
+        normalized = " ".join(self._raw.lower().split())
+        words = normalized.split()
+        maximum_words = min(64, len(words) // self.repetitions)
+        for width in range(4, maximum_words + 1):
+            block = words[-width:]
+            if all(
+                words[-(width * repetition) : -(width * (repetition - 1))] == block
+                for repetition in range(2, self.repetitions + 1)
+            ):
+                return True
+        maximum = min(self.maximum_unit_chars, len(normalized) // self.repetitions)
+        for width in range(self.minimum_unit_chars, maximum + 1):
+            block = normalized[-width:]
+            if len(block.strip()) < self.minimum_unit_chars // 2:
+                continue
+            if normalized.endswith(block * self.repetitions):
+                return True
+        return False
 
 
 @dataclass(frozen=True)
@@ -480,6 +529,10 @@ class TokenityDistributedRuntime:
         self._stop_event = threading.Event()
 
     def start(self) -> None:
+        if issue := standalone_model_issue(self.model):
+            self.state.phase = ReadinessPhase.FAILED
+            self.state.message = issue
+            raise ValueError(issue)
         self.state.phase = ReadinessPhase.DISTRIBUTED_INIT
         self.state.progress = 0.02
         self.state.message = "Initializing the MLX distributed group."
@@ -615,12 +668,17 @@ class TokenityDistributedRuntime:
     async def stream(self, request: ChatCompletionRequest) -> AsyncIterator[str]:
         ctx = None
         finish_reason = "stop"
+        repetition_detector = _RepetitionDetector()
         try:
             ctx, responses = await asyncio.to_thread(self._begin_generation, request)
             self.state.phase = ReadinessPhase.GENERATING
             while True:
                 item = await asyncio.to_thread(_next_response, responses)
                 if item is _DONE:
+                    break
+                if repetition_detector.observe(getattr(item, "text", "")):
+                    finish_reason = "tokenity_repetition"
+                    logging.warning("Tokenity stopped generation after detecting repeated output.")
                     break
                 finish_reason = getattr(item, "finish_reason", None) or finish_reason
                 payload = _stream_payload(item, self.model_id, finish_reason=None)
@@ -652,10 +710,15 @@ class TokenityDistributedRuntime:
         reasoning = ""
         finish_reason = "stop"
         tokens = 0
+        repetition_detector = _RepetitionDetector()
         try:
             ctx, responses = self._begin_generation(request)
             self.state.phase = ReadinessPhase.GENERATING
             for item in responses:
+                if repetition_detector.observe(getattr(item, "text", "")):
+                    finish_reason = "tokenity_repetition"
+                    logging.warning("Tokenity stopped generation after detecting repeated output.")
+                    break
                 tokens += 1
                 finish_reason = item.finish_reason or finish_reason
                 if item.state == "reasoning":
@@ -720,9 +783,17 @@ class TokenityDistributedRuntime:
             ),
             logits=self._symbols.LogitsProcessorArguments(
                 logit_bias=None,
-                repetition_penalty=0.0,
+                repetition_penalty=(
+                    request.repetition_penalty
+                    if request.repetition_penalty is not None
+                    else 0.0
+                ),
                 repetition_context_size=20,
-                presence_penalty=0.0,
+                presence_penalty=(
+                    request.presence_penalty
+                    if request.presence_penalty is not None
+                    else 0.0
+                ),
                 presence_context_size=20,
                 frequency_penalty=0.0,
                 frequency_context_size=20,

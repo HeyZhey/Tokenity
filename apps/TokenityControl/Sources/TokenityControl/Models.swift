@@ -264,12 +264,18 @@ struct ModelEntry: Codable, Hashable, Identifiable {
     var architecture: String? = nil
     var shardCount: Int? = nil
     var nativeMTP: NativeMTPCapability? = nil
+    var modelType: String? = nil
+    var standaloneLoadable: Bool? = nil
+    var loadBlockReason: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, path, format, quantization, architecture
         case sizeBytes = "size_bytes"
         case shardCount = "shard_count"
         case nativeMTP = "native_mtp"
+        case modelType = "model_type"
+        case standaloneLoadable = "standalone_loadable"
+        case loadBlockReason = "load_block_reason"
     }
 }
 
@@ -530,6 +536,19 @@ struct ModelLibraryRow: Identifiable, Hashable {
     var architecture: String?
     var shardCount: Int?
     var nativeMTP: NativeMTPCapability?
+    var modelType: String?
+    var standaloneLoadable: Bool
+    var loadBlockReason: String?
+
+    var isQwen35: Bool {
+        let identity = [id, architecture ?? "", modelType ?? ""]
+            .joined(separator: " ")
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: ".", with: "")
+            .replacingOccurrences(of: "-", with: "")
+        return identity.contains("qwen35")
+    }
 
     var sizeText: String {
         guard let sizeBytes else { return "Size unknown" }
@@ -538,17 +557,103 @@ struct ModelLibraryRow: Identifiable, Hashable {
     }
 }
 
+enum ModelThinkingMode: String, Codable, CaseIterable, Identifiable {
+    case automatic = "auto"
+    case enabled = "on"
+    case disabled = "off"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .automatic: return "Auto"
+        case .enabled: return "On"
+        case .disabled: return "Off"
+        }
+    }
+}
+
+struct ModelSamplingConfiguration: Hashable {
+    var temperature: Double
+    var topP: Double
+    var topK: Int
+    var minP: Double
+    var presencePenalty: Double
+    var repetitionPenalty: Double
+}
+
 struct ModelRuntimeConfiguration: Codable, Hashable {
     var maximumOutputTokens: Int = 32_768
     var temperature: Double = 0
     var topP: Double = 1
     var topK: Int = 0
     var minP: Double = 0
+    var presencePenalty: Double = 0
+    var repetitionPenalty: Double = 1
+    var thinkingMode: ModelThinkingMode = .automatic
+    var useRecommendedSampling: Bool = true
     var promptCacheSize: Int = 4
     var prefillStepSize: Int = 2_048
     var decodeConcurrency: Int = 1
     var promptConcurrency: Int = 1
     var trustRemoteCode: Bool = false
+
+    init(
+        maximumOutputTokens: Int = 32_768,
+        temperature: Double = 0,
+        topP: Double = 1,
+        topK: Int = 0,
+        minP: Double = 0,
+        presencePenalty: Double = 0,
+        repetitionPenalty: Double = 1,
+        thinkingMode: ModelThinkingMode = .automatic,
+        useRecommendedSampling: Bool = true,
+        promptCacheSize: Int = 4,
+        prefillStepSize: Int = 2_048,
+        decodeConcurrency: Int = 1,
+        promptConcurrency: Int = 1,
+        trustRemoteCode: Bool = false
+    ) {
+        self.maximumOutputTokens = maximumOutputTokens
+        self.temperature = temperature
+        self.topP = topP
+        self.topK = topK
+        self.minP = minP
+        self.presencePenalty = presencePenalty
+        self.repetitionPenalty = repetitionPenalty
+        self.thinkingMode = thinkingMode
+        self.useRecommendedSampling = useRecommendedSampling
+        self.promptCacheSize = promptCacheSize
+        self.prefillStepSize = prefillStepSize
+        self.decodeConcurrency = decodeConcurrency
+        self.promptConcurrency = promptConcurrency
+        self.trustRemoteCode = trustRemoteCode
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case maximumOutputTokens, temperature, topP, topK, minP
+        case presencePenalty, repetitionPenalty, thinkingMode, useRecommendedSampling
+        case promptCacheSize, prefillStepSize, decodeConcurrency, promptConcurrency
+        case trustRemoteCode
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        maximumOutputTokens = try container.decodeIfPresent(Int.self, forKey: .maximumOutputTokens) ?? 32_768
+        temperature = try container.decodeIfPresent(Double.self, forKey: .temperature) ?? 0
+        topP = try container.decodeIfPresent(Double.self, forKey: .topP) ?? 1
+        topK = try container.decodeIfPresent(Int.self, forKey: .topK) ?? 0
+        minP = try container.decodeIfPresent(Double.self, forKey: .minP) ?? 0
+        presencePenalty = try container.decodeIfPresent(Double.self, forKey: .presencePenalty) ?? 0
+        repetitionPenalty = try container.decodeIfPresent(Double.self, forKey: .repetitionPenalty) ?? 1
+        thinkingMode = try container.decodeIfPresent(ModelThinkingMode.self, forKey: .thinkingMode) ?? .automatic
+        useRecommendedSampling = try container.decodeIfPresent(Bool.self, forKey: .useRecommendedSampling) ?? true
+        promptCacheSize = try container.decodeIfPresent(Int.self, forKey: .promptCacheSize) ?? 4
+        prefillStepSize = try container.decodeIfPresent(Int.self, forKey: .prefillStepSize) ?? 2_048
+        decodeConcurrency = try container.decodeIfPresent(Int.self, forKey: .decodeConcurrency) ?? 1
+        promptConcurrency = try container.decodeIfPresent(Int.self, forKey: .promptConcurrency) ?? 1
+        trustRemoteCode = try container.decodeIfPresent(Bool.self, forKey: .trustRemoteCode) ?? false
+    }
 
     static let `default` = ModelRuntimeConfiguration()
 
@@ -559,11 +664,44 @@ struct ModelRuntimeConfiguration: Codable, Hashable {
         copy.topP = min(max(topP, 0), 1)
         copy.topK = min(max(topK, 0), 1_000)
         copy.minP = min(max(minP, 0), 1)
+        copy.presencePenalty = min(max(presencePenalty, -2), 2)
+        copy.repetitionPenalty = min(max(repetitionPenalty, 0), 2)
         copy.promptCacheSize = min(max(promptCacheSize, 1), 64)
         copy.prefillStepSize = min(max(prefillStepSize, 128), 8_192)
         copy.decodeConcurrency = min(max(decodeConcurrency, 1), 8)
         copy.promptConcurrency = min(max(promptConcurrency, 1), 8)
         return copy
+    }
+
+    func resolvedSampling(forQwen35: Bool) -> ModelSamplingConfiguration {
+        guard forQwen35, useRecommendedSampling else {
+            return ModelSamplingConfiguration(
+                temperature: temperature,
+                topP: topP,
+                topK: topK,
+                minP: minP,
+                presencePenalty: presencePenalty,
+                repetitionPenalty: repetitionPenalty
+            )
+        }
+        if thinkingMode == .disabled {
+            return ModelSamplingConfiguration(
+                temperature: 0.7,
+                topP: 0.8,
+                topK: 20,
+                minP: 0,
+                presencePenalty: 1.5,
+                repetitionPenalty: 1
+            )
+        }
+        return ModelSamplingConfiguration(
+            temperature: 1,
+            topP: 0.95,
+            topK: 20,
+            minP: 0,
+            presencePenalty: 1.5,
+            repetitionPenalty: 1
+        )
     }
 }
 
@@ -649,6 +787,9 @@ struct OpenAIChatRequest: Encodable {
     var topP: Double? = nil
     var topK: Int? = nil
     var minP: Double? = nil
+    var presencePenalty: Double? = nil
+    var repetitionPenalty: Double? = nil
+    var chatTemplateKwargs: [String: Bool]? = nil
 
     enum CodingKeys: String, CodingKey {
         case model, messages, stream, temperature
@@ -656,6 +797,9 @@ struct OpenAIChatRequest: Encodable {
         case topP = "top_p"
         case topK = "top_k"
         case minP = "min_p"
+        case presencePenalty = "presence_penalty"
+        case repetitionPenalty = "repetition_penalty"
+        case chatTemplateKwargs = "chat_template_kwargs"
     }
 }
 
@@ -777,6 +921,12 @@ struct OpenAIChatResponse: Decodable {
         }
 
         var message: Message?
+        var finishReason: String?
+
+        enum CodingKeys: String, CodingKey {
+            case message
+            case finishReason = "finish_reason"
+        }
     }
 
     var choices: [Choice]
