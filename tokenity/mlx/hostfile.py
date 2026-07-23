@@ -18,7 +18,6 @@ class HostfileError(ValueError):
 @dataclass
 class ClusterNode:
     id: str
-    ssh: str = "127.0.0.1"
     agent_url: str | None = None
     lan_ip: str | None = None
     rdma_ip: str | None = None
@@ -29,7 +28,6 @@ class ClusterNode:
     def from_mapping(cls, payload: dict[str, Any]) -> "ClusterNode":
         return cls(
             id=str(payload.get("id") or payload.get("node_id") or payload.get("hostname") or "node"),
-            ssh=str(payload.get("ssh") or payload.get("agent_url") or "127.0.0.1"),
             agent_url=payload.get("agent_url"),
             lan_ip=payload.get("lan_ip") or payload.get("ip"),
             rdma_ip=payload.get("rdma_ip") or payload.get("thunderbolt_ip"),
@@ -70,7 +68,6 @@ def _build_ring_hostfile(nodes: list[ClusterNode]) -> list[dict[str, Any]]:
         data_ip = node.lan_ip or node.rdma_ip
         rows.append(
             {
-                "ssh": node.ssh,
                 "ips": [data_ip] if data_ip else [],
                 "rdma": [],
             }
@@ -105,5 +102,5 @@ def _build_jaccl_hostfile(
             # RDMA device rows without ordinary IP entries.
             ips = [node.rdma_ip]
 
-        rows.append({"ssh": node.ssh, "ips": ips, "rdma": rdma_row})
+        rows.append({"ips": ips, "rdma": rdma_row})
     return rows

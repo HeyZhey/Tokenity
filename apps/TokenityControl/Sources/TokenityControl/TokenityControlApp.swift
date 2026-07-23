@@ -4,25 +4,36 @@ import AppKit
 @main
 struct TokenityControlApp: App {
     @NSApplicationDelegateAdaptor(TokenityAppDelegate.self) private var appDelegate
-    @StateObject private var store = TokenityStore()
 
     var body: some Scene {
-        WindowGroup("Tokenity") {
+        Window("Tokenity", id: "main") {
             TokenityRootView()
-                .environmentObject(store)
+                .environmentObject(appDelegate.store)
                 .tokenityThemed()
-                .onAppear {
-                    appDelegate.store = store
-                }
         }
         .windowResizability(.contentSize)
+
+        MenuBarExtra {
+            TokenityMenuBarContentHost(store: appDelegate.store)
+        } label: {
+            TokenityMenuBarLabelHost(store: appDelegate.store)
+        }
+        .menuBarExtraStyle(.menu)
     }
 }
 
 @MainActor
 final class TokenityAppDelegate: NSObject, NSApplicationDelegate {
-    weak var store: TokenityStore?
+    let store = TokenityStore(loadsChatHistorySynchronously: false)
     private var terminationInProgress = false
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        store.startStatusMonitoring()
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag {
@@ -35,7 +46,7 @@ final class TokenityAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard !terminationInProgress, let store else {
+        guard !terminationInProgress else {
             return .terminateNow
         }
         terminationInProgress = true

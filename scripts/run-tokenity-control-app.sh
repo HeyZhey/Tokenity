@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_DIR="$ROOT/apps/TokenityControl"
-BUNDLE_IDENTIFIER="${TOKENITY_BUNDLE_IDENTIFIER:-ai.tokenity.control.dev}"
+BUNDLE_IDENTIFIER="${TOKENITY_BUNDLE_IDENTIFIER:-ai.tokenity.control.stable}"
 
 # Keep App Bubble unambiguous while the old prototype still exists on disk.
 pkill -f "/Users/zxc/Documents/MLX-Distributed/apps/TokenityControl" 2>/dev/null || true

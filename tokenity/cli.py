@@ -49,6 +49,13 @@ def _build_parser() -> argparse.ArgumentParser:
     distributed_serve.add_argument("--decode-concurrency", type=int, default=1)
     distributed_serve.add_argument("--prompt-concurrency", type=int, default=1)
     distributed_serve.add_argument(
+        "--execution-mode",
+        choices=("single", "distributed"),
+        default="distributed",
+        help="Use a local mlx_lm.load path or an MLX distributed data plane.",
+    )
+    distributed_serve.add_argument("--warmup-timeout", type=float, default=120.0)
+    distributed_serve.add_argument(
         "--native-mtp-mode",
         choices=("off", "auto", "required"),
         default="off",
@@ -107,6 +114,8 @@ def _run_distributed_serve(args: argparse.Namespace) -> int:
             "max_depth": args.native_mtp_max_depth,
             "head_placement": args.native_mtp_head_placement,
         },
+        execution_mode=args.execution_mode,
+        warmup_timeout=args.warmup_timeout,
     )
     return 0
 

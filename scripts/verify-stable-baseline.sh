@@ -22,9 +22,14 @@ APP_BUNDLE="$("$ROOT/scripts/build-tokenity-control-app.sh")"
 APP_EXECUTABLE="$APP_BUNDLE/Contents/MacOS/TokenityControl"
 test -x "$APP_EXECUTABLE"
 
-if ! strings "$APP_EXECUTABLE" | grep -Fq "The model returned reasoning but did not finish a final answer."; then
-  echo "Built app does not contain the current chat-streaming baseline." >&2
-  exit 1
-fi
+for marker in \
+  "The model returned reasoning but did not finish a final answer." \
+  "ThinkingTagStreamParser" \
+  "Search conversations"; do
+  if ! LC_ALL=C grep -aFq "$marker" "$APP_EXECUTABLE"; then
+    echo "Built app does not contain the current Chat workspace marker: $marker" >&2
+    exit 1
+  fi
+done
 
 echo "Stable baseline verified: $APP_BUNDLE"

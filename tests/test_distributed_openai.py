@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import threading
+import time
 import json
 from types import SimpleNamespace
 
@@ -22,6 +24,7 @@ from tokenity.serving.distributed_openai import (
     create_app,
 )
 from tokenity.serving.readiness import ReadinessState
+from tokenity.serving.readiness import ReadinessPhase
 
 
 def test_distributed_skeleton_readiness_and_models():
@@ -150,8 +153,118 @@ def test_stream_reports_repetition_finish_reason_and_stops_generation_context():
     events = asyncio.run(collect())
 
     assert any('"finish_reason": "tokenity_repetition"' in event for event in events)
+    final_payload = json.loads(events[-2].removeprefix("data: "))
+    assert final_payload["usage"]["completion_tokens"] == 2
+    assert final_payload["usage"]["total_tokens"] == 2
     assert events[-1] == "data: [DONE]\n\n"
     assert stopped.is_set()
+
+
+def test_first_stream_emits_keepalives_then_incremental_content_with_timeline():
+    stopped = threading.Event()
+    context = SimpleNamespace(prompt=[1, 2], prompt_cache_count=0, stop=stopped.set)
+
+    def begin(_request):
+        time.sleep(0.04)
+
+        def responses():
+            time.sleep(0.04)
+            yield SimpleNamespace(text="first", state="content", finish_reason=None)
+            time.sleep(0.02)
+            yield SimpleNamespace(text=" second", state="content", finish_reason="stop")
+
+        return context, responses()
+
+    state = ReadinessState(model="/models/qwen", phase=ReadinessPhase.READY)
+    runtime = TokenityDistributedRuntime(model="/models/qwen", state=state)
+    runtime._begin_generation = begin  # type: ignore[method-assign]  # noqa: SLF001
+
+    async def collect():
+        started = time.monotonic()
+        events = []
+        request = ChatCompletionRequest(
+            model="qwen",
+            messages=[{"role": "user", "content": "hello"}],
+            stream=True,
+        )
+        async for event in runtime.stream(request, request_id="request-timing", keepalive_interval=0.01):
+            events.append((time.monotonic() - started, event))
+        return events
+
+    events = asyncio.run(collect())
+
+    assert events[0][1].startswith(": keep-alive")
+    content_events = [(at, event) for at, event in events if event.startswith("data:") and "[DONE]" not in event]
+    assert len(content_events) >= 3
+    assert '"content": "first"' in content_events[0][1]
+    assert '"content": " second"' in content_events[1][1]
+    assert content_events[0][0] < content_events[1][0]
+    assert state.last_request is not None
+    for event in [
+        "accepted",
+        "first_keepalive",
+        "prefill_start",
+        "prefill_end",
+        "first_content_token",
+        "last_token",
+        "completed",
+    ]:
+        assert event in state.last_request
+    assert stopped.is_set()
+
+
+def test_stream_records_headers_only_when_asgi_response_start_is_sent():
+    state = ReadinessState(model="/models/qwen", phase=ReadinessPhase.READY)
+    runtime = TokenityDistributedRuntime(model="/models/qwen", state=state)
+    runtime._begin_generation = lambda _: (  # type: ignore[method-assign]  # noqa: SLF001
+        SimpleNamespace(prompt=[], prompt_cache_count=0, stop=lambda: None),
+        iter([SimpleNamespace(text="OK", state="content", finish_reason="stop")]),
+    )
+
+    with TestClient(create_app(model="/models/qwen", runtime=runtime)) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["x-tokenity-request-id"]
+    assert state.last_request is not None
+    assert state.last_request["headers_sent"] >= state.last_request["accepted"]
+    assert "data: [DONE]" in response.text
+
+
+def test_single_runtime_source_contains_no_distributed_initialization():
+    source = inspect.getsource(TokenityDistributedRuntime._start_single)  # noqa: SLF001
+
+    assert "distributed.init" not in source
+    assert "mlx_lm import load" in source
+
+
+def test_ready_is_published_only_after_materialization_and_warmup():
+    state = ReadinessState(model="/models/qwen", phase=ReadinessPhase.LOADING_MODEL)
+    runtime = TokenityDistributedRuntime(model="/models/qwen", state=state)
+    runtime.state.rank = 0
+    runtime.state.world_size = 2
+    runtime._provider = SimpleNamespace(model=object(), tokenizer=object())  # noqa: SLF001
+    runtime._generator = SimpleNamespace(  # noqa: SLF001
+        _generation_thread=SimpleNamespace(is_alive=lambda: True)
+    )
+    warmed = threading.Event()
+    runtime._warmup_distributed = warmed.set  # type: ignore[method-assign]  # noqa: SLF001
+    runtime._run_warmup_with_timeout = lambda warmup: warmup()  # type: ignore[method-assign]  # noqa: SLF001
+
+    runtime._monitor_model_load()  # noqa: SLF001
+
+    assert warmed.is_set()
+    assert state.phase == ReadinessPhase.READY
+    assert state.ready_evidence["weights_materialized"] is True
+    assert state.ready_evidence["one_token_probe"] is True
 
 
 def test_runtime_rejects_qwen35_mtp_draft_checkpoint_before_mlx_init(tmp_path):

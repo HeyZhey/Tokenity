@@ -70,6 +70,24 @@ def test_node_info_reports_rdma():
     assert "memory" in response.json()
 
 
+def test_node_info_advertises_stable_agent_contract():
+    client = TestClient(create_app(rdma_probe_fn=fake_rdma_probe))
+
+    response = client.get("/v1/node/info")
+
+    assert response.status_code == 200
+    assert response.json()["agent_contract"] == {
+        "version": 1,
+        "capabilities": [
+            "cluster_runtime",
+            "instance_quorum",
+            "instance_runtimes",
+            "managed_instances",
+            "native_mtp",
+        ],
+    }
+
+
 def test_node_status_reports_memory():
     client = TestClient(create_app(rdma_probe_fn=fake_rdma_probe))
 
@@ -77,6 +95,26 @@ def test_node_status_reports_memory():
 
     assert response.status_code == 200
     assert "memory" in response.json()
+
+
+def test_runtime_status_marks_old_memory_sample_stale(tmp_path: Path):
+    status_path = tmp_path / "runtime.json"
+    status_path.write_text(
+        json.dumps(
+            {
+                "phase": "ready",
+                "updated_at": time.time() - 30,
+                "memory": {"mlx_active_bytes": 123, "stale": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    status = agent_module._read_runtime_status(str(status_path))
+
+    assert status is not None
+    assert status["status_stale"] is True
+    assert status["memory"]["stale"] is True
 
 
 def test_memory_stats_prefers_physical_vm_pages_over_pressure_percentage(monkeypatch):
@@ -255,125 +293,49 @@ def test_supervisor_keeps_child_stdin_open(tmp_path: Path):
         supervisor.stop("stdin-probe", timeout=1)
 
 
-def test_supervisor_stop_cleans_orphaned_hostfile_process_group(tmp_path: Path):
-    hostfile = tmp_path / "tokenity-hostfiles" / "distributed-openai-test.json"
-    hostfile.parent.mkdir()
-    hostfile.write_text("[]", encoding="utf-8")
-    orphan = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            "import time; time.sleep(30)",
-            "--hostfile",
-            str(hostfile),
-        ],
-        start_new_session=True,
-    )
+def test_supervisor_manages_two_same_role_instances_independently(tmp_path: Path):
     supervisor = RoleSupervisor(log_dir=tmp_path)
-    supervisor._commands["distributed-openai"] = [  # noqa: SLF001 - targeted supervisor cleanup regression
-        "ssh",
-        "-o",
-        "BatchMode=yes",
-        "127.0.0.1",
-        f"mlx.launch --hostfile {hostfile} -- python -m tokenity distributed-openai serve",
-    ]
-
-    try:
-        supervisor.stop("distributed-openai", timeout=1)
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            if orphan.poll() is not None:
-                break
-            time.sleep(0.05)
-        else:
-            raise AssertionError("orphaned hostfile process was not terminated")
-    finally:
-        if orphan.poll() is None:
-            orphan.kill()
-            orphan.wait(timeout=5)
-
-
-def test_supervisor_stop_kills_related_process_after_wrapper_exits(tmp_path: Path):
-    hostfile = tmp_path / "tokenity-hostfiles" / "distributed-openai-test.json"
-    hostfile.parent.mkdir()
-    hostfile.write_text("[]", encoding="utf-8")
-    stubborn = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            "import signal, time; signal.signal(signal.SIGTERM, lambda *_: None); time.sleep(30)",
-            "--hostfile",
-            str(hostfile),
-        ],
-        start_new_session=True,
+    first = supervisor.start(
+        "single-node-openai",
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        instance_id="instance-a",
+        operation_id="operation-a",
     )
-    supervisor = RoleSupervisor(log_dir=tmp_path)
-    supervisor.start(
-        "distributed-openai",
-        [
-            sys.executable,
-            "-c",
-            "import time; time.sleep(30)",
-            "--hostfile",
-            str(hostfile),
-        ],
+    second = supervisor.start(
+        "single-node-openai",
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        instance_id="instance-b",
+        operation_id="operation-b",
     )
 
     try:
-        supervisor.stop("distributed-openai", timeout=1)
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            if stubborn.poll() is not None:
-                break
-            time.sleep(0.05)
-        else:
-            raise AssertionError("related hostfile process survived final SIGKILL")
+        assert first.pid is not None and second.pid is not None and first.pid != second.pid
+        supervisor.stop("single-node-openai", timeout=1, instance_id="instance-a")
+        assert supervisor.status("single-node-openai", instance_id="instance-a").state == "stopped"
+        assert supervisor.status("single-node-openai", instance_id="instance-b").state == "running"
     finally:
-        if stubborn.poll() is None:
-            stubborn.kill()
-            stubborn.wait(timeout=5)
+        supervisor.stop("single-node-openai", timeout=1, instance_id="instance-b")
 
 
-def test_supervisor_stop_kills_related_tokenity_serve_process(tmp_path: Path):
-    model = tmp_path / "Qwen"
-    model.mkdir()
-    rank = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            "import signal, time; signal.signal(signal.SIGTERM, lambda *_: None); time.sleep(30)",
-            "tokenity",
-            "distributed-openai",
-            "serve",
-            "--model",
-            str(model),
-            "--host",
-            "0.0.0.0",
-            "--port",
-            "8000",
-        ],
-        start_new_session=True,
-    )
-    supervisor = RoleSupervisor(log_dir=tmp_path)
-    supervisor._commands["distributed-openai"] = [  # noqa: SLF001 - targeted supervisor cleanup regression
-        "ssh",
-        "127.0.0.1",
-        f"mlx.launch -- python -m tokenity distributed-openai serve --model {model} --host 0.0.0.0 --port 8000",
-    ]
+def test_agent_restart_reports_unverified_process_as_orphan_instead_of_killing_it():
+    class OrphanAwareSupervisor(_FakeSupervisor):
+        def cleanup_orphaned_model_processes(self):
+            return [
+                {
+                    "pid": 42,
+                    "command": "python -m tokenity distributed-openai serve --model /models/qwen",
+                    "state": "orphaned",
+                    "reason": "unverified",
+                }
+            ]
 
-    try:
-        supervisor.stop("distributed-openai", timeout=1)
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            if rank.poll() is not None:
-                break
-            time.sleep(0.05)
-        else:
-            raise AssertionError("related Tokenity serve process survived final SIGKILL")
-    finally:
-        if rank.poll() is None:
-            rank.kill()
-            rank.wait(timeout=5)
+    with TestClient(
+        create_app(rdma_probe_fn=fake_rdma_probe, supervisor=OrphanAwareSupervisor())
+    ) as client:
+        payload = client.get("/v1/node/status").json()
+
+    assert payload["orphaned_processes"][0]["state"] == "orphaned"
+    assert payload["orphaned_processes"][0]["pid"] == 42
 
 
 def test_model_scan(tmp_path: Path):
@@ -445,7 +407,8 @@ def test_distributed_dry_run_forwards_runtime_configuration():
 
     assert response.status_code == 200
     plan = response.json()["launch_plan"]
-    assert plan["transport"] == "http"
+    assert plan["transport"] == "local-process"
+    assert plan["execution_mode"] == "single"
     command = plan["ranks"][0]["command"]
     assert command[command.index("--api-identifier") + 1] == "tokenity/qwen"
     assert command[command.index("--max-tokens") + 1] == "65536"
@@ -546,7 +509,7 @@ def test_rank_environment_matches_mlx_jaccl_contract(tmp_path: Path, monkeypatch
     ]
 
 
-def test_single_node_ring_uses_mlx_singleton_without_an_empty_hostfile():
+def test_single_node_uses_local_runtime_without_distributed_environment():
     request = RankStartRequest(
         cluster_id="cluster-test",
         model="/models/qwen",
@@ -558,10 +521,12 @@ def test_single_node_ring_uses_mlx_singleton_without_an_empty_hostfile():
         ring_hosts=[["127.0.0.1:29500"]],
     )
 
-    _, env = _rank_command_and_environment(request)
+    command, env = _rank_command_and_environment(request)
 
-    assert env["MLX_RANK"] == "0"
+    assert "MLX_RANK" not in env
     assert "MLX_HOSTFILE" not in env
+    assert "MLX_JACCL_COORDINATOR" not in env
+    assert command[command.index("--execution-mode") + 1] == "single"
 
 
 class _FakeSupervisor:
@@ -599,6 +564,7 @@ def test_distributed_start_fans_out_worker_rank_over_http():
             rank_ready_fn=lambda pid, port, timeout: True,
             rank_stabilize_fn=lambda seconds: None,
             rank_connected_fn=lambda pid, request, timeout: True,
+            runtime_preflight_fn=lambda *_: [],
         )
     )
     response = client.post(
@@ -634,6 +600,13 @@ def test_distributed_start_fans_out_worker_rank_over_http():
     assert posts[0][0] == "http://192.168.5.75:9100/v1/node/start-distributed-rank"
     assert posts[0][1]["rank"] == 1
     assert "ssh" not in posts[0][1]
+    assert "native_mtp" not in posts[0][1]
+
+    runtime = client.get("/v1/node/status").json()["cluster_runtime"]
+    assert runtime["rank"] == 0
+    assert runtime["world_size"] == 2
+    assert runtime["connection_mode"] == "jaccl"
+    assert runtime["role"] == "controller"
 
     stop = client.post(
         "/v1/node/stop-role",
@@ -643,6 +616,268 @@ def test_distributed_start_fans_out_worker_rank_over_http():
     assert any(url.endswith("/v1/node/request-stop-all") for url, _, _ in posts)
     assert posts[-1][0] == "http://192.168.5.75:9100/v1/node/stop-all"
     assert posts[-1][1]["timeout"] == 5
+    assert client.get("/v1/node/status").json()["cluster_runtime"] is None
+
+
+def test_instance_quorum_requires_matching_ready_rank_evidence(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(agent_module.tempfile, "gettempdir", lambda: str(tmp_path))
+    supervisor = _FakeSupervisor()
+    worker_payloads = []
+
+    def post_json(url, payload, timeout):
+        worker_payloads.append(payload)
+        return {"status": {"state": "running"}}
+
+    def get_json(url, timeout):
+        instance_id = worker_payloads[0]["instance_id"]
+        return {
+            "instance": {"instance_id": instance_id},
+            "process": {"state": "running"},
+            "runtime": {
+                "instance_id": instance_id,
+                "operation_id": worker_payloads[0]["operation_id"],
+                "rank": 1,
+                "world_size": 2,
+                "connection_mode": "jaccl",
+                "model_revision": None,
+                "phase": "ready",
+                "updated_at": time.time(),
+                "tokenizer_identity": "Tokenizer",
+                "ready_evidence": {
+                    "weights_materialized": True,
+                    "tokenizer_ready": True,
+                    "generation_engine_ready": True,
+                    "one_token_probe": False,
+                    "warmup_cache_isolated": False,
+                },
+            },
+        }
+
+    client = TestClient(
+        create_app(
+            rdma_probe_fn=fake_rdma_probe,
+            supervisor=supervisor,
+            post_json_fn=post_json,
+            get_json_fn=get_json,
+            rank_ready_fn=lambda pid, port, timeout: True,
+            rank_stabilize_fn=lambda seconds: None,
+            rank_connected_fn=lambda pid, request, timeout: True,
+            runtime_preflight_fn=lambda *_: [],
+        )
+    )
+    start = client.post(
+        "/v1/node/start-distributed-openai",
+        json={
+            "model": "/models/qwen",
+            "connection_mode": "jaccl",
+            "dry_run": False,
+            "nodes": [
+                {
+                    "id": "mac-a",
+                    "agent_url": "http://192.168.5.23:9100",
+                    "lan_ip": "192.168.5.23",
+                    "rdma_ip": "192.168.0.1",
+                    "rdma_devices": ["rdma_en4"],
+                },
+                {
+                    "id": "mac-b",
+                    "agent_url": "http://192.168.5.75:9100",
+                    "lan_ip": "192.168.5.75",
+                    "rdma_ip": "192.168.0.2",
+                    "rdma_devices": ["rdma_en5"],
+                },
+            ],
+        },
+    )
+    assert start.status_code == 200
+    instance_id = start.json()["instance_id"]
+    operation_id = start.json()["operation_id"]
+    local_path = agent_module._runtime_status_path(instance_id, 0)
+    local_path.write_text(
+        json.dumps(
+            {
+                "instance_id": instance_id,
+                "operation_id": operation_id,
+                "rank": 0,
+                "world_size": 2,
+                "connection_mode": "jaccl",
+                "model_revision": None,
+                "phase": "ready",
+                "updated_at": time.time(),
+                "tokenizer_identity": "Tokenizer",
+                "ready_evidence": {
+                    "weights_materialized": True,
+                    "tokenizer_ready": True,
+                    "generation_engine_ready": True,
+                    "one_token_probe": True,
+                    "warmup_cache_isolated": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    quorum = client.get(f"/v1/node/instances/{instance_id}/quorum")
+
+    assert quorum.status_code == 200
+    assert quorum.json()["ready"] is True
+    assert quorum.json()["rank_quorum"] == "2/2"
+    assert quorum.json()["instance"]["state"] == "ready"
+
+
+class _FakeGatewayConnection:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeGatewayResponse:
+    def __init__(self, body: bytes, *, content_type: str):
+        self.status = 200
+        self._body = body
+        self._offset = 0
+        self._content_type = content_type
+
+    def getheader(self, name):
+        return self._content_type if name.lower() == "content-type" else None
+
+    def read1(self, size):
+        if self._offset >= len(self._body):
+            return b""
+        end = min(len(self._body), self._offset + min(size, 13))
+        result = self._body[self._offset:end]
+        self._offset = end
+        return result
+
+    def read(self):
+        result = self._body[self._offset:]
+        self._offset = len(self._body)
+        return result
+
+
+def test_stable_gateway_routes_multiple_instances_and_releases_request_leases(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(agent_module.tempfile, "gettempdir", lambda: str(tmp_path))
+    supervisor = _FakeSupervisor()
+    upstream_urls = []
+
+    def gateway_open(url, body, headers, timeout):
+        upstream_urls.append(url)
+        payload = json.loads(body)
+        if payload.get("stream"):
+            body_bytes = b'data: {"choices":[{"delta":{"content":"OK"}}]}\n\ndata: [DONE]\n\n'
+            content_type = "text/event-stream"
+        else:
+            body_bytes = b'{"choices":[{"message":{"role":"assistant","content":"OK"}}]}'
+            content_type = "application/json"
+        return _FakeGatewayConnection(), _FakeGatewayResponse(body_bytes, content_type=content_type)
+
+    client = TestClient(
+        create_app(
+            rdma_probe_fn=fake_rdma_probe,
+            supervisor=supervisor,
+            runtime_preflight_fn=lambda *_: [],
+            gateway_open_fn=gateway_open,
+        )
+    )
+
+    def start_ready(instance_id: str, operation_id: str, port: int):
+        response = client.post(
+            "/v1/node/start-distributed-openai",
+            json={
+                "model": "/models/qwen",
+                "api_identifier": "qwen-shared",
+                "instance_id": instance_id,
+                "operation_id": operation_id,
+                "port": port,
+                "starting_port": port + 1_000,
+                "connection_mode": "ring",
+                "dry_run": False,
+                "nodes": [
+                    {
+                        "id": "mac-a",
+                        "agent_url": "http://127.0.0.1:9100",
+                        "lan_ip": "127.0.0.1",
+                    }
+                ],
+            },
+        )
+        assert response.status_code == 200, response.text
+        runtime_path = agent_module._runtime_status_path(instance_id, 0)
+        runtime_path.write_text(
+            json.dumps(
+                {
+                    "instance_id": instance_id,
+                    "operation_id": operation_id,
+                    "rank": 0,
+                    "world_size": 1,
+                    "connection_mode": "single",
+                    "model_revision": None,
+                    "phase": "ready",
+                    "updated_at": time.time(),
+                    "tokenizer_identity": "Tokenizer",
+                    "ready_evidence": {
+                        "weights_materialized": True,
+                        "tokenizer_ready": True,
+                        "generation_engine_ready": True,
+                        "one_token_probe": True,
+                        "warmup_cache_isolated": True,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        quorum = client.get(f"/v1/node/instances/{instance_id}/quorum")
+        assert quorum.status_code == 200 and quorum.json()["ready"] is True
+        return response.json()["instance"]["http_port"]
+
+    first_port = start_ready("instance-a", "operation-a", 18_000)
+    second_port = start_ready("instance-b", "operation-b", 18_000)
+
+    first = client.post(
+        "/v1/chat/completions",
+        json={"model": "qwen-shared", "messages": [], "stream": True},
+    )
+    second = client.post(
+        "/v1/chat/completions",
+        json={"model": "qwen-shared", "messages": [], "stream": False},
+    )
+
+    assert first.status_code == 200
+    assert first.headers["x-tokenity-instance-id"] == "instance-a"
+    assert first.headers["content-type"].startswith("text/event-stream")
+    assert "data: [DONE]" in first.text
+    assert second.status_code == 200
+    assert second.headers["x-tokenity-instance-id"] == "instance-b"
+    assert second.json()["choices"][0]["message"]["content"] == "OK"
+    assert upstream_urls == [
+        f"http://127.0.0.1:{first_port}/v1/chat/completions",
+        f"http://127.0.0.1:{second_port}/v1/chat/completions",
+    ]
+    routes = client.get("/v1/gateway/routes").json()["data"]
+    assert {item["instance_id"] for item in routes} == {"instance-a", "instance-b"}
+    assert all(item["active_request_count"] == 0 for item in routes)
+
+    runtime_status = client.get("/v1/node/status").json()
+    assert {
+        item["instance_id"] for item in runtime_status["cluster_runtimes"]
+    } == {"instance-a", "instance-b"}
+    assert runtime_status["cluster_runtime"]["instance_id"] == "instance-b"
+
+    stopped = client.post("/v1/node/instances/instance-b/stop", json={"timeout": 1})
+    assert stopped.status_code == 200
+    runtime_status = client.get("/v1/node/status").json()
+    assert [
+        item["instance_id"] for item in runtime_status["cluster_runtimes"]
+    ] == ["instance-a"]
+    assert runtime_status["cluster_runtime"]["instance_id"] == "instance-a"
+    remaining = client.post(
+        "/v1/chat/completions",
+        json={"model": "qwen-shared", "messages": [], "stream": False},
+    )
+    assert remaining.status_code == 200
+    assert remaining.headers["x-tokenity-instance-id"] == "instance-a"
 
 
 def test_stop_all_stops_every_model_role_and_heartbeat_renews_lease():
@@ -683,6 +918,33 @@ def test_remote_rank_rejects_a_caller_selected_python_executable():
     assert "installed Python runtime" in response.json()["detail"]
 
 
+def test_remote_rank_preflight_rejects_mismatched_tokenity_code_revision(monkeypatch):
+    monkeypatch.setattr(agent_module, "_tokenity_code_revision", lambda: "local-revision")
+    client = TestClient(
+        create_app(
+            rdma_probe_fn=fake_rdma_probe,
+            runtime_preflight_fn=lambda *_: [],
+        )
+    )
+    response = client.post(
+        "/v1/node/start-distributed-rank",
+        json={
+            "cluster_id": "cluster-test",
+            "model": "/models/qwen",
+            "rank": 1,
+            "world_size": 2,
+            "connection_mode": "ring",
+            "python": sys.executable,
+            "ring_hosts": [["127.0.0.1:29500"], ["127.0.0.1:29501"]],
+            "tokenity_code_revision": "remote-revision",
+        },
+    )
+
+    assert response.status_code == 412
+    issues = response.json()["detail"]["issues"]
+    assert any("code revision mismatch" in issue for issue in issues)
+
+
 def test_remote_rank_rolls_back_when_the_data_plane_does_not_connect():
     supervisor = _FakeSupervisor()
     client = TestClient(
@@ -690,6 +952,7 @@ def test_remote_rank_rolls_back_when_the_data_plane_does_not_connect():
             rdma_probe_fn=fake_rdma_probe,
             supervisor=supervisor,
             rank_connected_fn=lambda pid, request, timeout: False,
+            runtime_preflight_fn=lambda *_: [],
         )
     )
     response = client.post(

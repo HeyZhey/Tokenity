@@ -15,21 +15,26 @@ from pathlib import Path
 class RoleStatus:
     role: str
     state: str
+    instance_id: str | None = None
+    operation_id: str | None = None
     pid: int | None = None
     return_code: int | None = None
     command: list[str] | None = None
     log_path: str | None = None
     message: str | None = None
     log_tail: str | None = None
+    process_resident_bytes: int | None = None
+    sampled_at: float | None = None
 
 
 class RoleSupervisor:
     def __init__(self, log_dir: Path | None = None) -> None:
         self.log_dir = log_dir or Path.home() / "Library" / "Application Support" / "Tokenity" / "logs"
-        self._processes: dict[str, subprocess.Popen[bytes]] = {}
-        self._commands: dict[str, list[str]] = {}
-        self._logs: dict[str, Path] = {}
-        self._new_sessions: dict[str, bool] = {}
+        self._processes: dict[tuple[str, str | None], subprocess.Popen[bytes]] = {}
+        self._commands: dict[tuple[str, str | None], list[str]] = {}
+        self._logs: dict[tuple[str, str | None], Path] = {}
+        self._new_sessions: dict[tuple[str, str | None], bool] = {}
+        self._operation_ids: dict[tuple[str, str | None], str | None] = {}
         self._lock = threading.RLock()
 
     def start(
@@ -39,18 +44,22 @@ class RoleSupervisor:
         env: dict[str, str] | None = None,
         cwd: str | Path | None = None,
         start_new_session: bool = True,
+        instance_id: str | None = None,
+        operation_id: str | None = None,
     ) -> RoleStatus:
+        key = (role, instance_id)
         with self._lock:
-            existing = self._processes.get(role)
+            existing = self._processes.get(key)
             if existing and existing.poll() is None:
-                if self._commands.get(role) == command:
-                    return self.status(role)
+                if self._commands.get(key) == command and self._operation_ids.get(key) == operation_id:
+                    return self.status(role, instance_id=instance_id)
                 # A same-role request for a different model/configuration must
-                # replace the old backend instead of silently reusing it.
-                self.stop(role, timeout=10)
+                # replace only that instance instead of another model process.
+                self.stop(role, timeout=10, instance_id=instance_id)
 
             self.log_dir.mkdir(parents=True, exist_ok=True)
-            log_path = self.log_dir / f"{role}.log"
+            suffix = f"-{_safe_log_component(instance_id)}" if instance_id else ""
+            log_path = self.log_dir / f"{role}{suffix}.log"
             merged_env = os.environ.copy()
             if env:
                 merged_env.update(env)
@@ -69,33 +78,36 @@ class RoleSupervisor:
                 args=(process, log_path),
                 daemon=True,
             ).start()
-            self._processes[role] = process
-            self._commands[role] = command
-            self._logs[role] = log_path
-            self._new_sessions[role] = start_new_session
-            return self.status(role)
+            self._processes[key] = process
+            self._commands[key] = command
+            self._logs[key] = log_path
+            self._new_sessions[key] = start_new_session
+            self._operation_ids[key] = operation_id
+            return self.status(role, instance_id=instance_id)
 
-    def stop(self, role: str, timeout: float = 10.0) -> RoleStatus:
+    def stop(self, role: str, timeout: float = 10.0, *, instance_id: str | None = None) -> RoleStatus:
+        key = (role, instance_id)
         with self._lock:
-            process = self._processes.get(role)
-            command = self._commands.get(role)
+            process = self._processes.get(key)
+            command = self._commands.get(key)
             if not process or process.poll() is not None:
-                if command:
+                if command and instance_id is None:
                     _terminate_related_processes(command, signal.SIGTERM)
                     time.sleep(min(timeout, 0.5))
                     _terminate_related_processes(command, signal.SIGKILL)
-                return self.status(role)  # type: ignore[return-value]
+                return self.status(role, instance_id=instance_id)  # type: ignore[return-value]
 
-            if self._new_sessions.get(role, True):
+            if self._new_sessions.get(key, True):
                 _terminate_process_group(process, signal.SIGTERM)
             else:
                 process.terminate()
-            _terminate_related_processes(command, signal.SIGTERM)
+            if instance_id is None:
+                _terminate_related_processes(command, signal.SIGTERM)
             deadline = time.monotonic() + timeout
             while process.poll() is None and time.monotonic() < deadline:
                 time.sleep(0.1)
             if process.poll() is None:
-                if self._new_sessions.get(role, True):
+                if self._new_sessions.get(key, True):
                     _terminate_process_group(process, signal.SIGKILL)
                 else:
                     process.kill()
@@ -103,10 +115,11 @@ class RoleSupervisor:
                     process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     pass
-            _terminate_related_processes(command, signal.SIGKILL)
-            return self.status(role)
+            if instance_id is None:
+                _terminate_related_processes(command, signal.SIGKILL)
+            return self.status(role, instance_id=instance_id)
 
-    def request_stop(self, role: str) -> RoleStatus:
+    def request_stop(self, role: str, *, instance_id: str | None = None) -> RoleStatus:
         """Ask a role to stop without waiting or escalating to SIGKILL.
 
         Distributed ranks need a short coordination phase where every rank has
@@ -115,80 +128,154 @@ class RoleSupervisor:
         all ranks first and only then wait for them to leave their collectives.
         """
 
+        key = (role, instance_id)
         with self._lock:
-            process = self._processes.get(role)
+            process = self._processes.get(key)
             if not process or process.poll() is not None:
-                return self.status(role)  # type: ignore[return-value]
-            if self._new_sessions.get(role, True):
+                return self.status(role, instance_id=instance_id)  # type: ignore[return-value]
+            if self._new_sessions.get(key, True):
                 _terminate_process_group(process, signal.SIGTERM)
             else:
                 process.terminate()
-            return self.status(role)  # type: ignore[return-value]
+            return self.status(role, instance_id=instance_id)  # type: ignore[return-value]
 
-    def wait(self, role: str, timeout: float = 10.0) -> RoleStatus:
+    def wait(self, role: str, timeout: float = 10.0, *, instance_id: str | None = None) -> RoleStatus:
         """Wait for a role to exit without sending another signal."""
 
+        key = (role, instance_id)
         with self._lock:
-            process = self._processes.get(role)
+            process = self._processes.get(key)
         if process is None or process.poll() is not None:
-            return self.status(role)  # type: ignore[return-value]
+            return self.status(role, instance_id=instance_id)  # type: ignore[return-value]
         deadline = time.monotonic() + timeout
         while process.poll() is None and time.monotonic() < deadline:
             time.sleep(0.05)
-        return self.status(role)  # type: ignore[return-value]
+        return self.status(role, instance_id=instance_id)  # type: ignore[return-value]
 
     def stop_all(self, roles: list[str] | tuple[str, ...] | None = None, timeout: float = 10.0) -> list[RoleStatus]:
         with self._lock:
-            selected = list(roles) if roles is not None else sorted(set(self._processes) | set(self._commands))
-        return [self.stop(role, timeout=timeout) for role in selected]
+            keys = sorted(set(self._processes) | set(self._commands), key=lambda item: (item[0], item[1] or ""))
+            if roles is not None:
+                requested = set(roles)
+                keys = [key for key in keys if key[0] in requested]
+        return [self.stop(role, timeout=timeout, instance_id=instance_id) for role, instance_id in keys]
 
-    def cleanup_orphaned_model_processes(self) -> None:
-        """Terminate model ranks left behind by a previous Agent process."""
+    def cleanup_orphaned_model_processes(self) -> list[dict[str, object]]:
+        """Reconcile, but never silently kill, ranks from a previous Agent.
 
-        _terminate_matching_processes(
-            ["tokenity distributed-openai serve --model"],
-            signal.SIGTERM,
-        )
-        time.sleep(0.25)
-        _terminate_matching_processes(
-            ["tokenity distributed-openai serve --model"],
-            signal.SIGKILL,
-        )
+        A freshly restarted Agent is not the parent of those processes and
+        therefore cannot prove their instance lease or request count. They are
+        reported as orphaned for an explicit operator decision instead of being
+        destroyed during Agent startup.
+        """
 
-    def status(self, role: str | None = None) -> RoleStatus | list[RoleStatus]:
+        return _matching_processes(["tokenity distributed-openai serve --model"])
+
+    def status(
+        self,
+        role: str | None = None,
+        *,
+        instance_id: str | None = None,
+    ) -> RoleStatus | list[RoleStatus]:
         with self._lock:
             if role is not None:
-                process = self._processes.get(role)
+                key = (role, instance_id)
+                process = self._processes.get(key)
                 if not process:
-                    log_path = self._logs.get(role)
+                    log_path = self._logs.get(key)
                     return RoleStatus(
                         role=role,
                         state="stopped",
-                        command=self._commands.get(role),
+                        instance_id=instance_id,
+                        operation_id=self._operation_ids.get(key),
+                        command=self._commands.get(key),
                         log_path=_str(log_path),
+                        sampled_at=time.time(),
                     )
                 return_code = process.poll()
                 state = "running" if return_code is None else "stopped"
-                log_path = self._logs.get(role)
+                log_path = self._logs.get(key)
                 log_tail = _tail_log(log_path) if state == "stopped" else _failure_log_tail(log_path)
                 if state == "running" and log_tail is not None:
                     state = "failed"
                 return RoleStatus(
                     role=role,
                     state=state,
+                    instance_id=instance_id,
+                    operation_id=self._operation_ids.get(key),
                     pid=process.pid if state in {"running", "failed"} else None,
                     return_code=return_code,
-                    command=self._commands.get(role),
+                    command=self._commands.get(key),
                     log_path=_str(log_path),
                     message=_status_message(role, return_code, log_tail),
                     log_tail=log_tail,
+                    process_resident_bytes=(
+                        _process_resident_bytes(process.pid) if return_code is None else None
+                    ),
+                    sampled_at=time.time(),
                 )
-            roles = sorted(set(self._processes) | set(self._commands))
-            return [self.status(item) for item in roles]  # type: ignore[misc]
+            keys = sorted(set(self._processes) | set(self._commands), key=lambda item: (item[0], item[1] or ""))
+            return [
+                self.status(item_role, instance_id=item_instance)
+                for item_role, item_instance in keys
+            ]  # type: ignore[misc]
 
 
 def _str(path: Path | None) -> str | None:
     return str(path) if path else None
+
+
+def _safe_log_component(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", value)[:80]
+
+
+def _process_resident_bytes(pid: int) -> int | None:
+    try:
+        completed = subprocess.run(
+            ["/bin/ps", "-o", "rss=", "-p", str(pid)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        kibibytes = int(completed.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return kibibytes * 1024
+
+
+def _matching_processes(markers: list[str]) -> list[dict[str, object]]:
+    try:
+        completed = subprocess.run(
+            ["/bin/ps", "-axo", "pid=,command="],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    matches: list[dict[str, object]] = []
+    for line in completed.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        pid_text, _, command = stripped.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if pid == os.getpid() or not any(marker in command for marker in markers):
+            continue
+        matches.append(
+            {
+                "pid": pid,
+                "command": command,
+                "state": "orphaned",
+                "reason": "Process predates the current Node Agent and has no verified request lease.",
+            }
+        )
+    return matches
 
 
 def _terminate_process_group(process: subprocess.Popen[bytes], sig: signal.Signals) -> None:
@@ -229,10 +316,6 @@ def _related_process_markers(command: list[str] | None) -> list[str]:
         return []
     command_text = " ".join(command)
     markers: list[str] = []
-    for match in re.finditer(r"--hostfile\s+('([^']+)'|\"([^\"]+)\"|(\S+))", command_text):
-        marker = next(group for group in match.groups()[1:] if group)
-        if "tokenity-hostfiles" in marker:
-            markers.append(marker)
     for match in re.finditer(
         r"tokenity\s+distributed-openai\s+serve\s+--model\s+('([^']+)'|\"([^\"]+)\"|(\S+))",
         command_text,

@@ -121,6 +121,31 @@ enum ModelLoadState: String, Hashable {
     case loading = "Loading"
     case loaded = "Loaded"
     case unloading = "Unloading"
+    case failed = "Failed"
+}
+
+enum ServerHealthState: Equatable {
+    case stopped
+    case starting(String?)
+    case ready
+    case error(String)
+
+    var title: String {
+        switch self {
+        case .stopped: return "Stopped"
+        case .starting: return "Starting"
+        case .ready: return "Ready"
+        case .error: return "Error"
+        }
+    }
+
+    var detail: String? {
+        switch self {
+        case .starting(let detail): return detail
+        case .error(let detail): return detail
+        case .stopped, .ready: return nil
+        }
+    }
 }
 
 enum NativeMTPMode: String, CaseIterable, Codable, Identifiable {
@@ -233,26 +258,64 @@ struct RDMAStatus: Codable, Hashable {
 struct ProcessRole: Codable, Hashable, Identifiable {
     var role: String
     var state: String
+    var instanceID: String? = nil
+    var operationID: String? = nil
     var pid: Int?
     var returnCode: Int?
     var command: [String]?
     var logPath: String?
     var message: String?
     var logTail: String?
+    var processResidentBytes: Int64? = nil
+    var sampledAt: Double? = nil
 
-    var id: String { role }
+    var id: String { [role, instanceID].compactMap { $0 }.joined(separator: ":") }
 
     enum CodingKeys: String, CodingKey {
         case role, state, pid, command, message
+        case instanceID = "instance_id"
+        case operationID = "operation_id"
         case returnCode = "return_code"
         case logPath = "log_path"
         case logTail = "log_tail"
+        case processResidentBytes = "process_resident_bytes"
+        case sampledAt = "sampled_at"
     }
 }
 
 struct NodeStatusResponse: Codable {
     var roles: [ProcessRole]
     var memory: MemoryStats?
+    var clusterRuntime: ClusterRuntimeStatus?
+    var clusterRuntimes: [ClusterRuntimeStatus]?
+
+    enum CodingKeys: String, CodingKey {
+        case roles, memory
+        case clusterRuntime = "cluster_runtime"
+        case clusterRuntimes = "cluster_runtimes"
+    }
+}
+
+struct ClusterRuntimeStatus: Codable, Hashable {
+    var clusterID: String
+    var instanceID: String? = nil
+    var operationID: String? = nil
+    var rank: Int
+    var worldSize: Int
+    var connectionMode: String
+    var role: String
+    var modelRevision: String? = nil
+    var epoch: Int? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case rank, role, epoch
+        case clusterID = "cluster_id"
+        case instanceID = "instance_id"
+        case operationID = "operation_id"
+        case worldSize = "world_size"
+        case connectionMode = "connection_mode"
+        case modelRevision = "model_revision"
+    }
 }
 
 struct ModelEntry: Codable, Hashable, Identifiable {
@@ -267,9 +330,10 @@ struct ModelEntry: Codable, Hashable, Identifiable {
     var modelType: String? = nil
     var standaloneLoadable: Bool? = nil
     var loadBlockReason: String? = nil
+    var revision: String? = nil
 
     enum CodingKeys: String, CodingKey {
-        case id, path, format, quantization, architecture
+        case id, path, format, quantization, architecture, revision
         case sizeBytes = "size_bytes"
         case shardCount = "shard_count"
         case nativeMTP = "native_mtp"
@@ -284,6 +348,15 @@ struct NodeModelsResponse: Codable {
     var models: [ModelEntry]
 }
 
+struct AgentContractInfo: Codable, Hashable {
+    var version: Int
+    var capabilities: Set<String>
+
+    func supports(_ capability: String) -> Bool {
+        capabilities.contains(capability)
+    }
+}
+
 struct NodeInfoResponse: Codable {
     var nodeID: String
     var hostname: String
@@ -296,9 +369,13 @@ struct NodeInfoResponse: Codable {
     var mlxVersion: String?
     var mlxLMVersion: String?
     var tokenityVersion: String
+    var tokenityCodeRevision: String?
+    var agentContract: AgentContractInfo?
     var processRoles: [ProcessRole]
     var memory: MemoryStats?
     var rdma: RDMAStatus
+    var clusterRuntime: ClusterRuntimeStatus?
+    var clusterRuntimes: [ClusterRuntimeStatus]?
 
     enum CodingKeys: String, CodingKey {
         case nodeID = "node_id"
@@ -308,7 +385,11 @@ struct NodeInfoResponse: Codable {
         case mlxVersion = "mlx_version"
         case mlxLMVersion = "mlx_lm_version"
         case tokenityVersion = "tokenity_version"
+        case tokenityCodeRevision = "tokenity_code_revision"
+        case agentContract = "agent_contract"
         case processRoles = "process_roles"
+        case clusterRuntime = "cluster_runtime"
+        case clusterRuntimes = "cluster_runtimes"
         case memory
     }
 }
@@ -364,6 +445,36 @@ struct MemoryStats: Codable, Hashable {
     )
 }
 
+struct RuntimeMemoryStats: Codable, Hashable {
+    var processResidentBytes: Int64?
+    var processPhysFootprintBytes: Int64?
+    var mlxActiveBytes: Int64?
+    var mlxPeakBytes: Int64?
+    var mlxCacheBytes: Int64?
+    var modelWeightsEstimatedBytes: Int64?
+    var modelResidentObservedBytes: Int64?
+    var kvCacheBytes: Int64?
+    var promptCacheBytes: Int64?
+    var activeRequestCount: Int?
+    var sampledAt: Double?
+    var stale: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case processResidentBytes = "process_resident_bytes"
+        case processPhysFootprintBytes = "process_phys_footprint_bytes"
+        case mlxActiveBytes = "mlx_active_bytes"
+        case mlxPeakBytes = "mlx_peak_bytes"
+        case mlxCacheBytes = "mlx_cache_bytes"
+        case modelWeightsEstimatedBytes = "model_weights_estimated_bytes"
+        case modelResidentObservedBytes = "model_resident_observed_bytes"
+        case kvCacheBytes = "kv_cache_bytes"
+        case promptCacheBytes = "prompt_cache_bytes"
+        case activeRequestCount = "active_request_count"
+        case sampledAt = "sampled_at"
+        case stale
+    }
+}
+
 struct TokenityNode: Identifiable, Hashable {
     var id: String
     var hostname: String
@@ -375,11 +486,20 @@ struct TokenityNode: Identifiable, Hashable {
     var mlxVersion: String?
     var mlxLMVersion: String?
     var tokenityVersion: String
+    var tokenityCodeRevision: String? = nil
+    var agentContract: AgentContractInfo? = nil
     var rdma: RDMAStatus
     var roles: [ProcessRole]
     var memory: MemoryStats
     var models: [ModelEntry]
     var isOnline: Bool
+    var clusterRuntime: ClusterRuntimeStatus? = nil
+    var clusterRuntimes: [ClusterRuntimeStatus] = []
+    var agentLatencyMilliseconds: Double? = nil
+    var lastAgentResponseAt: Date? = nil
+    var agentError: String? = nil
+    var consecutiveAgentFailures: Int = 0
+    var runtimeMemory: RuntimeMemoryStats? = nil
 
     var displayName: String {
         if agentURL.contains("192.168.5.23") || (user == "apple" && hostname.localizedCaseInsensitiveContains("Mac")) {
@@ -408,11 +528,13 @@ struct TokenityNode: Identifiable, Hashable {
     }
 
     var memoryPercentText: String {
+        guard isOnline else { return "Unavailable" }
         guard let inUseRatio = memory.inUseRatio ?? memory.usedRatio else { return "Memory unknown" }
         return "\(Int((inUseRatio * 100).rounded()))% in use"
     }
 
     var memoryUsageText: String {
+        guard isOnline else { return "Node offline" }
         guard let inUse = memory.inUseBytes ?? memory.usedBytes,
               let total = memory.totalBytes else { return "Memory unknown" }
         var parts = ["\(Self.formatBytes(inUse)) in use"]
@@ -420,10 +542,20 @@ struct TokenityNode: Identifiable, Hashable {
             parts.append("\(Self.formatBytes(reclaimable)) reclaimable cache")
         }
         parts.append("\(Self.formatBytes(total)) total")
+        if let runtime = runtimeMemory {
+            if runtime.stale == true {
+                parts.insert("runtime metrics stale", at: 0)
+            } else if let observed = runtime.modelResidentObservedBytes ?? runtime.mlxActiveBytes {
+                parts.insert("MLX/model \(Self.formatBytes(observed))", at: 0)
+            } else if let resident = runtime.processResidentBytes {
+                parts.insert("runtime resident \(Self.formatBytes(resident))", at: 0)
+            }
+        }
         return parts.joined(separator: " · ")
     }
 
     var displayRuntime: String {
+        guard isOnline else { return "Offline" }
         if mlxVersion == nil && mlxLMVersion == nil {
             return "Not inspected"
         }
@@ -710,6 +842,21 @@ enum ChatRole: String, Codable, Hashable {
     case assistant
 }
 
+enum ChatGenerationState: String, Codable, Hashable {
+    case waiting
+    case reasoning
+    case answering
+    case completed
+    case stopped
+    case repetitive
+    case lengthLimited
+    case failed
+
+    var isGenerating: Bool {
+        self == .waiting || self == .reasoning || self == .answering
+    }
+}
+
 struct ChatMessage: Identifiable, Codable, Hashable {
     let id: UUID
     var role: ChatRole
@@ -717,6 +864,12 @@ struct ChatMessage: Identifiable, Codable, Hashable {
     var thinking: String
     var createdAt: Date
     var includeInContext: Bool
+    var generationState: ChatGenerationState?
+    var statusMessage: String?
+    var metrics: ChatMetrics?
+    var reasoningDurationSeconds: Double?
+    var reasoningTokenCount: Int?
+    var modelName: String?
 
     init(
         id: UUID = UUID(),
@@ -724,7 +877,13 @@ struct ChatMessage: Identifiable, Codable, Hashable {
         content: String,
         thinking: String = "",
         createdAt: Date = Date(),
-        includeInContext: Bool = true
+        includeInContext: Bool = true,
+        generationState: ChatGenerationState? = nil,
+        statusMessage: String? = nil,
+        metrics: ChatMetrics? = nil,
+        reasoningDurationSeconds: Double? = nil,
+        reasoningTokenCount: Int? = nil,
+        modelName: String? = nil
     ) {
         self.id = id
         self.role = role
@@ -732,6 +891,12 @@ struct ChatMessage: Identifiable, Codable, Hashable {
         self.thinking = thinking
         self.createdAt = createdAt
         self.includeInContext = includeInContext
+        self.generationState = generationState
+        self.statusMessage = statusMessage
+        self.metrics = metrics
+        self.reasoningDurationSeconds = reasoningDurationSeconds
+        self.reasoningTokenCount = reasoningTokenCount
+        self.modelName = modelName
     }
 }
 
@@ -739,6 +904,7 @@ struct ChatMetrics: Codable, Hashable {
     var firstTokenSeconds: Double?
     var totalSeconds: Double?
     var outputTokensPerSecond: Double?
+    var outputTokens: Int? = nil
 
     static let empty = ChatMetrics()
 }
@@ -750,6 +916,7 @@ struct ChatSession: Identifiable, Codable, Hashable {
     var updatedAt: Date
     var messages: [ChatMessage]
     var metrics: ChatMetrics
+    var titleWasEdited: Bool?
 
     static func fresh(id: UUID = UUID(), now: Date = Date()) -> ChatSession {
         ChatSession(
@@ -757,19 +924,27 @@ struct ChatSession: Identifiable, Codable, Hashable {
             title: "New Chat",
             createdAt: now,
             updatedAt: now,
-            messages: [
-                ChatMessage(
-                    role: .assistant,
-                    content: "Create a cluster, load a model, then send a prompt to measure first response and total generation time.",
-                    includeInContext: false
-                )
-            ],
-            metrics: .empty
+            messages: [],
+            metrics: .empty,
+            titleWasEdited: false
         )
     }
 
     var preview: String {
-        messages.last(where: { $0.role == .user })?.content ?? "No prompts yet"
+        guard let content = messages.reversed().first(where: {
+            !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        })?.content else {
+            return "No messages yet"
+        }
+        return content
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func matches(search query: String) -> Bool {
+        let clean = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return true }
+        return title.localizedCaseInsensitiveContains(clean) || preview.localizedCaseInsensitiveContains(clean)
     }
 }
 
@@ -846,6 +1021,9 @@ struct AgentStartModelRequest: Encodable {
     // load models through pre-MTP Node Agents. New Agents already default a
     // missing field to off.
     var nativeMTP: NativeMTPConfiguration? = nil
+    var instanceID: String? = nil
+    var operationID: String? = nil
+    var memoryReservationBytes: Int64? = nil
 
     enum CodingKeys: String, CodingKey {
         case model, nodes, host, port
@@ -860,12 +1038,33 @@ struct AgentStartModelRequest: Encodable {
         case trustRemoteCode = "trust_remote_code"
         case leaseSeconds = "lease_seconds"
         case nativeMTP = "native_mtp"
+        case instanceID = "instance_id"
+        case operationID = "operation_id"
+        case memoryReservationBytes = "memory_reservation_bytes"
+    }
+}
+
+struct AgentStartModelResponse: Decodable {
+    var instanceID: String?
+    var operationID: String?
+    var apiBaseURL: String?
+
+    enum CodingKeys: String, CodingKey {
+        case instanceID = "instance_id"
+        case operationID = "operation_id"
+        case apiBaseURL = "api_base_url"
     }
 }
 
 struct AgentStopRoleRequest: Encodable {
     var role: String
     var timeout: Double
+    var instanceID: String? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case role, timeout
+        case instanceID = "instance_id"
+    }
 }
 
 struct AgentStopAllRequest: Encodable {
@@ -874,9 +1073,11 @@ struct AgentStopAllRequest: Encodable {
 
 struct AgentHeartbeatRequest: Encodable {
     var ttlSeconds: Double
+    var instanceID: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case ttlSeconds = "ttl_seconds"
+        case instanceID = "instance_id"
     }
 }
 
@@ -904,6 +1105,19 @@ struct OpenAIChatChunk: Decodable {
     }
 
     var choices: [Choice]
+    var usage: OpenAIUsage?
+}
+
+struct OpenAIUsage: Decodable {
+    var promptTokens: Int?
+    var completionTokens: Int?
+    var totalTokens: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case promptTokens = "prompt_tokens"
+        case completionTokens = "completion_tokens"
+        case totalTokens = "total_tokens"
+    }
 }
 
 struct OpenAIChatResponse: Decodable {
@@ -930,9 +1144,10 @@ struct OpenAIChatResponse: Decodable {
     }
 
     var choices: [Choice]
+    var usage: OpenAIUsage?
 }
 
-struct LaunchPreview {
+struct LaunchPreview: Equatable {
     var summary: [LaunchSummaryItem]
     var networkPlan: [NetworkPlanRow]
     var warnings: [String]

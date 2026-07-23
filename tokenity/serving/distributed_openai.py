@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
 import gc
 import json
 import logging
 import os
+import queue
 import signal
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -15,6 +19,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from types import SimpleNamespace
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -51,6 +56,28 @@ class ChatCompletionRequest(BaseModel):
     chat_template_kwargs: dict[str, Any] | None = None
 
 
+class _TimelineStreamingResponse(StreamingResponse):
+    def __init__(self, *args: Any, state: ReadinessState, request_id: str, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._timeline_state = state
+        self._timeline_request_id = request_id
+
+    async def stream_response(self, send) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": self.status_code,
+                "headers": self.raw_headers,
+            }
+        )
+        self._timeline_state.record_request_event(self._timeline_request_id, "headers_sent")
+        async for chunk in self.body_iterator:
+            if not isinstance(chunk, (bytes, memoryview)):
+                chunk = chunk.encode(self.charset)
+            await send({"type": "http.response.body", "body": chunk, "more_body": True})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+
 @dataclass
 class _GenerationResult:
     text: str
@@ -59,6 +86,20 @@ class _GenerationResult:
     prompt_tokens: int
     completion_tokens: int
     prompt_cache_tokens: int | None
+
+
+class _SingleGenerationContext:
+    def __init__(self, prompt: list[int]) -> None:
+        self.prompt = prompt
+        self.prompt_cache_count = 0
+        self._stopped = threading.Event()
+
+    @property
+    def stopped(self) -> bool:
+        return self._stopped.is_set()
+
+    def stop(self) -> None:
+        self._stopped.set()
 
 
 class _RepetitionDetector:
@@ -151,6 +192,8 @@ def _report_load_progress(current: int, total: int) -> None:
     # for provider publication/compilation.
     state.progress = min(0.95, 0.1 + (0.85 * current / total))
     state.message = f"Loading model parameters ({current}/{total})."
+    state.updated_at = time.time()
+    state.publish()
 
 
 @dataclass
@@ -500,7 +543,11 @@ class TokenityDistributedRuntime:
         decode_concurrency: int = 1,
         prompt_concurrency: int = 1,
         native_mtp: NativeMTPConfig | dict[str, Any] | None = None,
+        execution_mode: str = "distributed",
+        warmup_timeout: float = 120.0,
     ) -> None:
+        if execution_mode not in {"single", "distributed"}:
+            raise ValueError(f"Unsupported execution mode: {execution_mode}")
         self.model = model
         self.model_id = (api_identifier or "").strip() or Path(model).name or model
         self.state = state
@@ -510,6 +557,9 @@ class TokenityDistributedRuntime:
         self.prefill_step_size = prefill_step_size
         self.decode_concurrency = decode_concurrency
         self.prompt_concurrency = prompt_concurrency
+        self.execution_mode = execution_mode
+        self.warmup_timeout = warmup_timeout
+        self.state.execution_mode = execution_mode
         self.native_mtp = NativeMTPRuntimeController(
             model=model,
             config=(
@@ -527,15 +577,34 @@ class TokenityDistributedRuntime:
         self._group: Any = None
         self._load_monitor: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._single_model: Any = None
+        self._single_tokenizer: Any = None
+        self._single_generation_lock = threading.Lock()
+        self._single_contexts: set[_SingleGenerationContext] = set()
+        self._single_contexts_lock = threading.Lock()
+        self._active_request_count = 0
+        self._request_count_lock = threading.Lock()
+        self._status_heartbeat_stop = threading.Event()
+        self._status_heartbeat: threading.Thread | None = None
 
     def start(self) -> None:
+        self._start_status_heartbeat()
         if issue := standalone_model_issue(self.model):
-            self.state.phase = ReadinessPhase.FAILED
-            self.state.message = issue
+            self.state.transition(
+                ReadinessPhase.FAILED,
+                message=issue,
+                error={"stage": "model_validation", "message": issue},
+            )
             raise ValueError(issue)
-        self.state.phase = ReadinessPhase.DISTRIBUTED_INIT
+        if self.execution_mode == "single":
+            self._start_single()
+            return
+
+        self.state.transition(
+            ReadinessPhase.DISTRIBUTED_INIT,
+            message="Initializing the MLX distributed group.",
+        )
         self.state.progress = 0.02
-        self.state.message = "Initializing the MLX distributed group."
         _set_active_load_state(self.state, self._stop_event)
         try:
             import mlx.core as mx  # type: ignore
@@ -545,8 +614,11 @@ class TokenityDistributedRuntime:
             _delay_rank0_distributed_init()
             self._group = mx.distributed.init()
         except Exception as exc:  # pragma: no cover - depends on target MLX runtime
-            self.state.phase = ReadinessPhase.FAILED
-            self.state.message = f"MLX distributed init failed: {exc}"
+            self.state.transition(
+                ReadinessPhase.FAILED,
+                message=f"MLX distributed init failed: {exc}",
+                error={"stage": "distributed_initializing", "message": str(exc)},
+            )
             _set_active_load_state(None)
             raise
 
@@ -557,7 +629,10 @@ class TokenityDistributedRuntime:
         self.native_mtp.prepare(mx, self._group)
         self.state.native_mtp = self.native_mtp.telemetry
 
-        self.state.phase = ReadinessPhase.LOADING_MODEL
+        self.state.transition(
+            ReadinessPhase.LOADING_MODEL,
+            message="Loading model metadata and materializing sharded weights.",
+        )
         self.state.progress = 0.1
         self._symbols = _MLXServerSymbols.load(self.native_mtp)
         args = self._server_args()
@@ -565,14 +640,113 @@ class TokenityDistributedRuntime:
         self._map_model_aliases(self._provider)
         cache = self._symbols.LRUPromptCache(args.prompt_cache_size)
         self._generator = self._symbols.ResponseGenerator(self._provider, cache)
-        self.state.message = "Loading model across MLX ranks."
         self._load_monitor = threading.Thread(target=self._monitor_model_load, daemon=True)
         self._load_monitor.start()
+
+    def _start_single(self) -> None:
+        """Load a local model without creating any MLX distributed group."""
+
+        self.state.rank = 0
+        self.state.world_size = 1
+        self.state.backend = "single"
+        self.state.transition(
+            ReadinessPhase.LOADING_MODEL,
+            message="Loading model metadata on one Mac without distributed initialization.",
+        )
+        self.state.progress = 0.05
+        _set_active_load_state(self.state, self._stop_event)
+        try:
+            import mlx.core as mx  # type: ignore
+            from mlx.utils import tree_flatten  # type: ignore
+            from mlx_lm import load  # type: ignore
+
+            if mx.metal.is_available():
+                mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
+            self._single_model, self._single_tokenizer = load(
+                self.model,
+                tokenizer_config={"trust_remote_code": True if self.trust_remote_code else None},
+                lazy=True,
+            )
+            self.state.tokenizer_identity = type(self._single_tokenizer).__name__
+            self.state.message = "Materializing local model weights."
+            self.state.progress = 0.1
+            _eval_parameters_in_chunks(mx, tree_flatten(self._single_model.parameters()))
+            self.state.transition(
+                ReadinessPhase.COMPILING,
+                message="Compiling and running an isolated one-token readiness warmup.",
+            )
+            self.state.progress = 0.96
+            self._run_warmup_with_timeout(self._warmup_single)
+            evidence = {
+                "all_ranks_healthy": True,
+                "rank_quorum": "1/1",
+                "weights_materialized": True,
+                "tokenizer_ready": self._single_tokenizer is not None,
+                "generation_engine_ready": self._single_model is not None,
+                "one_token_probe": True,
+                "warmup_cache_isolated": True,
+            }
+            self.state.progress = 1.0
+            self.state.transition(
+                ReadinessPhase.READY,
+                message="Runtime is accepting generation requests.",
+                evidence=evidence,
+            )
+        except Exception as exc:
+            self._single_model = None
+            self._single_tokenizer = None
+            self.state.transition(
+                ReadinessPhase.FAILED,
+                message=f"Single-node runtime failed during startup: {exc}",
+                error={"stage": self.state.lifecycle_state, "message": str(exc)},
+            )
+            raise
+        finally:
+            _set_active_load_state(None)
+
+    def _run_warmup_with_timeout(self, warmup: Callable[[], None]) -> None:
+        result: queue.Queue[BaseException | None] = queue.Queue(maxsize=1)
+
+        def run() -> None:
+            try:
+                warmup()
+            except BaseException as exc:  # propagate the original warmup cause
+                result.put(exc)
+            else:
+                result.put(None)
+
+        thread = threading.Thread(target=run, daemon=True, name="tokenity-readiness-warmup")
+        thread.start()
+        try:
+            failure = result.get(timeout=self.warmup_timeout)
+        except queue.Empty as exc:
+            self._stop_event.set()
+            raise TimeoutError(
+                f"One-token readiness warmup exceeded {self.warmup_timeout:.1f} seconds."
+            ) from exc
+        if failure is not None:
+            raise failure
+
+    def _warmup_single(self) -> None:
+        request = ChatCompletionRequest(
+            model=self.model_id,
+            messages=[{"role": "user", "content": "Reply with OK."}],
+            max_tokens=1,
+            temperature=0.0,
+            chat_template_kwargs={"enable_thinking": False},
+        )
+        ctx, responses = self._begin_single_generation(request)
+        try:
+            next(responses, None)
+        finally:
+            ctx.stop()
 
     def is_rank0(self) -> bool:
         return self.state.rank == 0
 
     def join(self) -> None:
+        if self.execution_mode == "single":
+            return
         if self._generator is not None:
             try:
                 self._generator.join()
@@ -581,13 +755,39 @@ class TokenityDistributedRuntime:
 
     def request_stop(self) -> None:
         self._stop_event.set()
-        self.state.phase = ReadinessPhase.STOPPING
-        self.state.message = "Stopping model runtime and releasing MLX memory."
+        self._status_heartbeat_stop.set()
+        self.state.transition(
+            ReadinessPhase.STOPPING,
+            message="Stopping model runtime and releasing MLX memory.",
+        )
+        with self._single_contexts_lock:
+            for context in list(self._single_contexts):
+                context.stop()
         if self._generator is not None and not self.process_isolated_shutdown:
             self._generator._stop = True
 
+    def _start_status_heartbeat(self) -> None:
+        if not self.state.status_path or self._status_heartbeat is not None:
+            return
+
+        def publish() -> None:
+            self.memory_metrics()
+            while not self._status_heartbeat_stop.wait(2.0):
+                self.state.updated_at = time.time()
+                self.memory_metrics()
+
+        self._status_heartbeat = threading.Thread(
+            target=publish,
+            daemon=True,
+            name="tokenity-runtime-heartbeat",
+        )
+        self._status_heartbeat.start()
+
     def stop(self) -> None:
         self.request_stop()
+        if self.execution_mode == "single":
+            self._release_memory()
+            return
         if self.process_isolated_shutdown:
             logging.warning(
                 "Tokenity is using process-isolated GLM teardown to bypass the MLX CompilerCache destructor bug."
@@ -608,6 +808,8 @@ class TokenityDistributedRuntime:
         self._provider = None
         self._symbols = None
         self._group = None
+        self._single_model = None
+        self._single_tokenizer = None
         gc.collect()
         if distributed_runtime:
             # A distributed process exits immediately after shutdown, so the
@@ -642,47 +844,89 @@ class TokenityDistributedRuntime:
         }
 
     def complete(self, request: ChatCompletionRequest) -> dict[str, object]:
-        result = self._complete_sync(request)
-        return {
-            "id": f"chatcmpl-tokenity-{uuid.uuid4()}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": self.model_id,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": _message_payload(result.text, result.reasoning),
-                    "finish_reason": result.finish_reason,
-                }
-            ],
-            "usage": {
-                "prompt_tokens": result.prompt_tokens,
-                "completion_tokens": result.completion_tokens,
-                "total_tokens": result.prompt_tokens + result.completion_tokens,
-                "prompt_tokens_details": {
-                    "cached_tokens": result.prompt_cache_tokens or 0,
+        self._acquire_request()
+        try:
+            result = self._complete_sync(request)
+            return {
+                "id": f"chatcmpl-tokenity-{uuid.uuid4()}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": self.model_id,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": _message_payload(result.text, result.reasoning),
+                        "finish_reason": result.finish_reason,
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": result.prompt_tokens,
+                    "completion_tokens": result.completion_tokens,
+                    "total_tokens": result.prompt_tokens + result.completion_tokens,
+                    "prompt_tokens_details": {
+                        "cached_tokens": result.prompt_cache_tokens or 0,
+                    },
                 },
-            },
-        }
+            }
+        finally:
+            self._release_request()
 
-    async def stream(self, request: ChatCompletionRequest) -> AsyncIterator[str]:
+    async def stream(
+        self,
+        request: ChatCompletionRequest,
+        *,
+        request_id: str | None = None,
+        accepted_at: float | None = None,
+        keepalive_interval: float = 5.0,
+    ) -> AsyncIterator[str]:
+        request_id = request_id or uuid.uuid4().hex
+        self.state.record_request_event(request_id, "accepted", accepted_at)
+        self.state.record_request_event(request_id, "prefill_start")
         ctx = None
         finish_reason = "stop"
+        tokens = 0
         repetition_detector = _RepetitionDetector()
+        self._acquire_request()
         try:
-            ctx, responses = await asyncio.to_thread(self._begin_generation, request)
-            self.state.phase = ReadinessPhase.GENERATING
+            begin_task = asyncio.create_task(asyncio.to_thread(self._begin_generation, request))
+            while not begin_task.done():
+                done, _ = await asyncio.wait({begin_task}, timeout=keepalive_interval)
+                if done:
+                    break
+                if self.state.last_request is not None and "first_keepalive" not in self.state.last_request:
+                    self.state.record_request_event(request_id, "first_keepalive")
+                yield f": keep-alive request_id={request_id}\n\n"
+            ctx, responses = await begin_task
+            self.state.transition(
+                ReadinessPhase.GENERATING,
+                message="Generating tokens.",
+            )
             while True:
-                item = await asyncio.to_thread(_next_response, responses)
+                next_task = asyncio.create_task(asyncio.to_thread(_next_response, responses))
+                while not next_task.done():
+                    done, _ = await asyncio.wait({next_task}, timeout=keepalive_interval)
+                    if done:
+                        break
+                    if self.state.last_request is not None and "first_keepalive" not in self.state.last_request:
+                        self.state.record_request_event(request_id, "first_keepalive")
+                    yield f": keep-alive request_id={request_id}\n\n"
+                item = await next_task
                 if item is _DONE:
                     break
                 if repetition_detector.observe(getattr(item, "text", "")):
                     finish_reason = "tokenity_repetition"
                     logging.warning("Tokenity stopped generation after detecting repeated output.")
                     break
+                tokens += 1
                 finish_reason = getattr(item, "finish_reason", None) or finish_reason
                 payload = _stream_payload(item, self.model_id, finish_reason=None)
                 if payload is not None:
+                    if self.state.last_request is not None and "prefill_end" not in self.state.last_request:
+                        self.state.record_request_event(request_id, "prefill_end")
+                    if getattr(item, "text", "") and self.state.last_request is not None:
+                        if "first_content_token" not in self.state.last_request:
+                            self.state.record_request_event(request_id, "first_content_token")
+                        self.state.record_request_event(request_id, "last_token")
                     yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
             final = {
                 "id": f"chatcmpl-tokenity-{uuid.uuid4()}",
@@ -696,13 +940,30 @@ class TokenityDistributedRuntime:
                         "finish_reason": finish_reason,
                     }
                 ],
+                "usage": {
+                    "prompt_tokens": len(getattr(ctx, "prompt", [])),
+                    "completion_tokens": tokens,
+                    "total_tokens": len(getattr(ctx, "prompt", [])) + tokens,
+                    "prompt_tokens_details": {
+                        "cached_tokens": getattr(ctx, "prompt_cache_count", 0) or 0,
+                    },
+                },
             }
             yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
+            self.state.record_request_event(request_id, "completed")
+        except asyncio.CancelledError:
+            self.state.record_request_event(request_id, "cancelled")
+            raise
+        except Exception as exc:
+            self.state.record_request_event(request_id, "failed")
+            if self.state.last_request is not None:
+                self.state.last_request["error"] = str(exc)
+            raise
         finally:
             if ctx is not None:
                 ctx.stop()
-            self.state.phase = ReadinessPhase.READY
+            self._release_request()
 
     def _complete_sync(self, request: ChatCompletionRequest) -> _GenerationResult:
         ctx = None
@@ -736,9 +997,10 @@ class TokenityDistributedRuntime:
         finally:
             if ctx is not None:
                 ctx.stop()
-            self.state.phase = ReadinessPhase.READY
 
     def _begin_generation(self, request: ChatCompletionRequest) -> tuple[Any, Iterator[Any]]:
+        if self.execution_mode == "single":
+            return self._begin_single_generation(request)
         if self._symbols is None or self._generator is None:
             raise RuntimeError("Tokenity distributed runtime has not started.")
         if not self._is_serving_model():
@@ -751,7 +1013,15 @@ class TokenityDistributedRuntime:
                 "Native MTP request fallback: native_mtp_reason=seeded_sequential_path seed=%s",
                 request.seed,
             )
-        self.state.phase = ReadinessPhase.PREFILL_PENDING
+        self.state.transition(
+            ReadinessPhase.PREFILL_PENDING,
+            message="Prefilling the request prompt.",
+        )
+        return self._begin_distributed_generation(request)
+
+    def _begin_distributed_generation(self, request: ChatCompletionRequest) -> tuple[Any, Iterator[Any]]:
+        assert self._symbols is not None
+        assert self._generator is not None
         completion_request = self._symbols.CompletionRequest(
             "chat",
             "",
@@ -763,6 +1033,103 @@ class TokenityDistributedRuntime:
             completion_request,
             self._generation_args(request),
         )
+
+    def _begin_single_generation(self, request: ChatCompletionRequest) -> tuple[Any, Iterator[Any]]:
+        if self._single_model is None or self._single_tokenizer is None:
+            raise RuntimeError("Tokenity single-node runtime has not started.")
+        if not self.accepts_model(request.model):
+            raise ValueError(f"Model is not loaded: {request.model}")
+        if not self._single_generation_lock.acquire(timeout=600):
+            raise TimeoutError("Single-node generation queue did not become available before its deadline.")
+        try:
+            messages = [dict(message) for message in request.messages]
+            tokenizer = self._single_tokenizer
+            if getattr(tokenizer, "has_chat_template", False):
+                prompt = tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    **(request.chat_template_kwargs or {}),
+                )
+            else:
+                text = "\n".join(
+                    f"{message.get('role', 'user')}: {message.get('content', '')}"
+                    for message in messages
+                )
+                prompt = tokenizer.encode(text)
+
+            from mlx_lm import stream_generate  # type: ignore
+            from mlx_lm.sample_utils import make_logits_processors, make_sampler  # type: ignore
+
+            context = _SingleGenerationContext(list(prompt))
+            with self._single_contexts_lock:
+                self._single_contexts.add(context)
+
+            sampler = make_sampler(
+                temp=request.temperature if request.temperature is not None else 0.0,
+                top_p=request.top_p if request.top_p is not None else 1.0,
+                top_k=request.top_k if request.top_k is not None else 0,
+                min_p=request.min_p if request.min_p is not None else 0.0,
+            )
+            logits_processors = make_logits_processors(
+                repetition_penalty=(
+                    request.repetition_penalty if request.repetition_penalty not in {None, 0} else None
+                ),
+                repetition_context_size=20,
+                presence_penalty=(
+                    request.presence_penalty if request.presence_penalty not in {None, 0} else None
+                ),
+                presence_context_size=20,
+            )
+
+            def progress(_processed: int, _total: int) -> None:
+                if context.stopped or self._stop_event.is_set():
+                    raise RuntimeError("Generation was cancelled during prefill.")
+
+            generated = stream_generate(
+                model=self._single_model,
+                tokenizer=tokenizer,
+                prompt=prompt,
+                max_tokens=request.max_tokens or self.max_tokens,
+                sampler=sampler,
+                logits_processors=logits_processors,
+                prefill_step_size=self.prefill_step_size,
+                prompt_progress_callback=progress,
+            )
+
+            def responses() -> Iterator[Any]:
+                try:
+                    for item in generated:
+                        if context.stopped or self._stop_event.is_set():
+                            break
+                        yield SimpleNamespace(
+                            text=getattr(item, "text", ""),
+                            state="content",
+                            finish_reason=getattr(item, "finish_reason", None),
+                        )
+                finally:
+                    with self._single_contexts_lock:
+                        self._single_contexts.discard(context)
+                    self._single_generation_lock.release()
+
+            return context, responses()
+        except BaseException:
+            self._single_generation_lock.release()
+            raise
+
+    def _acquire_request(self) -> None:
+        with self._request_count_lock:
+            self._active_request_count += 1
+
+    def _release_request(self) -> None:
+        with self._request_count_lock:
+            self._active_request_count = max(0, self._active_request_count - 1)
+            remaining = self._active_request_count
+        if remaining == 0 and self.state.phase not in {ReadinessPhase.FAILED, ReadinessPhase.STOPPING}:
+            self.state.transition(
+                ReadinessPhase.READY,
+                message="Runtime is accepting generation requests.",
+            )
 
     def _generation_args(self, request: ChatCompletionRequest) -> Any:
         assert self._symbols is not None
@@ -851,18 +1218,105 @@ class TokenityDistributedRuntime:
         while self.state.phase not in {ReadinessPhase.FAILED, ReadinessPhase.STOPPING}:
             if getattr(self._provider, "model", None) is not None:
                 if self.state.phase == ReadinessPhase.LOADING_MODEL:
-                    self.state.phase = ReadinessPhase.READY
-                    self.state.progress = 1.0
-                    self.state.progress_current = self.state.progress_total
-                    self.state.message = "Runtime is accepting generation requests."
-                    _set_active_load_state(None)
+                    try:
+                        tokenizer = getattr(self._provider, "tokenizer", None)
+                        self.state.tokenizer_identity = (
+                            type(tokenizer).__name__ if tokenizer is not None else None
+                        )
+                        if self.is_rank0():
+                            self.state.transition(
+                                ReadinessPhase.COMPILING,
+                                message="Compiling and running an isolated one-token readiness warmup.",
+                            )
+                            self.state.progress = 0.96
+                            self._run_warmup_with_timeout(self._warmup_distributed)
+                        self.state.progress = 1.0
+                        self.state.progress_current = self.state.progress_total
+                        self.state.transition(
+                            ReadinessPhase.READY,
+                            message="Runtime is accepting generation requests.",
+                            evidence={
+                                "rank": self.state.rank,
+                                "world_size": self.state.world_size,
+                                "weights_materialized": True,
+                                "tokenizer_ready": tokenizer is not None,
+                                "generation_engine_ready": generation_thread is not None
+                                and generation_thread.is_alive(),
+                                "one_token_probe": self.is_rank0(),
+                                "warmup_cache_isolated": self.is_rank0(),
+                            },
+                        )
+                    except Exception as exc:
+                        self.state.transition(
+                            ReadinessPhase.FAILED,
+                            message=f"Readiness warmup failed: {exc}",
+                            error={"stage": "compiling_warming", "message": str(exc)},
+                        )
+                    finally:
+                        _set_active_load_state(None)
                 return
             if generation_thread is not None and not generation_thread.is_alive():
-                self.state.phase = ReadinessPhase.FAILED
-                self.state.message = "MLX-LM generation thread exited before the model finished loading."
+                message = "MLX-LM generation thread exited before the model finished loading."
+                self.state.transition(
+                    ReadinessPhase.FAILED,
+                    message=message,
+                    error={"stage": "materializing_weights", "message": message},
+                )
                 _set_active_load_state(None)
                 return
             time.sleep(0.5)
+
+    def _warmup_distributed(self) -> None:
+        request = ChatCompletionRequest(
+            model=self.model_id,
+            messages=[{"role": "user", "content": "Reply with OK."}],
+            max_tokens=1,
+            temperature=0.0,
+            chat_template_kwargs={"enable_thinking": False},
+        )
+        ctx, responses = self._begin_distributed_generation(request)
+        try:
+            next(responses, None)
+        finally:
+            ctx.stop()
+            if self._generator is not None and self._symbols is not None:
+                # The warmup uses the production engine but replaces its cache
+                # before READY so no warmup KV/prompt entry is user-visible.
+                self._generator.prompt_cache = self._symbols.LRUPromptCache(self.prompt_cache_size)
+
+    def memory_metrics(self) -> dict[str, object]:
+        sampled_at = time.time()
+        resident = _process_resident_bytes(os.getpid())
+        metrics: dict[str, object] = {
+            "process_resident_bytes": resident,
+            "process_phys_footprint_bytes": _process_phys_footprint_bytes(os.getpid()),
+            "mlx_active_bytes": None,
+            "mlx_peak_bytes": None,
+            "mlx_cache_bytes": None,
+            "model_weights_estimated_bytes": _directory_size(self.model),
+            "model_resident_observed_bytes": None,
+            "kv_cache_bytes": None,
+            "prompt_cache_bytes": None,
+            "active_request_count": self._active_request_count,
+            "sampled_at": sampled_at,
+            "stale": False,
+        }
+        try:
+            import mlx.core as mx  # type: ignore
+
+            metrics["mlx_active_bytes"] = int(mx.get_active_memory())
+            metrics["mlx_peak_bytes"] = int(mx.get_peak_memory())
+            metrics["mlx_cache_bytes"] = int(mx.get_cache_memory())
+            metrics["model_resident_observed_bytes"] = metrics["mlx_active_bytes"]
+        except Exception:
+            pass
+        prompt_cache = getattr(self._generator, "prompt_cache", None)
+        prompt_cache_bytes = getattr(prompt_cache, "nbytes", None)
+        if isinstance(prompt_cache_bytes, int):
+            metrics["prompt_cache_bytes"] = prompt_cache_bytes
+        self.state.memory = metrics
+        self.state.publish()
+        return metrics
 
 
 def create_app(
@@ -894,7 +1348,15 @@ def create_app(
 
     @app.get("/v1/readiness")
     def readiness() -> dict[str, object]:
+        if runtime is not None:
+            runtime.memory_metrics()
         return state.to_dict()
+
+    @app.get("/v1/tokenity/metrics")
+    def metrics() -> dict[str, object]:
+        if runtime is None:
+            return {"memory": None, "readiness": state.to_dict()}
+        return {"memory": runtime.memory_metrics(), "readiness": state.to_dict()}
 
     @app.get("/")
     @app.get("/v1/tokenity/info")
@@ -952,6 +1414,9 @@ def create_app(
 
     @app.post("/v1/chat/completions")
     async def chat(request: ChatCompletionRequest):
+        accepted_at = time.time()
+        request_id = uuid.uuid4().hex
+        state.record_request_event(request_id, "accepted", accepted_at)
         if state.phase == ReadinessPhase.FAILED:
             raise HTTPException(status_code=503, detail=state.message or "runtime failed")
         if runtime is None:
@@ -959,10 +1424,25 @@ def create_app(
                 return StreamingResponse(_stream_skeleton(state), media_type="text/event-stream")
             return _skeleton_completion(model=request.model)
         if request.stream:
-            return StreamingResponse(runtime.stream(request), media_type="text/event-stream")
+            return _TimelineStreamingResponse(
+                runtime.stream(request, request_id=request_id, accepted_at=accepted_at),
+                state=state,
+                request_id=request_id,
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache, no-transform",
+                    "X-Accel-Buffering": "no",
+                    "X-Tokenity-Request-ID": request_id,
+                },
+            )
         try:
-            return await asyncio.to_thread(runtime.complete, request)
+            response = await asyncio.to_thread(runtime.complete, request)
+            state.record_request_event(request_id, "completed")
+            return response
         except Exception as exc:
+            state.record_request_event(request_id, "failed")
+            if state.last_request is not None:
+                state.last_request["error"] = str(exc)
             logging.exception("Tokenity generation failed")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -1061,6 +1541,66 @@ def _next_response(iterator: Iterator[Any]) -> Any:
         return _DONE
 
 
+def _process_resident_bytes(pid: int) -> int | None:
+    try:
+        completed = subprocess.run(
+            ["/bin/ps", "-o", "rss=", "-p", str(pid)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return int(completed.stdout.strip()) * 1024
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _process_phys_footprint_bytes(pid: int) -> int | None:
+    if sys.platform != "darwin":
+        return None
+
+    class RUsageInfoV0(ctypes.Structure):
+        _fields_ = [
+            ("uuid", ctypes.c_uint8 * 16),
+            ("user_time", ctypes.c_uint64),
+            ("system_time", ctypes.c_uint64),
+            ("pkg_idle_wakeups", ctypes.c_uint64),
+            ("interrupt_wakeups", ctypes.c_uint64),
+            ("pageins", ctypes.c_uint64),
+            ("wired_size", ctypes.c_uint64),
+            ("resident_size", ctypes.c_uint64),
+            ("phys_footprint", ctypes.c_uint64),
+            ("proc_start_abstime", ctypes.c_uint64),
+            ("proc_exit_abstime", ctypes.c_uint64),
+        ]
+
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+        proc_pid_rusage = libproc.proc_pid_rusage
+        proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+        proc_pid_rusage.restype = ctypes.c_int
+        usage = RUsageInfoV0()
+        if proc_pid_rusage(pid, 0, ctypes.byref(usage)) != 0:
+            return None
+        return int(usage.phys_footprint)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _directory_size(path: str) -> int | None:
+    root = Path(path)
+    if not root.is_dir():
+        return None
+    total = 0
+    try:
+        for item in root.iterdir():
+            if item.is_file() and item.suffix in {".safetensors", ".gguf"}:
+                total += item.stat().st_size
+    except OSError:
+        return None
+    return total or None
+
+
 def serve(
     *,
     model: str,
@@ -1075,10 +1615,21 @@ def serve(
     decode_concurrency: int = 1,
     prompt_concurrency: int = 1,
     native_mtp: NativeMTPConfig | dict[str, Any] | None = None,
+    execution_mode: str = "distributed",
+    warmup_timeout: float = 120.0,
 ) -> None:
     import uvicorn
 
-    state = ReadinessState(model=model)
+    state = ReadinessState(
+        model=model,
+        instance_id=os.environ.get("TOKENITY_INSTANCE_ID"),
+        operation_id=os.environ.get("TOKENITY_OPERATION_ID"),
+        execution_mode=execution_mode,
+        cluster_id=os.environ.get("TOKENITY_CLUSTER_ID"),
+        connection_mode=os.environ.get("TOKENITY_CONNECTION_MODE"),
+        model_revision=os.environ.get("TOKENITY_MODEL_REVISION"),
+        status_path=os.environ.get("TOKENITY_STATUS_PATH"),
+    )
     runtime: TokenityDistributedRuntime | None = None
     try:
         runtime = TokenityDistributedRuntime(
@@ -1092,12 +1643,17 @@ def serve(
             decode_concurrency=decode_concurrency,
             prompt_concurrency=prompt_concurrency,
             native_mtp=native_mtp,
+            execution_mode=execution_mode,
+            warmup_timeout=warmup_timeout,
         )
         runtime.start()
     except Exception as exc:  # pragma: no cover - depends on target MLX runtime
         logging.exception("Tokenity distributed runtime failed during startup")
-        state.phase = ReadinessPhase.FAILED
-        state.message = f"Tokenity distributed runtime failed: {exc}"
+        state.transition(
+            ReadinessPhase.FAILED,
+            message=f"Tokenity runtime failed: {exc}",
+            error={"stage": state.lifecycle_state, "message": str(exc)},
+        )
         _set_active_load_state(None)
         if require_mlx or isinstance(exc, NativeMTPStartupError):
             raise

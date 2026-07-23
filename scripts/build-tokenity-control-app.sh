@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_DIR="$ROOT/apps/TokenityControl"
 
 CONFIGURATION="${TOKENITY_BUILD_CONFIGURATION:-debug}"
-BUNDLE_IDENTIFIER="${TOKENITY_BUNDLE_IDENTIFIER:-ai.tokenity.control.dev}"
+BUNDLE_IDENTIFIER="${TOKENITY_BUNDLE_IDENTIFIER:-ai.tokenity.control.stable}"
 BUNDLE_NAME="${TOKENITY_BUNDLE_NAME:-TokenityControl}"
 BUNDLE_VERSION="${TOKENITY_BUNDLE_VERSION:-1}"
 BUNDLE_SHORT_VERSION="${TOKENITY_BUNDLE_SHORT_VERSION:-0.1.0}"
@@ -15,7 +15,7 @@ swift build -c "$CONFIGURATION" >&2
 
 BIN_DIR="$(swift build -c "$CONFIGURATION" --show-bin-path)"
 EXECUTABLE="$BIN_DIR/TokenityControl"
-APP_BUNDLE="${TOKENITY_APP_BUNDLE_PATH:-$BIN_DIR/TokenityControl.app}"
+APP_BUNDLE="${TOKENITY_APP_BUNDLE_PATH:-$BIN_DIR/TokenityControl-Stable.app}"
 ICON_SOURCE="$APP_DIR/Resources/AppIcon.icns"
 
 if [[ ! -x "$EXECUTABLE" ]]; then

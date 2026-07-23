@@ -124,6 +124,77 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertTrue(store.launchPreview.summary.contains { $0.title == "Selected Macs" && $0.value == "3" })
     }
 
+    func testReaddedOriginalPrimaryKeepsCurrentCoordinatorAsRankZero() async throws {
+        var startHost: String?
+        var rankNodeIDs: [String] = []
+        let store = TokenityStore(dataTransport: { request in
+            if request.url?.path == "/v1/node/start-distributed-openai" {
+                startHost = request.url?.host
+                let body = try XCTUnwrap(request.httpBody)
+                let object = try XCTUnwrap(
+                    JSONSerialization.jsonObject(with: body) as? [String: Any]
+                )
+                let nodes = try XCTUnwrap(object["nodes"] as? [[String: Any]])
+                rankNodeIDs = nodes.compactMap { $0["id"] as? String }
+            }
+            return try await Self.successfulModelTransport(request)
+        })
+        store.connectionMode = .ring
+        let mango = try XCTUnwrap(store.nodes.first { $0.id == "mac-a" })
+
+        store.toggleNodeSelection(mango)
+        XCTAssertEqual(store.coordinatorID, "mac-b")
+        store.toggleNodeSelection(mango)
+        XCTAssertEqual(store.coordinatorID, "mac-b")
+
+        store.createCluster()
+        let model = try XCTUnwrap(store.modelLibraryRows.first)
+        await store.loadModel(model)
+
+        XCTAssertEqual(startHost, "192.168.5.75")
+        XCTAssertEqual(rankNodeIDs, ["mac-b", "mac-a"])
+        XCTAssertEqual(store.loadedModelName, model.id)
+    }
+
+    func testOfflineSelectedNodesBlockClusterReadinessAndDoNotLookRuntimeReady() throws {
+        let store = TokenityStore()
+        store.connectionMode = .ring
+
+        let mango = try XCTUnwrap(store.nodes.first { $0.id == "mac-a" })
+        XCTAssertFalse(mango.isOnline)
+        XCTAssertEqual(mango.displayRuntime, "Offline")
+        XCTAssertEqual(mango.memoryPercentText, "Unavailable")
+        XCTAssertEqual(mango.memoryUsageText, "Node offline")
+        XCTAssertTrue(store.launchPreview.readinessIssues.contains { $0.contains("Mango Node Agent is offline") })
+        XCTAssertTrue(store.launchPreview.readinessIssues.contains { $0.contains("Kiwi Node Agent is offline") })
+        XCTAssertTrue(store.launchPreview.networkPlan.allSatisfy { $0.readiness == "Needs attention" })
+    }
+
+    func testBackgroundRefreshPopulatesUnknownMemoryForAnOnlineNode() async throws {
+        let store = TokenityStore(dataTransport: { request in
+            guard request.url?.path == "/v1/node/info" else {
+                return try await Self.successfulModelTransport(request)
+            }
+            return Self.response(
+                for: request,
+                payload: TokenityTestFixtures.basicNodeInfoPayload(for: request)
+            )
+        })
+        for index in store.nodes.indices where store.selectedNodeIDs.contains(store.nodes[index].id) {
+            store.nodes[index].isOnline = true
+            store.nodes[index].lastAgentResponseAt = Date().addingTimeInterval(-3)
+            store.nodes[index].memory = .unknown
+        }
+
+        await store.refreshSelectedNodeStatus(showsActivity: false)
+
+        for node in store.selectedNodes {
+            XCTAssertEqual(node.memory.totalBytes, 549_755_813_888)
+            XCTAssertEqual(node.memory.inUseBytes, 8_589_934_592)
+            XCTAssertNotEqual(node.memoryPercentText, "Memory unknown")
+        }
+    }
+
     func testModelLoadRequiresCreatedCluster() async {
         let store = TokenityStore(dataTransport: Self.successfulModelTransport)
         store.connectionMode = .ring
@@ -146,6 +217,7 @@ final class TokenityStoreTests: XCTestCase {
             await store.stopModel(first)
         }
         XCTAssertNil(store.loadedModelName)
+        XCTAssertEqual(store.phase, .running)
     }
 
     func testModelLoadOmitsOffForLegacyAgentAndAutoFallsBack() async throws {
@@ -164,7 +236,7 @@ final class TokenityStoreTests: XCTestCase {
                         httpVersion: nil,
                         headerFields: nil
                     )!
-                    let payload = #"{"detail":[{"msg":"Extra inputs are not permitted"}]}"#
+                    let payload = #"{"detail":[{"loc":["body","native_mtp"],"msg":"Extra inputs are not permitted"}]}"#
                     return (Data(payload.utf8), response)
                 }
             }
@@ -191,6 +263,162 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertTrue(store.logs.contains { $0.contains("Auto is falling back") })
     }
 
+    func testLegacyInstanceContractFallsBackAndChatStillStreams() async throws {
+        var startBodies: [[String: Any]] = []
+        var streamedChatURL: URL?
+        let store = TokenityStore(
+            dataTransport: { request in
+                if request.url?.path == "/v1/node/start-distributed-openai" {
+                    let body = try XCTUnwrap(
+                        JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any]
+                    )
+                    startBodies.append(body)
+                    if body["instance_id"] != nil || body["operation_id"] != nil {
+                        return Self.response(
+                            for: request,
+                            payload: #"{"detail":[{"loc":["body","instance_id"],"msg":"Extra inputs are not permitted"},{"loc":["body","operation_id"],"msg":"Extra inputs are not permitted"}]}"#,
+                            statusCode: 422
+                        )
+                    }
+                }
+                return try await Self.successfulModelTransport(request)
+            },
+            lineStreamTransport: { request in
+                streamedChatURL = request.url
+                return AsyncThrowingStream { continuation in
+                    continuation.yield("data: {\"choices\":[{\"delta\":{\"content\":\"Legacy chat works\"},\"finish_reason\":null}]}")
+                    continuation.yield("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}")
+                    continuation.yield("data: [DONE]")
+                    continuation.finish()
+                }
+            }
+        )
+        store.connectionMode = .ring
+        store.createCluster()
+        let model = try XCTUnwrap(store.modelLibraryRows.first)
+
+        await store.loadModel(model)
+
+        XCTAssertEqual(startBodies.count, 2)
+        XCTAssertNotNil(startBodies[0]["instance_id"])
+        XCTAssertNotNil(startBodies[0]["operation_id"])
+        XCTAssertNil(startBodies[1]["instance_id"])
+        XCTAssertNil(startBodies[1]["operation_id"])
+        XCTAssertEqual(store.loadedModelName, model.id)
+        XCTAssertNil(store.activeModelInstanceID)
+        XCTAssertTrue(store.logs.contains { $0.contains("legacy model start contract") })
+
+        store.chatInput = "Verify legacy chat routing."
+        await store.sendChatMessage()
+
+        XCTAssertEqual(streamedChatURL?.host, "192.168.5.23")
+        XCTAssertEqual(streamedChatURL?.port, 8_000)
+        XCTAssertEqual(store.chatMessages.last?.content, "Legacy chat works")
+        XCTAssertEqual(store.chatMessages.last?.generationState, .completed)
+    }
+
+    func testLegacyModelSwitchPollingDoesNotDisableChatAfterLoad() async throws {
+        var stopAllCount = 0
+        var blocksSecondCleanup = false
+        var secondCleanupContinuation: CheckedContinuation<Void, Never>?
+        var servedModel = "Qwen3.5-122B-A10B-4bit"
+
+        let store = TokenityStore(
+            dataTransport: { request in
+                let path = request.url?.path ?? ""
+                if path == "/v1/node/info" {
+                    var payload = TokenityTestFixtures.basicNodeInfoPayload(for: request)
+                    if blocksSecondCleanup {
+                        payload = payload.replacingOccurrences(
+                            of: #""process_roles":[]"#,
+                            with: #""process_roles":[{"role":"distributed-openai","state":"stopped"}]"#
+                        )
+                    }
+                    return Self.response(for: request, payload: payload)
+                }
+                if path == "/v1/node/stop-all" {
+                    stopAllCount += 1
+                    if stopAllCount == 3 {
+                        blocksSecondCleanup = true
+                        await withCheckedContinuation { continuation in
+                            secondCleanupContinuation = continuation
+                        }
+                    }
+                    return Self.response(for: request, payload: #"{}"#)
+                }
+                if path == "/v1/node/start-distributed-openai" {
+                    let body = try XCTUnwrap(
+                        JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any]
+                    )
+                    if body["instance_id"] != nil || body["operation_id"] != nil {
+                        return Self.response(
+                            for: request,
+                            payload: #"{"detail":[{"loc":["body","instance_id"],"msg":"Extra inputs are not permitted"},{"loc":["body","operation_id"],"msg":"Extra inputs are not permitted"}]}"#,
+                            statusCode: 422
+                        )
+                    }
+                    if let modelPath = body["model"] as? String {
+                        servedModel = URL(fileURLWithPath: modelPath).lastPathComponent
+                    }
+                    return Self.response(for: request, payload: #"{"status":{"state":"running"}}"#)
+                }
+                if path == "/v1/models" {
+                    return Self.response(
+                        for: request,
+                        payload: "{\"data\":[{\"id\":\"\(servedModel)\"}]}"
+                    )
+                }
+                return try await Self.successfulModelTransport(request)
+            },
+            lineStreamTransport: { _ in
+                AsyncThrowingStream { continuation in
+                    continuation.yield("data: {\"choices\":[{\"delta\":{\"content\":\"Switched model chat works\"},\"finish_reason\":null}]}")
+                    continuation.yield("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}")
+                    continuation.yield("data: [DONE]")
+                    continuation.finish()
+                }
+            }
+        )
+        store.connectionMode = .ring
+        store.createCluster()
+        let first = try XCTUnwrap(
+            store.modelLibraryRows.first { $0.id == "Qwen3.5-122B-A10B-4bit" }
+        )
+        await store.loadModel(first)
+        XCTAssertTrue(store.isChatReady)
+
+        for index in store.nodes.indices where store.selectedNodeIDs.contains(store.nodes[index].id) {
+            store.nodes[index].models.append(
+                ModelEntry(id: "SecondModel", path: "/Users/Shared/TokenityModels/SecondModel")
+            )
+        }
+        let second = try XCTUnwrap(store.modelLibraryRows.first { $0.id == "SecondModel" })
+        let switchTask = Task { await store.loadModel(second) }
+        for _ in 0..<200 where !blocksSecondCleanup {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(blocksSecondCleanup)
+
+        await store.refreshSelectedNodeStatus(showsActivity: false)
+
+        XCTAssertEqual(store.phase, .running)
+        XCTAssertFalse(store.logs.contains { $0.contains("stopped outside Tokenity") })
+        let cleanupContinuation = try XCTUnwrap(secondCleanupContinuation)
+        secondCleanupContinuation = nil
+        cleanupContinuation.resume()
+        await switchTask.value
+
+        XCTAssertEqual(store.loadedModelName, second.id)
+        XCTAssertEqual(store.phase, .running)
+        XCTAssertTrue(store.isChatReady)
+
+        store.chatInput = "Verify chat after switching models."
+        await store.sendChatMessage()
+
+        XCTAssertEqual(store.chatMessages.last?.content, "Switched model chat works")
+        XCTAssertEqual(store.chatMessages.last?.generationState, .completed)
+    }
+
     func testNativeMTPRequiredDoesNotFallBackForLegacyAgent() async throws {
         var startBodies: [[String: Any]] = []
         let store = TokenityStore(dataTransport: { request in
@@ -206,7 +434,7 @@ final class TokenityStoreTests: XCTestCase {
                     httpVersion: nil,
                     headerFields: nil
                 )!
-                let payload = #"{"detail":[{"msg":"Extra inputs are not permitted"}]}"#
+                let payload = #"{"detail":[{"loc":["body","native_mtp"],"msg":"Extra inputs are not permitted"}]}"#
                 return (Data(payload.utf8), response)
             }
             return try await Self.successfulModelTransport(request)
@@ -289,6 +517,12 @@ final class TokenityStoreTests: XCTestCase {
 
     func testModelLoadShowsIncompatibleAgentMessage() async {
         let store = TokenityStore(dataTransport: { request in
+            if request.url?.path == "/v1/node/info" {
+                return Self.response(
+                    for: request,
+                    payload: TokenityTestFixtures.basicNodeInfoPayload(for: request)
+                )
+            }
             let response = HTTPURLResponse(
                 url: request.url ?? URL(string: "http://127.0.0.1")!,
                 statusCode: 404,
@@ -309,6 +543,55 @@ final class TokenityStoreTests: XCTestCase {
 
         XCTAssertNil(store.loadedModelName)
         XCTAssertTrue(store.modelLoadMessage.contains("older Node Agent"))
+    }
+
+    func testModelStaysLoadingUntilInferenceProbeCompletes() async throws {
+        let probeStarted = expectation(description: "inference probe started")
+        var probeRequest: URLRequest?
+        let store = TokenityStore(dataTransport: { request in
+            if request.url?.path == "/v1/chat/completions" {
+                probeRequest = request
+                probeStarted.fulfill()
+                try await Task.sleep(for: .milliseconds(200))
+            }
+            return try await Self.successfulModelTransport(request)
+        })
+        store.connectionMode = .ring
+        store.createCluster()
+        let model = try XCTUnwrap(store.modelLibraryRows.first)
+
+        let loadTask = Task { await store.loadModel(model) }
+        await fulfillment(of: [probeStarted], timeout: 2)
+
+        XCTAssertEqual(store.modelLoadStates[model.id], .loading)
+        XCTAssertNil(store.loadedModelName)
+        XCTAssertEqual(store.modelLoadProgress, 0.98)
+        XCTAssertTrue(store.modelLoadMessage.contains("Verifying inference"))
+        let probeBody = try XCTUnwrap(probeRequest?.httpBody)
+        let probeObject = try XCTUnwrap(JSONSerialization.jsonObject(with: probeBody) as? [String: Any])
+        XCTAssertEqual(probeObject["stream"] as? Bool, true)
+
+        let controllerIndex = try XCTUnwrap(store.nodes.firstIndex { $0.id == store.coordinatorID })
+        store.nodes[controllerIndex].roles = [
+            ProcessRole(
+                role: "distributed-openai",
+                state: "running",
+                pid: 4_242,
+                command: [
+                    "/runtime/python", "-m", "tokenity", "distributed-openai", "serve",
+                    "--model", model.representativePath,
+                    "--api-identifier", model.id,
+                ]
+            )
+        ]
+        await store.refreshSelectedNodeStatus(showsActivity: false)
+        XCTAssertEqual(store.modelLoadStates[model.id], .loading)
+        XCTAssertNil(store.loadedModelName)
+
+        await loadTask.value
+        XCTAssertEqual(store.modelLoadStates[model.id], .loaded)
+        XCTAssertEqual(store.loadedModelName, model.id)
+        XCTAssertEqual(store.modelLoadProgress, 1)
     }
 
     func testModelLoadStopsWhenBackendExits() async {
@@ -347,7 +630,7 @@ final class TokenityStoreTests: XCTestCase {
         await store.loadModel(first)
 
         XCTAssertNil(store.loadedModelName)
-        XCTAssertEqual(store.modelLoadStates[first.id], .notLoaded)
+        XCTAssertEqual(store.modelLoadStates[first.id], .failed)
         XCTAssertTrue(store.modelLoadMessage.contains("qwen3_5_moe"))
     }
 
@@ -387,7 +670,7 @@ final class TokenityStoreTests: XCTestCase {
         await store.loadModel(first)
 
         XCTAssertNil(store.loadedModelName)
-        XCTAssertEqual(store.modelLoadStates[first.id], .notLoaded)
+        XCTAssertEqual(store.modelLoadStates[first.id], .failed)
         XCTAssertTrue(store.modelLoadMessage.contains("Changing queue pair"))
     }
 
@@ -397,7 +680,9 @@ final class TokenityStoreTests: XCTestCase {
         let store = TokenityStore(dataTransport: { request in
             let path = request.url?.path ?? ""
             let payload: String
-            if path == "/v1/node/stop-all" {
+            if path == "/v1/node/info" {
+                payload = TokenityTestFixtures.basicNodeInfoPayload(for: request)
+            } else if path == "/v1/node/stop-all" {
                 stopAllRequests += 1
                 payload = #"{"statuses":[]}"#
             } else if path.contains("/v1/node/start") {
@@ -430,6 +715,7 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertFalse(store.isModelLoading)
         XCTAssertNil(store.loadedModelName)
         XCTAssertEqual(store.modelLoadMessage, "No model loaded")
+        XCTAssertEqual(store.phase, .running)
         XCTAssertGreaterThanOrEqual(stopAllRequests, store.selectedNodes.count * 2)
     }
 
@@ -471,6 +757,7 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertFalse(store.isModelUnloading)
         XCTAssertEqual(store.modelLoadStates[first.id], .notLoaded)
         XCTAssertEqual(store.modelLoadMessage, "No model loaded")
+        XCTAssertEqual(store.phase, .running)
     }
 
     func testMemoryStatsDecodePhysicalMemoryUsage() throws {
@@ -487,6 +774,44 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertEqual(memory.inUseRatio, 0.0137)
         XCTAssertEqual(memory.reclaimableBytes, 405_337_620_480)
         XCTAssertEqual(memory.pressureAvailableRatio, 0.99)
+    }
+
+    func testNodeMemoryLabelsStaleRuntimeMetricsInsteadOfPresentingThemAsCurrent() {
+        var node = TokenityNode.samples[0]
+        node.isOnline = true
+        node.memory = MemoryStats(
+            totalBytes: 16_000,
+            usedBytes: 8_000,
+            freeBytes: 8_000,
+            usedRatio: 0.5,
+            physicalUsedBytes: 8_000,
+            physicalUsedRatio: 0.5,
+            inUseBytes: 7_000,
+            inUseRatio: 0.4375,
+            reclaimableBytes: 1_000,
+            wiredBytes: nil,
+            compressedBytes: nil,
+            anonymousBytes: nil,
+            fileBackedBytes: nil,
+            pressureAvailableRatio: nil
+        )
+        node.runtimeMemory = RuntimeMemoryStats(
+            processResidentBytes: 5_000,
+            processPhysFootprintBytes: nil,
+            mlxActiveBytes: 4_000,
+            mlxPeakBytes: 4_500,
+            mlxCacheBytes: 500,
+            modelWeightsEstimatedBytes: 3_000,
+            modelResidentObservedBytes: 4_000,
+            kvCacheBytes: nil,
+            promptCacheBytes: nil,
+            activeRequestCount: 0,
+            sampledAt: 1,
+            stale: true
+        )
+
+        XCTAssertTrue(node.memoryUsageText.contains("runtime metrics stale"))
+        XCTAssertFalse(node.memoryUsageText.contains("MLX/model"))
     }
 
     func testApplicationTerminationCleanupStopsAllSelectedNodes() async {
@@ -551,10 +876,43 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertFalse(store.chatMessages.last?.thinking.isEmpty ?? true)
         XCTAssertNotNil(store.chatMetrics.firstTokenSeconds)
         XCTAssertNotNil(store.chatMetrics.totalSeconds)
+        XCTAssertEqual(store.chatMetrics.outputTokens, 4)
+    }
+
+    func testLiveChatStreamUsesExactCompletionTokenCountFromFinalUsage() async {
+        let suiteName = "TokenityStoreTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = TokenityStore(
+            dataTransport: Self.successfulModelTransport,
+            lineStreamTransport: { _ in
+                AsyncThrowingStream { continuation in
+                    continuation.yield("data: {\"choices\":[{\"delta\":{\"content\":\"A short answer.\"},\"finish_reason\":null}]}")
+                    continuation.yield("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":17,\"total_tokens\":26}}")
+                    continuation.yield("data: [DONE]")
+                    continuation.finish()
+                }
+            },
+            userDefaults: defaults
+        )
+        guard let first = store.modelLibraryRows.first else {
+            XCTFail("Expected sample model")
+            return
+        }
+        store.connectionMode = .ring
+        store.createCluster()
+        await store.loadModel(first)
+        store.chatInput = "Count the output."
+
+        await store.sendChatMessage()
+
+        XCTAssertEqual(store.chatMessages.last?.content, "A short answer.")
+        XCTAssertEqual(store.chatMetrics.outputTokens, 17)
     }
 
     func testChatFallsBackToNonStreamingWhenStreamFailsBeforeFirstToken() async throws {
         var fallbackRequest: URLRequest?
+        var streamingAttempts = 0
         let suiteName = "TokenityStoreTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -566,7 +924,8 @@ final class TokenityStoreTests: XCTestCase {
                 return try await Self.successfulModelTransport(request)
             },
             lineStreamTransport: { _ in
-                AsyncThrowingStream { continuation in
+                streamingAttempts += 1
+                return AsyncThrowingStream { continuation in
                     continuation.finish(throwing: URLError(.networkConnectionLost))
                 }
             },
@@ -590,6 +949,245 @@ final class TokenityStoreTests: XCTestCase {
         let body = try XCTUnwrap(fallbackRequest?.httpBody)
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
         XCTAssertEqual(object["stream"] as? Bool, false)
+        XCTAssertEqual(streamingAttempts, 2)
+    }
+
+    func testFirstChatRetriesStreamingBeforeUsingNonStreamingFallback() async throws {
+        var streamingAttempts = 0
+        var nonStreamingRequests = 0
+        var retryContinuation: AsyncThrowingStream<String, Error>.Continuation?
+        let suiteName = "TokenityStoreTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = TokenityStore(
+            dataTransport: { request in
+                if request.url?.path == "/v1/chat/completions",
+                   let body = request.httpBody,
+                   let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+                   object["stream"] as? Bool == false {
+                    nonStreamingRequests += 1
+                }
+                return try await Self.successfulModelTransport(request)
+            },
+            lineStreamTransport: { _ in
+                streamingAttempts += 1
+                if streamingAttempts == 1 {
+                    return AsyncThrowingStream { continuation in
+                        continuation.finish(throwing: URLError(.networkConnectionLost))
+                    }
+                }
+                return AsyncThrowingStream { continuation in
+                    retryContinuation = continuation
+                }
+            },
+            userDefaults: defaults
+        )
+        store.connectionMode = .ring
+        store.createCluster()
+        let model = try XCTUnwrap(store.modelLibraryRows.first)
+        await store.loadModel(model)
+        store.chatInput = "Keep this response streaming."
+
+        let chatTask = Task { await store.sendChatMessage() }
+        for _ in 0..<200 where retryContinuation == nil {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let continuation = try XCTUnwrap(retryContinuation)
+        continuation.yield("data: {\"choices\":[{\"delta\":{\"content\":\"First part. \"},\"finish_reason\":null}]}")
+        for _ in 0..<100 where store.chatMessages.last?.content != "First part. " {
+            await Task.yield()
+        }
+
+        XCTAssertTrue(store.isChatRunning)
+        XCTAssertEqual(store.chatMessages.last?.content, "First part. ")
+        XCTAssertEqual(nonStreamingRequests, 0)
+
+        continuation.yield("data: {\"choices\":[{\"delta\":{\"content\":\"Second part.\"},\"finish_reason\":null}]}")
+        continuation.yield("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}")
+        continuation.yield("data: [DONE]")
+        continuation.finish()
+        await chatTask.value
+
+        XCTAssertEqual(streamingAttempts, 2)
+        XCTAssertEqual(nonStreamingRequests, 0)
+        XCTAssertEqual(store.chatMessages.last?.content, "First part. Second part.")
+    }
+
+    func testMalformedSSEDoesNotRetryOrFallBackToNonStreaming() async throws {
+        var streamingAttempts = 0
+        var nonStreamingRequests = 0
+        let store = TokenityStore(
+            dataTransport: { request in
+                if request.url?.path == "/v1/chat/completions",
+                   let body = request.httpBody,
+                   let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+                   object["stream"] as? Bool == false {
+                    nonStreamingRequests += 1
+                }
+                return try await Self.successfulModelTransport(request)
+            },
+            lineStreamTransport: { _ in
+                streamingAttempts += 1
+                return AsyncThrowingStream { continuation in
+                    continuation.yield("data: {not-valid-json")
+                    continuation.finish()
+                }
+            }
+        )
+        store.connectionMode = .ring
+        store.createCluster()
+        let model = try XCTUnwrap(store.modelLibraryRows.first)
+        await store.loadModel(model)
+        store.chatInput = "Do not hide this protocol error."
+
+        await store.sendChatMessage()
+
+        XCTAssertEqual(streamingAttempts, 1)
+        XCTAssertEqual(nonStreamingRequests, 0)
+        XCTAssertEqual(store.chatMessages.last?.generationState, .failed)
+        XCTAssertFalse(store.chatMessages.last?.statusMessage?.isEmpty ?? true)
+    }
+
+    func testTwoManagedModelsCoexistAndStoppingOneLeavesSiblingRoutable() async throws {
+        var stopInstancePaths: [String] = []
+        var stopAllCount = 0
+        let store = TokenityStore(
+            dataTransport: { request in
+                let path = request.url?.path ?? ""
+                if path == "/v1/node/start-distributed-openai" {
+                    let body = try XCTUnwrap(request.httpBody)
+                    let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+                    let modelPath = try XCTUnwrap(object["model"] as? String)
+                    let isSecond = modelPath.contains("SecondModel")
+                    let instanceID = isSecond ? "instance-second" : "instance-first"
+                    let port = isSecond ? 18_001 : 18_000
+                    return Self.response(
+                        for: request,
+                        payload: "{\"instance_id\":\"\(instanceID)\",\"operation_id\":\"operation-test\",\"api_base_url\":\"http://192.168.5.23:\(port)/v1\"}"
+                    )
+                }
+                if path.hasPrefix("/v1/node/instances/") && path.hasSuffix("/quorum") {
+                    let instanceID = path.split(separator: "/").dropLast().last.map(String.init) ?? ""
+                    return Self.response(
+                        for: request,
+                        payload: "{\"instance_id\":\"\(instanceID)\",\"ready\":true,\"issues\":[],\"rank_quorum\":\"1/1\",\"ranks\":[]}"
+                    )
+                }
+                if path.hasPrefix("/v1/node/instances/") && path.hasSuffix("/stop") {
+                    stopInstancePaths.append(path)
+                    return Self.response(for: request, payload: #"{"instance":{"state":"stopped"}}"#)
+                }
+                if path == "/v1/node/stop-all" {
+                    stopAllCount += 1
+                    return Self.response(for: request, payload: #"{}"#)
+                }
+                if path == "/v1/models" {
+                    let model = request.url?.port == 18_001 ? "SecondModel" : "Qwen3.5-122B-A10B-4bit"
+                    return Self.response(for: request, payload: "{\"data\":[{\"id\":\"\(model)\"}]}")
+                }
+                if path == "/v1/readiness" {
+                    return Self.response(for: request, payload: #"{"phase":"ready"}"#)
+                }
+                if path == "/v1/chat/completions" {
+                    return try await Self.successfulModelTransport(request)
+                }
+                return try await Self.successfulModelTransport(request)
+            },
+            lineStreamTransport: { request in
+                XCTAssertEqual(request.url?.port, 9_100, "Managed chat must use the stable Node Agent gateway")
+                return AsyncThrowingStream { continuation in
+                    continuation.yield("data: {\"choices\":[{\"delta\":{\"content\":\"Gateway OK\"},\"finish_reason\":null}]}")
+                    continuation.yield("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}")
+                    continuation.yield("data: [DONE]")
+                    continuation.finish()
+                }
+            }
+        )
+        store.backendMode = .singleNode
+        store.connectionMode = .ring
+        store.createCluster()
+        for index in store.nodes.indices where store.selectedNodeIDs.contains(store.nodes[index].id) {
+            store.nodes[index].models.append(
+                ModelEntry(id: "SecondModel", path: "/Users/Shared/TokenityModels/SecondModel")
+            )
+        }
+        let first = try XCTUnwrap(store.modelLibraryRows.first { $0.id == "Qwen3.5-122B-A10B-4bit" })
+        let second = try XCTUnwrap(store.modelLibraryRows.first { $0.id == "SecondModel" })
+
+        await store.loadModel(first)
+        stopAllCount = 0
+        await store.loadModel(second)
+
+        XCTAssertEqual(store.modelLoadStates[first.id], .loaded)
+        XCTAssertEqual(store.modelLoadStates[second.id], .loaded)
+        XCTAssertEqual(store.loadedModelName, second.id)
+        XCTAssertEqual(store.activeModelInstanceID, "instance-second")
+        XCTAssertEqual(stopAllCount, 0, "A second managed load must not stop its sibling instance")
+
+        let coordinatorIndex = try XCTUnwrap(
+            store.nodes.firstIndex { $0.id == store.coordinator?.id }
+        )
+        store.nodes[coordinatorIndex].agentContract = AgentContractInfo(
+            version: 1,
+            capabilities: [
+                "cluster_runtime",
+                "instance_quorum",
+                "instance_runtimes",
+                "managed_instances",
+            ]
+        )
+        store.nodes[coordinatorIndex].roles = [
+            ProcessRole(
+                role: "single-node-openai",
+                state: "failed",
+                instanceID: "instance-first",
+                pid: nil,
+                message: "Sibling stopped"
+            ),
+            ProcessRole(
+                role: "single-node-openai",
+                state: "running",
+                instanceID: "instance-second",
+                pid: 2_002
+            ),
+        ]
+        let firstRuntime = ClusterRuntimeStatus(
+            clusterID: "instance-first",
+            instanceID: "instance-first",
+            rank: 0,
+            worldSize: 1,
+            connectionMode: "ring",
+            role: "controller"
+        )
+        let secondRuntime = ClusterRuntimeStatus(
+            clusterID: "instance-second",
+            instanceID: "instance-second",
+            rank: 0,
+            worldSize: 1,
+            connectionMode: "ring",
+            role: "controller"
+        )
+        store.nodes[coordinatorIndex].clusterRuntime = firstRuntime
+        store.nodes[coordinatorIndex].clusterRuntimes = [firstRuntime, secondRuntime]
+
+        XCTAssertEqual(store.menuBarSnapshot.level, .ready)
+        XCTAssertEqual(
+            store.menuBarSnapshot.nodes.first(where: { $0.id == store.coordinator?.id })?.inferenceRoleText,
+            "single-node-openai: Running"
+        )
+
+        store.chatInput = "Route through the gateway."
+        await store.sendChatMessage()
+        XCTAssertEqual(store.chatMessages.last?.content, "Gateway OK")
+
+        await store.stopModel(first)
+
+        XCTAssertEqual(stopInstancePaths, ["/v1/node/instances/instance-first/stop"])
+        XCTAssertEqual(store.modelLoadStates[first.id], .notLoaded)
+        XCTAssertEqual(store.modelLoadStates[second.id], .loaded)
+        XCTAssertEqual(store.loadedModelName, second.id)
+        XCTAssertEqual(store.activeModelInstanceID, "instance-second")
+        XCTAssertEqual(stopAllCount, 0)
     }
 
     func testReasoningOnlyChatDoesNotShowNotRespondingError() async {
@@ -1037,17 +1635,26 @@ final class TokenityStoreTests: XCTestCase {
     func testExternalAPIUsesCoordinatorAddress() {
         let store = TokenityStore()
 
-        XCTAssertEqual(store.openAIAPIBaseURL, "http://192.168.5.23:8000/v1")
+        XCTAssertEqual(store.openAIAPIBaseURL, "http://192.168.5.23:9100/v1")
         XCTAssertEqual(store.externalAPIModelName, "Load a model first")
     }
 
     private static func successfulModelTransport(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         let path = request.url?.path ?? ""
         let payload: String
-        if path.contains("/v1/models") {
+        if path == "/v1/node/info" {
+            payload = TokenityTestFixtures.basicNodeInfoPayload(for: request)
+        } else if path.contains("/v1/models") {
             payload = #"{"data":[{"id":"Qwen3.5-122B-A10B-4bit"}]}"#
         } else if path.contains("/v1/chat/completions") {
-            payload = #"{"choices":[{"message":{"content":"OK"}}]}"#
+            let body = request.httpBody.flatMap {
+                try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+            }
+            if body?["stream"] as? Bool == true {
+                payload = "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+            } else {
+                payload = #"{"choices":[{"message":{"content":"OK"}}]}"#
+            }
         } else if path.contains("/v1/node/start") {
             payload = #"{"status":{"state":"running"}}"#
         } else if path.contains("/v1/node/stop-role") {
@@ -1058,6 +1665,20 @@ final class TokenityStoreTests: XCTestCase {
         let response = HTTPURLResponse(
             url: request.url ?? URL(string: "http://127.0.0.1")!,
             statusCode: 200,
+            httpVersion: nil,
+            headerFields: nil
+        )!
+        return (Data(payload.utf8), response)
+    }
+
+    private static func response(
+        for request: URLRequest,
+        payload: String,
+        statusCode: Int = 200
+    ) -> (Data, HTTPURLResponse) {
+        let response = HTTPURLResponse(
+            url: request.url ?? URL(string: "http://127.0.0.1")!,
+            statusCode: statusCode,
             httpVersion: nil,
             headerFields: nil
         )!

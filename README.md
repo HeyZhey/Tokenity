@@ -35,8 +35,9 @@ fit across the combined unified memory of several machines.
 - Model inventory with format, quantization, size, architecture, and shard metadata.
 - GLM-5.2 cross-layer DSA indexer compatibility based on upstream mlx-lm PR #1410.
 - Per-model runtime, thinking-mode, and sampling configuration with Qwen3.5 presets.
-- Streaming Chat with expanded reasoning, automatic scrolling, metrics, separate history sessions, and immediate cancellation.
-- Automatic non-streaming recovery when a macOS streaming connection fails before the first token.
+- Native Chat workspace with adaptive reasoning, Markdown and code rendering, per-message metrics, searchable history, follow-aware scrolling, and immediate cancellation.
+- One streaming reconnect and non-streaming recovery only for explicit transport failures before the first token; protocol/server errors remain visible.
+- Independent single- and multi-Mac model instances with per-instance ports, reservations, readiness quorum, request leases, and stable gateway routing.
 - Model unload, cluster stop, and app shutdown cancel the active generation before backend teardown.
 - OpenAI-compatible API for Cherry Studio, Msty, scripts, and other local clients.
 - Node-level RDMA, memory, process, and model diagnostics.
@@ -46,19 +47,24 @@ fit across the combined unified memory of several machines.
 
 ```mermaid
 flowchart LR
-    UI["TokenityControl\nSwiftUI app"] -->|"HTTP control :9100"| A["Coordinator Mac\nNode Agent"]
+    UI["TokenityControl\nSwiftUI app"] -->|"HTTP control :9100"| A["Coordinator Mac\nNode Agent + gateway"]
     A -->|"typed HTTP rank start :9100"| B["Worker Mac\nNode Agent"]
-    A --> R0["MLX rank 0\nCoordinator"]
-    B --> R1["MLX rank 1\nWorker"]
+    A --> R0["Instance 1 · MLX rank 0\nprivate dynamic port"]
+    B --> R1["Instance 1 · MLX rank 1"]
+    A --> S0["Instance 2 · single MLX runtime\nprivate dynamic port"]
     R0 <-->|"Thunderbolt RDMA / JACCL"| R1
-    CLIENT["Cherry Studio / Msty\nOpenAI SDK / curl"] -->|"OpenAI API :8000"| R0
+    CLIENT["Cherry Studio / Msty\nOpenAI SDK / curl"] -->|"stable OpenAI API :9100"| A
+    A -->|"model alias / instance id"| R0
+    A -->|"model alias / instance id"| S0
 ```
 
 The SwiftUI app talks to the coordinator's Node Agent. The coordinator starts
 its local rank and asks every worker Agent to start a strictly typed rank over
 HTTP. Each Agent supervises only its local process. Rank 0 hosts Tokenity's
-OpenAI-compatible server while MLX moves tensors over its ring or JACCL/RDMA
-data plane. SSH is not part of product startup or inference.
+OpenAI-compatible private server while MLX moves tensors over its ring or
+JACCL/RDMA data plane. The Agent's stable gateway holds an instance request
+lease and forwards SSE bytes without buffering. SSH is not part of product
+startup or inference.
 
 ## Repository layout
 
@@ -152,6 +158,46 @@ tokenity node-agent --host 0.0.0.0 --port 9100
 7. Select **Load** and wait until the model state becomes **Loaded**.
 8. Use **Chat**, or open **API Access** to connect another application.
 
+## Menu Bar
+
+TokenityControl remains available in the macOS menu bar after its main window is
+closed. The menu uses the same `TokenityStore` instance as the main window and
+continues a single low-frequency status monitor for the lifetime of the app.
+Only **Quit Tokenity** exits the app; quitting safely cancels active generation,
+stops model roles, and releases the cluster.
+
+The status item combines color, shape, text, a tooltip, and accessibility labels:
+
+| Appearance | Meaning |
+| --- | --- |
+| Gray circle | Server stopped and no inference service is running. |
+| Yellow clock | Starting, loading, compiling, stopping, or waiting for a model/node. |
+| Green check | Server readiness is `ready`, the model is loaded, every required Agent/rank is healthy, and world size plus connection mode match the launch configuration. |
+| Red warning | Server/readiness failure, an offline required node, a failed rank, or inconsistent distributed topology. |
+| Message activity symbol | A chat response is currently being generated; streamed tokens do not individually redraw the menu contents. |
+
+The menu reports the listening endpoint, loaded model, single- or multi-Mac
+inference mode, Native MTP mode, and generation activity. **Machines** contains a
+submenu for every selected Controller and Worker with hostname, IP address,
+Node Agent health, inference role, connection path, response latency/last response,
+and a concise failure reason when available.
+
+Available shortcuts are **Open Tokenity**, **Start Server**, **Stop Server**,
+**Refresh Status**, **Open Models**, **Open Chat**, and **Quit Tokenity**. Unsafe or
+duplicate operations are disabled with an explanatory line. Stopping from the
+menu cancels an active streaming request before cleaning up all model roles.
+
+Node Agent `/v1/node/info` and `/v1/node/status` responses include an optional,
+backward-compatible `cluster_runtime` object with `cluster_id`, `rank`,
+`world_size`, `connection_mode`, and `role`. The menu uses it to prevent a
+partially connected distributed cluster from appearing healthy. After deploying
+this version on each inference Mac, restart the system Agent so the resident
+port-9100 process loads the new code:
+
+```bash
+sudo launchctl kickstart -k system/ai.tokenity.node-agent
+```
+
 Cluster settings expose these backends and connection modes:
 
 | Setting | Purpose |
@@ -201,11 +247,42 @@ setting `TOKENITY_MLX_LOAD_POLICY=fixed`, together with
 
 Tokenity Chat provides:
 
-- Streaming answer and `reasoning_content` rendering.
-- Thinking expanded by default.
-- Automatic transcript scrolling during generation.
-- First-response time, total time, and approximate token rate.
-- Independent persistent conversation sessions in a collapsible history sidebar.
+- A native macOS workspace with the transcript in the center, an auto-growing
+  composer below it, model/connection/generation status in the header, and a
+  searchable conversation sidebar on the right. The sidebar uses native list
+  selection and keyboard navigation, groups sessions into Today, Yesterday,
+  Previous 7 Days, Previous 30 Days, and Older, and supports rename/delete from
+  each row's context menu.
+- Streaming answer and `reasoning_content` rendering. Waiting for the first token
+  is shown as a neutral generation state; a Thinking disclosure is created only
+  after real reasoning arrives. Thinking is expanded while streaming, folds when
+  the final answer begins, and then respects the user's manual disclosure choice.
+- Incremental `<think>...</think>` parsing for models that place reasoning inside
+  `content`, including tags split across SSE chunks. Incomplete tags are buffered
+  so tag fragments never leak into the transcript and ordinary text is not lost.
+- Native Markdown rendering for six heading levels, emphasis, strikethrough,
+  nested ordered/unordered lists, quotes, dividers, inline code, links and detected
+  URLs, tables, and fenced code blocks. Incomplete streaming Markdown remains
+  visible while it is being completed; the original Markdown stays in the message
+  model for copying, regeneration, and history restoration.
+- Dedicated code blocks with language labels, lightweight highlighting for common
+  languages, horizontal scrolling, preserved indentation, and copy confirmation.
+  Unknown languages safely fall back to plain monospaced text. Code is never run.
+- Per-assistant-message first-token time, total generation time, approximate token
+  rate, model name, completion state, reasoning duration, and estimated reasoning
+  tokens. Cancellation, repetition detection, errors, and output-token limits have
+  distinct visible states.
+- Follow-aware transcript scrolling: streaming follows only while the reader is at
+  the bottom. Scrolling upward pauses follow mode and reveals a **Latest** button.
+- Independent persistent conversation sessions loaded and encoded away from the
+  main thread. New chat, stable selection, search, automatic titles, manual rename,
+  neighbor selection after delete, and empty/loading states are built in.
+- Return sends and Shift-Return inserts a newline. The native composer checks IME
+  marked text before sending, grows to a bounded height, explains disabled states,
+  and changes Send to Stop during generation.
+- Message actions include copying original Markdown, editing a user turn,
+  regenerating an assistant turn, and stopping the active response. They remain
+  keyboard/VoiceOver accessible without permanently occupying transcript space.
 - Protection against carrying incomplete or failed turns into the next prompt.
 - A **Stop** control for active generation; unloading a model, stopping the cluster,
   or closing Tokenity also cancels the request immediately and excludes the
@@ -222,20 +299,20 @@ Tokenity Chat provides:
 
 ## OpenAI-compatible API
 
-When a model is loaded, rank 0 exposes an API on port `8000`.
+When a model is loaded, the coordinator Node Agent exposes the stable
+OpenAI-compatible gateway on port `9100`. The rank-0 runtime also listens on a
+private backend port (typically `8000`) for diagnostics and gateway forwarding.
 
 | Endpoint | Description |
 | --- | --- |
-| `GET /health` | Lightweight service health. |
-| `GET /v1/readiness` | Detailed distributed runtime phase. |
 | `GET /v1/models` | Available model identifiers. |
+| `GET /v1/gateway/routes` | Ready model instances and routing metadata. |
 | `POST /v1/chat/completions` | Streaming or non-streaming chat completions. |
-| `GET /v1/tokenity/info` | Tokenity service metadata and supported endpoints. |
 
 Client configuration:
 
 ```text
-Base URL: http://<coordinator-lan-ip>:8000/v1
+Base URL: http://<coordinator-lan-ip>:9100/v1
 API key:  tokenity-local  # placeholder only; authentication is currently disabled
 Model:    use the id returned by GET /v1/models
 ```
@@ -244,7 +321,7 @@ Example:
 
 ```bash
 TOKENITY_HOST=192.168.1.10
-curl "http://${TOKENITY_HOST}:8000/v1/chat/completions" \
+curl "http://${TOKENITY_HOST}:9100/v1/chat/completions" \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "<model-id>",
@@ -294,7 +371,7 @@ verification details.
 
 ### Models says Loaded but Chat cannot answer
 
-Check the service directly:
+Check the private rank-0 runtime directly:
 
 ```bash
 TOKENITY_HOST=192.168.1.10

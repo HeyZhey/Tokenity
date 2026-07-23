@@ -1,5 +1,9 @@
 import Foundation
 
+private struct UncheckedSendableBox<Value>: @unchecked Sendable {
+    let value: Value
+}
+
 enum TokenityTransportError: LocalizedError {
     case invalidResponse
     case httpStatus(Int, String?)
@@ -105,19 +109,74 @@ struct ChatRepetitionDetector {
 }
 
 private struct ModelReadinessResponse: Decodable {
+    struct ReadyEvidence: Decodable {
+        var oneTokenProbe: Bool?
+        var warmupCacheIsolated: Bool?
+
+        enum CodingKeys: String, CodingKey {
+            case oneTokenProbe = "one_token_probe"
+            case warmupCacheIsolated = "warmup_cache_isolated"
+        }
+
+        var verifiesInference: Bool {
+            oneTokenProbe == true && warmupCacheIsolated == true
+        }
+    }
+
     var phase: String
     var message: String?
     var progress: Double?
     var progressCurrent: Int?
     var progressTotal: Int?
     var nativeMTP: NativeMTPReadiness?
+    var instanceID: String?
+    var rank: Int?
+    var worldSize: Int?
+    var connectionMode: String?
+    var modelRevision: String?
+    var memory: RuntimeMemoryStats?
+    var readyEvidence: ReadyEvidence?
 
     enum CodingKeys: String, CodingKey {
         case phase, message, progress
         case progressCurrent = "progress_current"
         case progressTotal = "progress_total"
         case nativeMTP = "native_mtp"
+        case instanceID = "instance_id"
+        case rank
+        case worldSize = "world_size"
+        case connectionMode = "connection_mode"
+        case modelRevision = "model_revision"
+        case memory
+        case readyEvidence = "ready_evidence"
     }
+}
+
+private struct InstanceQuorumResponse: Decodable {
+    struct RankEvidence: Decodable {
+        var node: String
+        var runtime: ModelReadinessResponse?
+    }
+
+    var instanceID: String
+    var ready: Bool
+    var issues: [String]
+    var rankQuorum: String
+    var ranks: [RankEvidence]
+
+    enum CodingKeys: String, CodingKey {
+        case ready, issues, ranks
+        case instanceID = "instance_id"
+        case rankQuorum = "rank_quorum"
+    }
+}
+
+private struct ManagedModelInstance {
+    var modelID: String
+    var serviceModelName: String
+    var instanceID: String
+    var apiBaseURL: String?
+    var backendRole: String
 }
 
 @MainActor
@@ -156,6 +215,9 @@ final class TokenityStore: ObservableObject {
     @Published var modelLoadMessage = "No model loaded"
     @Published private(set) var modelLoadProgress: Double?
     @Published private(set) var nativeMTPRuntime: NativeMTPReadiness?
+    @Published private(set) var serverHealth: ServerHealthState = .stopped
+    @Published private(set) var isRefreshingStatus = false
+    private(set) var lastStatusRefreshAt: Date?
     private static let initialChatSession = ChatSession.fresh()
 
     @Published var chatInput = ""
@@ -165,6 +227,8 @@ final class TokenityStore: ObservableObject {
     @Published private(set) var chatSessions: [ChatSession] = [TokenityStore.initialChatSession]
     @Published private(set) var activeChatSessionID: UUID = TokenityStore.initialChatSession.id
     @Published private(set) var chatScrollRevision = 0
+    @Published private(set) var chatComposerFocusRevision = 0
+    @Published private(set) var isChatHistoryLoading = false
     @Published private(set) var apiAccessStatus = "Not checked"
     @Published private(set) var modelConfigurations: [String: ModelRuntimeConfiguration] = [:]
     @Published var logs: [String] = [
@@ -177,10 +241,17 @@ final class TokenityStore: ObservableObject {
     private let userDefaults: UserDefaults
     private let modelConfigurationsKey = "TokenityModelRuntimeConfigurations.v1"
     private let chatSessionsKey = "TokenityChatSessions.v1"
+    private let chatHistoryQueue = DispatchQueue(label: "ai.tokenity.chat-history", qos: .utility)
+    private let writesChatHistorySynchronously: Bool
+    private var chatHistoryRevision = 0
     private let mlxStartingPort = 30020
     private let modelLeaseSeconds = 30.0
     private var loadedBackendRole: String?
     private var loadedServiceModelName: String?
+    private var activeLoadedModelID: String?
+    private var managedModelInstances: [String: ManagedModelInstance] = [:]
+    private(set) var activeModelInstanceID: String?
+    private var activeModelServiceBaseURL: String?
     private var legacyNativeMTPFallback: NativeMTPReadiness?
     private var activeModelLoadID: UUID?
     private var modelLoadTask: Task<Void, Never>?
@@ -189,26 +260,52 @@ final class TokenityStore: ObservableObject {
     private var activeChatAssistantIndex: Int?
     private var chatTask: Task<Void, Never>?
     private var chatTaskID: UUID?
+    private var statusMonitoringTask: Task<Void, Never>?
+    private var statusRefreshInFlight = false
+    private(set) var statusMonitoringStartCount = 0
 
     init(
         dataTransport: @escaping DataTransport = TokenityStore.liveData(for:),
         lineStreamTransport: @escaping LineStreamTransport = TokenityStore.liveLineStream(for:),
-        userDefaults: UserDefaults = .standard
+        userDefaults: UserDefaults = .standard,
+        loadsChatHistorySynchronously: Bool = true
     ) {
         self.dataTransport = dataTransport
         self.lineStreamTransport = lineStreamTransport
         self.userDefaults = userDefaults
+        writesChatHistorySynchronously = loadsChatHistorySynchronously
         if let data = userDefaults.data(forKey: modelConfigurationsKey),
            let decoded = try? JSONDecoder().decode([String: ModelRuntimeConfiguration].self, from: data) {
             modelConfigurations = decoded
         }
-        if let data = userDefaults.data(forKey: chatSessionsKey),
-           let decoded = try? JSONDecoder().decode([ChatSession].self, from: data),
-           let latest = decoded.sorted(by: { $0.updatedAt > $1.updatedAt }).first {
-            chatSessions = decoded.sorted(by: { $0.updatedAt > $1.updatedAt })
-            activeChatSessionID = latest.id
-            chatMessages = latest.messages
-            chatMetrics = latest.metrics
+        if loadsChatHistorySynchronously {
+            if let sessions = Self.loadChatSessions(from: userDefaults, key: chatSessionsKey),
+               let latest = sessions.first {
+                chatSessions = sessions
+                activeChatSessionID = latest.id
+                chatMessages = latest.messages
+                chatMetrics = latest.metrics
+            }
+        } else {
+            isChatHistoryLoading = true
+            let defaults = UncheckedSendableBox(value: userDefaults)
+            let key = chatSessionsKey
+            Task { [weak self] in
+                let sessions = await Task.detached(priority: .utility) {
+                    Self.loadChatSessions(from: defaults.value, key: key)
+                }.value
+                guard let self else { return }
+                if self.chatHistoryRevision == 0,
+                   let sessions,
+                   let latest = sessions.first {
+                    self.chatSessions = sessions
+                    self.activeChatSessionID = latest.id
+                    self.chatMessages = latest.messages
+                    self.chatMetrics = latest.metrics
+                    self.chatScrollRevision += 1
+                }
+                self.isChatHistoryLoading = false
+            }
         }
         rebuildLaunchPreview()
     }
@@ -217,8 +314,19 @@ final class TokenityStore: ObservableObject {
         nodes.filter { selectedNodeIDs.contains($0.id) }
     }
 
+    private var plannedNodes: [TokenityNode] {
+        let selected = selectedNodes
+        guard let coordinatorIndex = selected.firstIndex(where: { $0.id == coordinatorID }) else {
+            return selected
+        }
+        return [selected[coordinatorIndex]]
+            + selected.enumerated().compactMap { index, node in
+                index == coordinatorIndex ? nil : node
+            }
+    }
+
     var coordinator: TokenityNode? {
-        selectedNodes.first { $0.id == coordinatorID } ?? selectedNodes.first
+        plannedNodes.first
     }
 
     var openAIEndpoint: String {
@@ -231,7 +339,6 @@ final class TokenityStore: ObservableObject {
             var components = URLComponents(string: agentURL),
             components.host != nil
         else { return "Unavailable" }
-        components.port = 8000
         components.path = "/v1"
         components.query = nil
         return components.url?.absoluteString ?? "Unavailable"
@@ -246,7 +353,11 @@ final class TokenityStore: ObservableObject {
     }
 
     var loadedModelName: String? {
-        modelLoadStates
+        if let activeLoadedModelID,
+           modelLoadStates[activeLoadedModelID] == .loaded {
+            return activeLoadedModelID
+        }
+        return modelLoadStates
             .filter { $0.value == .loaded }
             .map(\.key)
             .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
@@ -315,6 +426,7 @@ final class TokenityStore: ObservableObject {
         chatMetrics = session.metrics
         chatInput = ""
         chatScrollRevision += 1
+        chatComposerFocusRevision += 1
         persistChatSessions()
     }
 
@@ -327,24 +439,67 @@ final class TokenityStore: ObservableObject {
         chatMetrics = session.metrics
         chatInput = ""
         chatScrollRevision += 1
+        chatComposerFocusRevision += 1
     }
 
     func deleteChatSession(_ sessionID: UUID) {
         guard !isChatRunning else { return }
+        let deletedIndex = chatSessions.firstIndex(where: { $0.id == sessionID })
         chatSessions.removeAll { $0.id == sessionID }
         if chatSessions.isEmpty {
             let session = ChatSession.fresh()
             chatSessions = [session]
         }
         if sessionID == activeChatSessionID,
-           let next = chatSessions.sorted(by: { $0.updatedAt > $1.updatedAt }).first {
+           !chatSessions.isEmpty {
+            let nextIndex = min(deletedIndex ?? 0, chatSessions.count - 1)
+            let next = chatSessions[nextIndex]
             activeChatSessionID = next.id
             chatMessages = next.messages
             chatMetrics = next.metrics
             chatInput = ""
             chatScrollRevision += 1
+            chatComposerFocusRevision += 1
         }
         persistChatSessions()
+    }
+
+    func renameChatSession(_ sessionID: UUID, title: String) {
+        let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty,
+              let index = chatSessions.firstIndex(where: { $0.id == sessionID })
+        else { return }
+        chatSessions[index].title = String(clean.prefix(80))
+        chatSessions[index].titleWasEdited = true
+        chatSessions[index].updatedAt = Date()
+        chatSessions.sort { $0.updatedAt > $1.updatedAt }
+        persistChatSessions()
+    }
+
+    func editChatMessage(_ messageID: UUID) {
+        guard !isChatRunning,
+              let index = chatMessages.firstIndex(where: { $0.id == messageID }),
+              chatMessages[index].role == .user
+        else { return }
+        let prompt = chatMessages[index].content
+        chatMessages.removeSubrange(index...)
+        chatInput = prompt
+        chatScrollRevision += 1
+        chatComposerFocusRevision += 1
+        syncActiveChatSession()
+    }
+
+    func regenerateAssistantMessage(_ messageID: UUID) {
+        guard !isChatRunning,
+              let assistantIndex = chatMessages.firstIndex(where: { $0.id == messageID }),
+              chatMessages[assistantIndex].role == .assistant,
+              let userIndex = chatMessages[..<assistantIndex].lastIndex(where: { $0.role == .user })
+        else { return }
+        let prompt = chatMessages[userIndex].content
+        chatMessages.removeSubrange(userIndex...)
+        chatInput = prompt
+        syncActiveChatSession()
+        beginSendingChatMessage()
     }
 
     func testExternalAPI() async {
@@ -424,11 +579,15 @@ final class TokenityStore: ObservableObject {
                 mlxVersion: decoded.mlxVersion,
                 mlxLMVersion: decoded.mlxLMVersion,
                 tokenityVersion: decoded.tokenityVersion,
+                tokenityCodeRevision: decoded.tokenityCodeRevision,
+                agentContract: decoded.agentContract,
                 rdma: decoded.rdma,
                 roles: decoded.processRoles,
                 memory: decoded.memory ?? .unknown,
                 models: [],
-                isOnline: true
+                isOnline: true,
+                clusterRuntime: decoded.clusterRuntime,
+                clusterRuntimes: decoded.clusterRuntimes ?? []
             )
             upsert(node)
             appendLog("Refreshed this Mac: \(decoded.hostname)")
@@ -467,19 +626,57 @@ final class TokenityStore: ObservableObject {
         rebuildLaunchPreview()
     }
 
-    func startStatusRefreshLoop() async {
-        await refreshSelectedNodeStatus()
-        while !Task.isCancelled {
-            await renewModelLeasesIfNeeded()
-            try? await Task.sleep(for: .seconds(5))
-            await refreshSelectedNodeStatus()
+    var isStatusMonitoring: Bool {
+        statusMonitoringTask != nil
+    }
+
+    func startStatusMonitoring(interval: Duration = .seconds(2)) {
+        guard statusMonitoringTask == nil else { return }
+        statusMonitoringStartCount += 1
+        statusMonitoringTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.refreshSelectedNodeStatus(showsActivity: false)
+                guard !Task.isCancelled else { return }
+                try? await Task.sleep(for: interval)
+            }
         }
     }
 
-    func refreshSelectedNodeStatus() async {
+    func stopStatusMonitoring() {
+        statusMonitoringTask?.cancel()
+        statusMonitoringTask = nil
+    }
+
+    func refreshSelectedNodeStatus(showsActivity: Bool = true) async {
+        guard !statusRefreshInFlight else { return }
+        statusRefreshInFlight = true
+        if showsActivity {
+            isRefreshingStatus = true
+        }
+        defer {
+            statusRefreshInFlight = false
+            if showsActivity {
+                isRefreshingStatus = false
+            }
+            lastStatusRefreshAt = Date()
+        }
+
+        await renewModelLeasesIfNeeded()
+        // Streaming already proves the model service is alive. Continue renewing
+        // its lease, but do not let polling telemetry compete with token updates.
+        if !showsActivity, isChatRunning { return }
+
         var updatedNodes = nodes
         for node in selectedNodes {
             guard let index = updatedNodes.firstIndex(where: { $0.id == node.id }) else { continue }
+            let previousNode = updatedNodes[index]
+            let telemetryAge = Date().timeIntervalSince(previousNode.lastAgentResponseAt ?? .distantPast)
+            let telemetryInterval = previousNode.memory.totalBytes == nil ? 2.0 : 10.0
+            let capturesVolatileTelemetry = showsActivity
+                || !previousNode.isOnline
+                || previousNode.lastAgentResponseAt == nil
+                || telemetryAge >= telemetryInterval
+            let startedAt = Date()
             if let info = await fetchNodeInfo(for: node) {
                 updatedNodes[index].hostname = info.hostname
                 updatedNodes[index].user = info.user
@@ -489,24 +686,253 @@ final class TokenityStore: ObservableObject {
                 updatedNodes[index].mlxVersion = info.mlxVersion
                 updatedNodes[index].mlxLMVersion = info.mlxLMVersion
                 updatedNodes[index].tokenityVersion = info.tokenityVersion
-                updatedNodes[index].roles = info.processRoles
-                updatedNodes[index].memory = info.memory ?? updatedNodes[index].memory
+                updatedNodes[index].tokenityCodeRevision = info.tokenityCodeRevision
+                updatedNodes[index].agentContract = info.agentContract
+                updatedNodes[index].roles = stableRoles(
+                    info.processRoles,
+                    preservingVolatileFieldsFrom: previousNode.roles,
+                    capturesVolatileTelemetry: capturesVolatileTelemetry
+                )
+                if capturesVolatileTelemetry {
+                    updatedNodes[index].memory = info.memory ?? updatedNodes[index].memory
+                }
                 updatedNodes[index].rdma = info.rdma
+                updatedNodes[index].clusterRuntime = info.clusterRuntime
+                updatedNodes[index].clusterRuntimes = info.clusterRuntimes ?? []
                 updatedNodes[index].isOnline = true
+                updatedNodes[index].consecutiveAgentFailures = 0
+                if capturesVolatileTelemetry {
+                    updatedNodes[index].agentLatencyMilliseconds = Date().timeIntervalSince(startedAt) * 1_000
+                    updatedNodes[index].lastAgentResponseAt = Date()
+                }
+                updatedNodes[index].agentError = nil
             } else if let status = await fetchStatus(for: node) {
-                updatedNodes[index].roles = status.roles
-                updatedNodes[index].memory = status.memory ?? updatedNodes[index].memory
+                updatedNodes[index].roles = stableRoles(
+                    status.roles,
+                    preservingVolatileFieldsFrom: previousNode.roles,
+                    capturesVolatileTelemetry: capturesVolatileTelemetry
+                )
+                if capturesVolatileTelemetry {
+                    updatedNodes[index].memory = status.memory ?? updatedNodes[index].memory
+                }
+                updatedNodes[index].clusterRuntime = status.clusterRuntime
+                updatedNodes[index].clusterRuntimes = status.clusterRuntimes ?? []
                 updatedNodes[index].isOnline = true
+                updatedNodes[index].consecutiveAgentFailures = 0
+                if capturesVolatileTelemetry {
+                    updatedNodes[index].agentLatencyMilliseconds = Date().timeIntervalSince(startedAt) * 1_000
+                    updatedNodes[index].lastAgentResponseAt = Date()
+                }
+                updatedNodes[index].agentError = nil
             } else {
-                updatedNodes[index].isOnline = false
+                let failures = previousNode.consecutiveAgentFailures + 1
+                updatedNodes[index].consecutiveAgentFailures = failures
+                if previousNode.isOnline && failures < 2 {
+                    // Keep the last verified topology through one missed poll.
+                    // Two consecutive failures are required before publishing
+                    // Offline and changing the global status icon.
+                    updatedNodes[index].isOnline = true
+                    updatedNodes[index].agentError = nil
+                } else {
+                    updatedNodes[index].isOnline = false
+                    updatedNodes[index].agentLatencyMilliseconds = nil
+                    updatedNodes[index].agentError = "Node Agent did not respond within the health-check timeout."
+                }
             }
         }
-        nodes = updatedNodes
-        if loadedModelName != nil,
-           let readiness = try? await fetchModelReadiness() {
-            nativeMTPRuntime = readiness.nativeMTP
+        if nodes != updatedNodes {
+            nodes = updatedNodes
         }
+        adoptExternallyRunningServiceIfNeeded()
+        if loadedServiceModelName != nil || loadedModelName != nil {
+            do {
+                if let readiness = try await fetchModelReadiness() {
+                    let quorum = readiness.phase == "ready"
+                        ? try await fetchInstanceQuorum()
+                        : nil
+                    if let quorum {
+                        applyRuntimeMemory(from: quorum)
+                    } else if let coordinatorIndex = nodes.firstIndex(where: { $0.id == coordinatorID }) {
+                        nodes[coordinatorIndex].runtimeMemory = readiness.memory
+                    }
+                    var nextNativeMTPRuntime = readiness.nativeMTP ?? legacyNativeMTPFallback
+                    if !showsActivity,
+                       var next = nextNativeMTPRuntime,
+                       let current = nativeMTPRuntime {
+                        next.proposedTokens = current.proposedTokens
+                        next.acceptedTokens = current.acceptedTokens
+                        next.acceptanceRate = current.acceptanceRate
+                        nextNativeMTPRuntime = next
+                    }
+                    if nativeMTPRuntime != nextNativeMTPRuntime {
+                        nativeMTPRuntime = nextNativeMTPRuntime
+                    }
+                    let isUnverifiedExternalDiscovery = activeModelLoadID == nil
+                        && loadedModelName == nil
+                    if isUnverifiedExternalDiscovery,
+                       readiness.phase == "ready",
+                       readiness.readyEvidence?.verifiesInference == true,
+                       let identifier = loadedServiceModelName {
+                        var states = modelLoadStates
+                        for key in states.keys where key != identifier {
+                            states[key] = .notLoaded
+                        }
+                        states[identifier] = .loaded
+                        modelLoadStates = states
+                        activeLoadedModelID = identifier
+                        if let instanceID = activeModelInstanceID {
+                            managedModelInstances[identifier] = ManagedModelInstance(
+                                modelID: identifier,
+                                serviceModelName: identifier,
+                                instanceID: instanceID,
+                                apiBaseURL: activeModelServiceBaseURL,
+                                backendRole: loadedBackendRole ?? "distributed-openai"
+                            )
+                        }
+                        modelLoadProgress = 1
+                        modelLoadMessage = "\(identifier) is loaded."
+                        appendLog("Verified externally running model service: \(identifier).")
+                    }
+                    let nextServerHealth: ServerHealthState
+                    switch readiness.phase {
+                    case "ready" where isUnverifiedExternalDiscovery
+                        && readiness.readyEvidence?.verifiesInference != true:
+                        nextServerHealth = .starting(
+                            "Waiting for the model runtime to publish verified one-token warmup evidence"
+                        )
+                    case "ready" where activeModelInstanceID == nil:
+                        // Legacy Agents have no managed instance/quorum
+                        // endpoint. A Tokenity-managed load reaches this state
+                        // only after the real streaming inference probe passes.
+                        nextServerHealth = .ready
+                    case "ready" where quorum?.ready == true:
+                        nextServerHealth = .ready
+                    case "ready":
+                        let detail = quorum?.issues.joined(separator: " ")
+                        nextServerHealth = .error(
+                            detail?.isEmpty == false
+                                ? detail!
+                                : "The planned rank quorum is incomplete."
+                        )
+                    case "failed":
+                        nextServerHealth = .error(readiness.message ?? "The model service reported a failed readiness state.")
+                    default:
+                        nextServerHealth = .starting(readiness.message ?? readiness.phase.replacingOccurrences(of: "_", with: " ").capitalized)
+                    }
+                    if serverHealth != nextServerHealth {
+                        serverHealth = nextServerHealth
+                    }
+                }
+            } catch {
+                let nextServerHealth = ServerHealthState.error("Service health check failed: \(userFacingMessage(for: error))")
+                if serverHealth != nextServerHealth {
+                    serverHealth = nextServerHealth
+                }
+            }
+        } else if phase == .stopped {
+            if serverHealth != .stopped {
+                serverHealth = .stopped
+            }
+        }
+        reconcileExternallyStoppedService()
         rebuildLaunchPreview()
+    }
+
+    private func adoptExternallyRunningServiceIfNeeded() {
+        // A process becomes visible to the status monitor before its readiness
+        // and streaming probes finish. Never let background discovery turn an
+        // in-progress Tokenity load green prematurely.
+        guard activeModelLoadID == nil,
+              !isModelTransitioning,
+              loadedModelName == nil,
+              let controller = coordinator,
+              let activeRole = controller.roles.first(where: Self.isActiveInferenceProcess),
+              let command = activeRole.command,
+              let modelFlag = command.firstIndex(of: "--model"),
+              command.indices.contains(modelFlag + 1)
+        else { return }
+
+        let discoveredPath = command[modelFlag + 1]
+        let identifier: String
+        if let identifierFlag = command.firstIndex(of: "--api-identifier"),
+           command.indices.contains(identifierFlag + 1) {
+            identifier = command[identifierFlag + 1]
+        } else {
+            identifier = URL(fileURLWithPath: discoveredPath).lastPathComponent
+        }
+        guard !identifier.isEmpty else { return }
+
+        var states = modelLoadStates
+        for key in states.keys {
+            states[key] = .notLoaded
+        }
+        states[identifier] = .loading
+        modelLoadStates = states
+        modelPath = discoveredPath
+        loadedBackendRole = activeRole.role
+        loadedServiceModelName = identifier
+        activeModelInstanceID = activeRole.instanceID
+        if let portFlag = command.firstIndex(of: "--port"),
+           command.indices.contains(portFlag + 1),
+           let port = Int(command[portFlag + 1]),
+           var components = URLComponents(string: controller.agentURL) {
+            components.port = port
+            components.path = "/v1"
+            activeModelServiceBaseURL = components.url?.absoluteString
+        }
+        phase = .running
+        modelLoadProgress = nil
+        modelLoadMessage = "Verifying externally running model service: \(identifier)..."
+        serverHealth = .starting("Checking the externally running model service")
+        appendLog("Discovered externally running model service: \(identifier).")
+    }
+
+    private func stableRoles(
+        _ incoming: [ProcessRole],
+        preservingVolatileFieldsFrom current: [ProcessRole],
+        capturesVolatileTelemetry: Bool
+    ) -> [ProcessRole] {
+        guard !capturesVolatileTelemetry else { return incoming }
+        return incoming.map { role in
+            guard let existing = current.first(where: {
+                $0.role == role.role && $0.instanceID == role.instanceID
+            }) else { return role }
+            var stable = role
+            stable.logTail = existing.logTail
+            return stable
+        }
+    }
+
+    func inferenceRolesForActiveModel(on node: TokenityNode) -> [ProcessRole] {
+        let inferenceRoles = node.roles.filter { Self.inferenceRoleNames.contains($0.role) }
+        guard let activeModelInstanceID else { return inferenceRoles }
+
+        let exact = inferenceRoles.filter { $0.instanceID == activeModelInstanceID }
+        if !exact.isEmpty {
+            return exact
+        }
+
+        // A legacy Agent cannot attach instance IDs to process roles. Only
+        // accept those unscoped roles when that Agent does not advertise
+        // managed-instance support.
+        guard node.agentContract?.supports("managed_instances") != true else { return [] }
+        return inferenceRoles.filter { $0.instanceID == nil }
+    }
+
+    func clusterRuntimeForActiveModel(on node: TokenityNode) -> ClusterRuntimeStatus? {
+        guard let activeModelInstanceID else { return node.clusterRuntime }
+        if let exact = node.clusterRuntimes.first(where: {
+            $0.instanceID == activeModelInstanceID
+        }) {
+            return exact
+        }
+        if let singleton = node.clusterRuntime,
+           singleton.instanceID == activeModelInstanceID {
+            return singleton
+        }
+        guard node.agentContract?.supports("instance_runtimes") != true else { return nil }
+        guard node.agentContract?.supports("managed_instances") != true else { return nil }
+        return node.clusterRuntime?.instanceID == nil ? node.clusterRuntime : nil
     }
 
     func toggleNodeSelection(_ node: TokenityNode) {
@@ -562,15 +988,16 @@ final class TokenityStore: ObservableObject {
             appendLog("Model load blocked because the selected cluster Mac is not reachable.")
             return
         }
-        if connectionMode != .ring {
-            await refreshSelectedNodeStatus()
-            let issues = readinessIssues(for: selectedNodes)
-            guard issues.isEmpty else {
-                let message = "Thunderbolt RDMA is not ready: \(issues.joined(separator: " "))"
-                modelLoadMessage = message
-                appendLog("Model load blocked. \(message)")
-                return
-            }
+        await refreshSelectedNodeStatus()
+        let issues = readinessIssues(for: selectedNodes)
+        guard issues.isEmpty else {
+            let prefix = connectionMode == .ring
+                ? "The selected cluster is not ready"
+                : "Thunderbolt RDMA is not ready"
+            let message = "\(prefix): \(issues.joined(separator: " "))"
+            modelLoadMessage = message
+            appendLog("Model load blocked. \(message)")
+            return
         }
 
         let cancelledChatTask = cancelActiveChat(
@@ -580,29 +1007,46 @@ final class TokenityStore: ObservableObject {
         if let cancelledChatTask { await cancelledChatTask.value }
 
         var states = modelLoadStates
-        for key in states.keys where key != row.id {
-            states[key] = .notLoaded
-        }
         states[row.id] = .loading
         modelLoadStates = states
         modelPath = row.representativePath
         modelLoadMessage = "Loading \(row.displayName)..."
         modelLoadProgress = 0
+        serverHealth = .starting("Loading \(row.displayName)")
         nativeMTPRuntime = nil
         legacyNativeMTPFallback = nil
         appendLog("Loading model: \(row.displayName).")
         let configuration = modelConfiguration(for: row.id)
         let operationID = UUID()
+        let requestedInstanceID = UUID().uuidString
         activeModelLoadID = operationID
 
         do {
-            // Clear stale roles on every selected Mac. This also makes switching
-            // from GLM to Qwen deterministic after the control App has restarted.
-            try await cleanupAllModelRoles()
+            // Clean unknown legacy roles only when Tokenity is not already
+            // managing an instance. Existing instances must remain isolated so
+            // a second model can be admitted on the same Mac(s).
+            if managedModelInstances.isEmpty {
+                let previousLoaded = loadedModelName
+                try await cleanupActiveInstanceOrLegacy()
+                if let previousLoaded, previousLoaded != row.id {
+                    states = modelLoadStates
+                    states[previousLoaded] = .notLoaded
+                    states[row.id] = .loading
+                    modelLoadStates = states
+                }
+            }
             try ensureActiveModelLoad(operationID)
             let role = backendRole
             loadedBackendRole = role
-            try await startBackendModel(row, role: role, configuration: configuration)
+            let startResponse = try await startBackendModel(
+                row,
+                role: role,
+                configuration: configuration,
+                operationID: operationID,
+                instanceID: requestedInstanceID
+            )
+            activeModelInstanceID = startResponse?.instanceID
+            activeModelServiceBaseURL = startResponse?.apiBaseURL
             try ensureActiveModelLoad(operationID)
             let serviceModelName = try await waitForModelService(
                 modelName: row.displayName,
@@ -610,71 +1054,126 @@ final class TokenityStore: ObservableObject {
                 operationID: operationID
             )
             try ensureActiveModelLoad(operationID)
+            modelLoadProgress = max(modelLoadProgress ?? 0, 0.98)
+            modelLoadMessage = "Verifying inference for \(row.displayName)..."
+            try await probeModelService(modelName: serviceModelName)
+            try ensureActiveModelLoad(operationID)
+            if let quorum = try await fetchInstanceQuorum() {
+                applyRuntimeMemory(from: quorum)
+                guard quorum.ready else {
+                    throw TokenityTransportError.backendExited(
+                        quorum.issues.joined(separator: " ")
+                    )
+                }
+            }
 
             states = modelLoadStates
-            for key in states.keys where key != row.id {
-                states[key] = .notLoaded
-            }
             states[row.id] = .loaded
             modelLoadStates = states
             loadedBackendRole = role
             loadedServiceModelName = serviceModelName
+            activeLoadedModelID = row.id
+            if let instanceID = startResponse?.instanceID {
+                managedModelInstances[row.id] = ManagedModelInstance(
+                    modelID: row.id,
+                    serviceModelName: serviceModelName,
+                    instanceID: instanceID,
+                    apiBaseURL: startResponse?.apiBaseURL,
+                    backendRole: role
+                )
+            }
             activeModelLoadID = nil
             modelLoadTask = nil
             modelLoadProgress = 1
             modelLoadMessage = "\(row.displayName) is loaded."
+            // A verified model service is authoritative evidence that the
+            // logical cluster is running. This also repairs any stale phase
+            // published by a status sample taken while the previous model was
+            // being stopped during a legacy-Agent model switch.
+            phase = .running
+            serverHealth = .ready
             appendLog("Model loaded: \(row.displayName).")
         } catch is CancellationError {
-            try? await cleanupAllModelRoles()
+            try? await cleanupInstanceOrLegacy(
+                instanceID: requestedInstanceID,
+                allowsGlobalFallback: managedModelInstances.isEmpty
+            )
             if activeModelLoadID == operationID {
                 activeModelLoadID = nil
-                resetModelLoadState(message: "Model loading cancelled.")
+                states = modelLoadStates
+                states[row.id] = .notLoaded
+                modelLoadStates = states
+                restoreActiveManagedInstance()
+                modelLoadMessage = "Model loading cancelled."
                 appendLog("Model loading cancelled: \(row.displayName).")
             }
         } catch {
-            try? await cleanupAllModelRoles()
+            try? await cleanupInstanceOrLegacy(
+                instanceID: requestedInstanceID,
+                allowsGlobalFallback: managedModelInstances.isEmpty
+            )
             guard activeModelLoadID == operationID else { return }
             activeModelLoadID = nil
             modelLoadTask = nil
             states = modelLoadStates
-            states[row.id] = .notLoaded
+            states[row.id] = .failed
             modelLoadStates = states
-            modelPath = ""
-            loadedBackendRole = nil
-            loadedServiceModelName = nil
+            restoreActiveManagedInstance()
             modelLoadProgress = nil
             let message = userFacingMessage(for: error)
+            serverHealth = loadedModelName == nil ? .error(message) : .ready
             modelLoadMessage = message
             appendLog("Model load failed: \(message)")
         }
     }
 
     func stopModel(_ row: ModelLibraryRow) async {
-        let cancelledChatTask = cancelActiveChat(
-            message: "Generation stopped because the model was unloaded.",
-            logReason: "model unload"
-        )
-        if let cancelledChatTask { await cancelledChatTask.value }
+        // Publish unloading before the first suspension point. Otherwise the
+        // status monitor can observe a stopped process while the model still
+        // looks loaded and incorrectly collapse the logical cluster state.
         activeModelLoadID = nil
         modelLoadTask?.cancel()
         modelLoadTask = nil
         var states = modelLoadStates
-        for key in states.keys where key != row.id {
-            states[key] = .notLoaded
-        }
         states[row.id] = .unloading
         modelLoadStates = states
         modelLoadProgress = nil
         nativeMTPRuntime = nil
         modelLoadMessage = "Unloading \(row.displayName) and releasing memory on all Macs..."
         appendLog("Unloading model: \(row.displayName).")
+
+        let stopsActiveChatModel = activeLoadedModelID == row.id
+        let cancelledChatTask = stopsActiveChatModel
+            ? cancelActiveChat(
+                message: "Generation stopped because the model was unloaded.",
+                logReason: "model unload"
+            )
+            : nil
+        if let cancelledChatTask { await cancelledChatTask.value }
+        let managed = managedModelInstances[row.id]
+        let targetInstanceID = managed?.instanceID
+            ?? (activeLoadedModelID == row.id ? activeModelInstanceID : nil)
         do {
-            try await cleanupAllModelRoles()
+            try await cleanupInstanceOrLegacy(
+                instanceID: targetInstanceID,
+                allowsGlobalFallback: managedModelInstances.count <= 1
+            )
         } catch {
             appendLog("Some model stop requests could not reach a selected Mac: \(userFacingMessage(for: error))")
         }
+        managedModelInstances.removeValue(forKey: row.id)
+        states = modelLoadStates
+        states[row.id] = .notLoaded
+        modelLoadStates = states
+        if activeLoadedModelID == row.id {
+            restoreActiveManagedInstance()
+        }
         await refreshSelectedNodeStatus()
-        resetModelLoadState(message: "No model loaded")
+        modelLoadProgress = nil
+        modelLoadMessage = loadedModelName.map { "\($0) remains loaded." } ?? "No model loaded"
+        if loadedModelName == nil {
+            serverHealth = .starting("Waiting for a model to load")
+        }
         appendLog("Model stopped: \(row.displayName).")
     }
 
@@ -713,7 +1212,14 @@ final class TokenityStore: ObservableObject {
         chatInput = ""
         chatMessages.append(ChatMessage(role: .user, content: prompt))
         let userIndex = chatMessages.count - 1
-        chatMessages.append(ChatMessage(role: .assistant, content: "", thinking: "Preparing response..."))
+        chatMessages.append(
+            ChatMessage(
+                role: .assistant,
+                content: "",
+                generationState: .waiting,
+                modelName: modelName
+            )
+        )
         let assistantIndex = chatMessages.count - 1
         let requestID = UUID()
         activeChatRequestID = requestID
@@ -739,19 +1245,46 @@ final class TokenityStore: ObservableObject {
         var tokenEstimate = 0
 
         do {
-            try await streamClusterChat(
-                serviceModelName: serviceModelName,
-                prompt: prompt,
-                configuration: configuration,
-                userIndex: userIndex,
-                assistantIndex: assistantIndex,
-                requestID: requestID,
-                start: start,
-                firstTokenAt: &firstTokenAt,
-                tokenEstimate: &tokenEstimate
-            )
+            var streamingAttempt = 0
+            while true {
+                do {
+                    try await streamClusterChat(
+                        serviceModelName: serviceModelName,
+                        prompt: prompt,
+                        configuration: configuration,
+                        userIndex: userIndex,
+                        assistantIndex: assistantIndex,
+                        requestID: requestID,
+                        start: start,
+                        firstTokenAt: &firstTokenAt,
+                        tokenEstimate: &tokenEstimate
+                    )
+                    break
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch TokenityTransportError.repetitiveOutput {
+                    throw TokenityTransportError.repetitiveOutput
+                } catch {
+                    guard streamingAttempt == 0,
+                          !assistantMessageHasVisibleOutput(at: assistantIndex),
+                          isExplicitStreamTransportFailure(error)
+                    else { throw error }
+                    streamingAttempt += 1
+                    firstTokenAt = nil
+                    tokenEstimate = 0
+                    chatMessages[assistantIndex].generationState = .waiting
+                    chatMessages[assistantIndex].statusMessage = "The first streaming connection was not ready; reconnecting…"
+                    appendLog("The first chat stream ended before producing output; retrying the streaming connection once: \(userFacingMessage(for: error))")
+                    try ensureActiveChatRequest(requestID)
+                }
+            }
             try ensureActiveChatRequest(requestID)
-            finishChatMetrics(start: start, firstTokenAt: firstTokenAt, tokenEstimate: tokenEstimate)
+            finishChatMetrics(
+                start: start,
+                firstTokenAt: firstTokenAt,
+                tokenEstimate: tokenEstimate,
+                assistantIndex: assistantIndex
+            )
         } catch is CancellationError {
             finishCancelledChatIfActive(
                 requestID,
@@ -761,25 +1294,29 @@ final class TokenityStore: ObservableObject {
         } catch TokenityTransportError.repetitiveOutput {
             chatMessages[userIndex].includeInContext = false
             chatMessages[assistantIndex].includeInContext = false
-            let placeholder = chatMessages[assistantIndex].thinking
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if placeholder == "Preparing response..." || placeholder == "Waiting for first response..." {
-                chatMessages[assistantIndex].thinking = ""
-            }
             let notice = "Generation stopped because repeated output was detected."
             let content = chatMessages[assistantIndex].content
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             chatMessages[assistantIndex].content = content.isEmpty
                 ? notice
                 : "\(chatMessages[assistantIndex].content)\n\n\(notice)"
+            chatMessages[assistantIndex].generationState = .repetitive
+            chatMessages[assistantIndex].statusMessage = notice
             chatScrollRevision += 1
-            finishChatMetrics(start: start, firstTokenAt: firstTokenAt, tokenEstimate: tokenEstimate)
+            finishChatMetrics(
+                start: start,
+                firstTokenAt: firstTokenAt,
+                tokenEstimate: tokenEstimate,
+                assistantIndex: assistantIndex
+            )
             appendLog("Chat generation stopped automatically after repeated output was detected.")
         } catch let streamingError {
-            if !assistantMessageHasVisibleOutput(at: assistantIndex) {
+            if !assistantMessageHasVisibleOutput(at: assistantIndex),
+               isExplicitStreamTransportFailure(streamingError) {
                 do {
                     try ensureActiveChatRequest(requestID)
-                    chatMessages[assistantIndex].thinking = "Retrying without streaming..."
+                    chatMessages[assistantIndex].generationState = .waiting
+                    chatMessages[assistantIndex].statusMessage = "Both streaming connections were interrupted; retrying once without streaming."
                     try await completeClusterChat(
                         serviceModelName: serviceModelName,
                         configuration: configuration,
@@ -789,7 +1326,12 @@ final class TokenityStore: ObservableObject {
                         tokenEstimate: &tokenEstimate
                     )
                     try ensureActiveChatRequest(requestID)
-                    finishChatMetrics(start: start, firstTokenAt: firstTokenAt, tokenEstimate: tokenEstimate)
+                    finishChatMetrics(
+                        start: start,
+                        firstTokenAt: firstTokenAt,
+                        tokenEstimate: tokenEstimate,
+                        assistantIndex: assistantIndex
+                    )
                     appendLog("Streaming chat connection failed, then recovered with a non-streaming response: \(userFacingMessage(for: streamingError))")
                     return
                 } catch is CancellationError {
@@ -805,6 +1347,9 @@ final class TokenityStore: ObservableObject {
                     chatMessages[assistantIndex].thinking = ""
                     let detail = userFacingMessage(for: fallbackError)
                     chatMessages[assistantIndex].content = "The model request could not complete. \(detail)"
+                    chatMessages[assistantIndex].generationState = .failed
+                    chatMessages[assistantIndex].statusMessage = detail
+                    if chatInput.isEmpty { chatInput = prompt }
                     appendLog("Chat streaming failed: \(userFacingMessage(for: streamingError))")
                     appendLog("Chat fallback failed: \(detail)")
                     return
@@ -818,18 +1363,30 @@ final class TokenityStore: ObservableObject {
                     chatMessages[assistantIndex].content = "The model returned reasoning but did not finish a final answer. Try again if you need the final response."
                 }
             }
+            chatMessages[assistantIndex].generationState = .failed
+            chatMessages[assistantIndex].statusMessage = userFacingMessage(for: streamingError)
+            if chatInput.isEmpty { chatInput = prompt }
             appendLog("Chat request could not complete: \(userFacingMessage(for: streamingError))")
         }
 
     }
 
     func createCluster() {
-        if launchPreview.readinessIssues.isEmpty {
+        // Connectivity is refreshed asynchronously immediately before model
+        // loading. The UI still disables this action while an Agent is offline,
+        // but the synchronous state transition must not trust an unrefreshed
+        // sample snapshot (and remains directly testable with mocked Agents).
+        let configurationIssues = launchPreview.readinessIssues.filter {
+            !$0.hasSuffix("Node Agent is offline.")
+        }
+        if configurationIssues.isEmpty {
             phase = .launching
+            serverHealth = .starting("Waiting for a model to load")
             appendLog("Cluster created with \(selectedNodes.count) selected Mac(s).")
             phase = .running
         } else {
             phase = .failed
+            serverHealth = .error("Cluster creation is blocked by readiness issues.")
             appendLog("Cluster creation blocked. Review readiness warnings.")
         }
     }
@@ -840,6 +1397,7 @@ final class TokenityStore: ObservableObject {
 
     func stopCluster() async {
         phase = .stopping
+        serverHealth = .starting("Stopping model service")
         let cancelledChatTask = cancelActiveChat(
             message: "Generation stopped because the cluster was stopped.",
             logReason: "cluster stop"
@@ -850,15 +1408,18 @@ final class TokenityStore: ObservableObject {
         modelLoadTask = nil
         do {
             try await cleanupAllModelRoles()
+            markInferenceRolesStoppedLocally()
         } catch {
             appendLog("Cluster cleanup could not reach every selected Mac: \(userFacingMessage(for: error))")
         }
         resetModelLoadState(message: "No model loaded")
         appendLog("Cluster stopped.")
         phase = .stopped
+        serverHealth = .stopped
     }
 
     func shutdownForApplicationTermination() async {
+        stopStatusMonitoring()
         let cancelledChatTask = cancelActiveChat(
             message: "Generation stopped because Tokenity is closing.",
             logReason: "application termination"
@@ -867,9 +1428,13 @@ final class TokenityStore: ObservableObject {
         activeModelLoadID = nil
         modelLoadTask?.cancel()
         modelLoadTask = nil
-        try? await cleanupAllModelRoles()
+        if (try? await cleanupAllModelRoles()) != nil {
+            markInferenceRolesStoppedLocally()
+        }
         resetModelLoadState(message: "No model loaded")
         phase = .stopped
+        serverHealth = .stopped
+        await waitForPendingChatHistoryWrites()
     }
 
     func stop() {
@@ -912,12 +1477,15 @@ final class TokenityStore: ObservableObject {
         if backendMode == .distributed && nativeMTPMode == .auto {
             warnings.append("Native MTP Auto falls back to standard decoding when the model, checkpoint, or runtime is incompatible.")
         }
-        launchPreview = LaunchPreview(
+        let nextPreview = LaunchPreview(
             summary: summary,
             networkPlan: networkPlan(for: nodes),
             warnings: warnings,
             readinessIssues: readiness
         )
+        if launchPreview != nextPreview {
+            launchPreview = nextPreview
+        }
     }
 
     private func fetchModels(for node: TokenityNode) async -> [ModelEntry]? {
@@ -989,10 +1557,115 @@ final class TokenityStore: ObservableObject {
         modelPath = ""
         loadedBackendRole = nil
         loadedServiceModelName = nil
+        activeLoadedModelID = nil
+        managedModelInstances.removeAll()
+        activeModelInstanceID = nil
+        activeModelServiceBaseURL = nil
+        for index in nodes.indices {
+            nodes[index].runtimeMemory = nil
+        }
         modelLoadProgress = nil
         nativeMTPRuntime = nil
         legacyNativeMTPFallback = nil
         modelLoadMessage = message
+        serverHealth = phase == .running
+            ? .starting("Waiting for a model to load")
+            : .stopped
+    }
+
+    private func markInferenceRolesStoppedLocally() {
+        for index in nodes.indices where selectedNodeIDs.contains(nodes[index].id) {
+            nodes[index].roles = nodes[index].roles.map { role in
+                guard Self.inferenceRoleNames.contains(role.role) else { return role }
+                var stopped = role
+                stopped.state = "stopped"
+                stopped.pid = nil
+                return stopped
+            }
+            nodes[index].clusterRuntime = nil
+            nodes[index].clusterRuntimes = []
+        }
+    }
+
+    private func reconcileExternallyStoppedService() {
+        // Stopping the previous runtime is an expected part of loading or
+        // unloading a model on legacy Agents. A polling sample can observe the
+        // old role as stopped before the new start request completes; treating
+        // that sample as an external exit races the transition and disables
+        // Chat even after the new model becomes ready.
+        guard activeModelLoadID == nil,
+              !isModelTransitioning,
+              loadedModelName != nil
+        else { return }
+        let inferenceRoles = selectedNodes.flatMap { inferenceRolesForActiveModel(on: $0) }
+        guard !inferenceRoles.isEmpty else { return }
+
+        if let failed = inferenceRoles.first(where: { $0.state.lowercased() == "failed" }) {
+            let message = failed.message ?? "The \(failed.role) process failed."
+            if failActiveManagedInstanceAndRestoreSibling(message: message) {
+                return
+            }
+            serverHealth = .error(message)
+            return
+        }
+
+        let hasActiveRole = inferenceRoles.contains { role in
+            let state = role.state.lowercased()
+            return role.pid != nil && state != "stopped" && state != "failed"
+        }
+        if selectedNodes.allSatisfy(\.isOnline), !hasActiveRole {
+            let message = "The active model service exited outside Tokenity."
+            if failActiveManagedInstanceAndRestoreSibling(message: message) {
+                return
+            }
+            cancelActiveChat(
+                message: "Generation stopped because the model service exited outside Tokenity.",
+                logReason: "external service stop"
+            )
+            resetModelLoadState(message: "Model service stopped outside Tokenity.")
+            phase = .stopped
+            appendLog("Detected that the model service was stopped outside Tokenity.")
+        }
+    }
+
+    private func failActiveManagedInstanceAndRestoreSibling(message: String) -> Bool {
+        guard let failedModelID = activeLoadedModelID,
+              let failedInstanceID = activeModelInstanceID,
+              managedModelInstances[failedModelID]?.instanceID == failedInstanceID,
+              managedModelInstances.keys.contains(where: {
+                  $0 != failedModelID && modelLoadStates[$0] == .loaded
+              })
+        else { return false }
+
+        cancelActiveChat(
+            message: "Generation stopped because the active model instance exited.",
+            logReason: "managed instance exit"
+        )
+        var states = modelLoadStates
+        states[failedModelID] = .failed
+        modelLoadStates = states
+        managedModelInstances.removeValue(forKey: failedModelID)
+        restoreActiveManagedInstance()
+
+        guard let replacement = loadedModelName else { return false }
+        phase = .running
+        serverHealth = .ready
+        modelLoadMessage = "\(message) Switched to \(replacement), which remains loaded."
+        appendLog("Managed model instance \(failedModelID) exited; switched to \(replacement).")
+        return true
+    }
+
+    static let inferenceRoleNames: Set<String> = [
+        "distributed-openai",
+        "distributed-openai-rank",
+        "single-node-openai",
+        "official-mlx-lm",
+    ]
+
+    private static func isActiveInferenceProcess(_ role: ProcessRole) -> Bool {
+        guard inferenceRoleNames.contains(role.role), role.pid != nil else { return false }
+        let state = role.state.lowercased()
+        return state != "stopped" && state != "failed"
     }
 
     private func aggregateNativeMTPCapability(
@@ -1041,8 +1714,11 @@ final class TokenityStore: ObservableObject {
     }
 
     private func readinessIssues(for nodes: [TokenityNode]) -> [String] {
-        guard connectionMode != .ring else { return [] }
-        return nodes.flatMap { node -> [String] in
+        var issues = nodes.compactMap { node in
+            node.isOnline ? nil : "\(node.displayName) Node Agent is offline."
+        }
+        guard connectionMode != .ring else { return issues }
+        issues.append(contentsOf: nodes.filter(\.isOnline).flatMap { node -> [String] in
             var issues: [String] = []
             if !node.rdma.rdmaEnabled {
                 let detail = node.rdma.rdmaErrors.first.map { " \($0)" } ?? ""
@@ -1054,25 +1730,31 @@ final class TokenityStore: ObservableObject {
                 issues.append("\(node.displayName) needs a detected Thunderbolt network address.")
             }
             return issues
-        }
+        })
+        return issues
     }
 
     private func networkPlan(for nodes: [TokenityNode]) -> [NetworkPlanRow] {
         nodes.map { node in
             let ready: Bool
             let detail: String
-            switch connectionMode {
-            case .ring:
-                ready = true
-                detail = "Uses the standard network path."
-            case .jaccl, .jacclRing:
-                ready = node.rdma.rdmaEnabled && node.rdma.thunderboltIP != nil
-                if ready {
-                    detail = "Direct Thunderbolt link detected."
-                } else if let error = node.rdma.rdmaErrors.first {
-                    detail = error
-                } else {
-                    detail = "Thunderbolt link information is incomplete."
+            if !node.isOnline {
+                ready = false
+                detail = "Node Agent is offline or unreachable."
+            } else {
+                switch connectionMode {
+                case .ring:
+                    ready = true
+                    detail = "Uses the standard network path."
+                case .jaccl, .jacclRing:
+                    ready = node.rdma.rdmaEnabled && node.rdma.thunderboltIP != nil
+                    if ready {
+                        detail = "Direct Thunderbolt link detected."
+                    } else if let error = node.rdma.rdmaErrors.first {
+                        detail = error
+                    } else {
+                        detail = "Thunderbolt link information is incomplete."
+                    }
                 }
             }
             return NetworkPlanRow(
@@ -1107,16 +1789,25 @@ final class TokenityStore: ObservableObject {
     private func startBackendModel(
         _ row: ModelLibraryRow,
         role: String,
-        configuration: ModelRuntimeConfiguration
-    ) async throws {
+        configuration: ModelRuntimeConfiguration,
+        operationID: UUID,
+        instanceID: String
+    ) async throws -> AgentStartModelResponse? {
         guard let baseURL = clusterControlBaseURL() else { throw TokenityTransportError.missingClusterControl }
         let nativeMTP = effectiveNativeMTPConfiguration
-
-        func requestBody(nativeMTP: NativeMTPConfiguration?) -> AgentStartModelRequest {
-            AgentStartModelRequest(
+        func requestBody(
+            nativeMTP: NativeMTPConfiguration?,
+            includesInstanceMetadata: Bool
+        ) -> AgentStartModelRequest {
+            // The Agent receiving this request always starts rank 0 locally.
+            // Keep the selected coordinator first even after users temporarily
+            // remove and re-add the original primary Mac.
+            let rankNodes = backendMode == .singleNode
+                ? Array(plannedNodes.prefix(1))
+                : plannedNodes
+            return AgentStartModelRequest(
                 model: row.representativePath,
-                nodes: (backendMode == .singleNode ? Array(selectedNodes.prefix(1)) : selectedNodes)
-                    .map(agentNodePayload(for:)),
+                nodes: rankNodes.map(agentNodePayload(for:)),
                 connectionMode: backendMode == .singleNode ? ConnectionMode.ring.cliValue : connectionMode.cliValue,
                 startingPort: mlxStartingPort,
                 host: "0.0.0.0",
@@ -1129,61 +1820,164 @@ final class TokenityStore: ObservableObject {
                 promptConcurrency: configuration.promptConcurrency,
                 trustRemoteCode: configuration.trustRemoteCode,
                 leaseSeconds: modelLeaseSeconds,
-                nativeMTP: nativeMTP
+                nativeMTP: nativeMTP,
+                instanceID: includesInstanceMetadata ? instanceID : nil,
+                operationID: includesInstanceMetadata ? operationID.uuidString : nil
             )
         }
 
-        func send(_ body: AgentStartModelRequest) async throws {
+        func send(_ body: AgentStartModelRequest) async throws -> AgentStartModelResponse? {
             var request = try jsonRequest(url: baseURL.appendingPathComponent(backendStartPath), body: body)
             request.timeoutInterval = 40
             let (data, response) = try await dataTransport(request)
             try validate(response, data: data)
+            return try? JSONDecoder().decode(AgentStartModelResponse.self, from: data)
         }
 
-        do {
-            // A missing field is equivalent to off for both old and new
-            // Agents, so standard decoding stays backward compatible.
-            try await send(requestBody(nativeMTP: nativeMTP.mode == .off ? nil : nativeMTP))
-        } catch TokenityTransportError.httpStatus(let status, let detail)
-            where status == 422 && isUnsupportedNativeMTPField(detail) {
-            switch nativeMTP.mode {
-            case .auto:
-                appendLog("The running Node Agent predates Native MTP. Auto is falling back to standard decoding for this load.")
-                legacyNativeMTPFallback = NativeMTPReadiness(
-                    requestedMode: NativeMTPMode.auto.rawValue,
-                    enabled: false,
-                    status: "unsupported",
-                    effectiveMode: "standard",
-                    fallbackReason: "unsupported_backend",
-                    message: "The running Node Agent predates Native MTP; standard decoding is active.",
-                    proposedTokens: 0,
-                    acceptedTokens: 0,
-                    acceptanceRate: nil
+        var includesInstanceMetadata = true
+        var requestedNativeMTP = nativeMTP.mode == .off ? nil : nativeMTP
+
+        while true {
+            do {
+                // Optional feature fields are removed one capability at a time
+                // when an older Agent rejects them. This preserves the stable
+                // load/chat path during a rolling Control/Agent upgrade.
+                return try await send(
+                    requestBody(
+                        nativeMTP: requestedNativeMTP,
+                        includesInstanceMetadata: includesInstanceMetadata
+                    )
                 )
-                nativeMTPRuntime = legacyNativeMTPFallback
-                try await send(requestBody(nativeMTP: nil))
-            case .required:
-                throw TokenityTransportError.nativeMTPAgentUpgradeRequired
-            case .off:
+            } catch TokenityTransportError.httpStatus(let status, let detail)
+                where status == 422 && isUnsupportedOptionalStartField(detail) {
+                let rejectsInstanceMetadata = isUnsupportedInstanceMetadataField(detail)
+                let rejectsNativeMTP = isUnsupportedNativeMTPField(detail)
+
+                if includesInstanceMetadata,
+                   rejectsInstanceMetadata || (!rejectsNativeMTP && !rejectsInstanceMetadata) {
+                    includesInstanceMetadata = false
+                    appendLog("The running Node Agent predates managed model instances. Retrying with the legacy model start contract.")
+                    continue
+                }
+
+                if requestedNativeMTP != nil,
+                   rejectsNativeMTP || !rejectsInstanceMetadata {
+                    switch nativeMTP.mode {
+                    case .auto:
+                        appendLog("The running Node Agent predates Native MTP. Auto is falling back to standard decoding for this load.")
+                        legacyNativeMTPFallback = NativeMTPReadiness(
+                            requestedMode: NativeMTPMode.auto.rawValue,
+                            enabled: false,
+                            status: "unsupported",
+                            effectiveMode: "standard",
+                            fallbackReason: "unsupported_backend",
+                            message: "The running Node Agent predates Native MTP; standard decoding is active.",
+                            proposedTokens: 0,
+                            acceptedTokens: 0,
+                            acceptanceRate: nil
+                        )
+                        nativeMTPRuntime = legacyNativeMTPFallback
+                        requestedNativeMTP = nil
+                        continue
+                    case .required:
+                        throw TokenityTransportError.nativeMTPAgentUpgradeRequired
+                    case .off:
+                        break
+                    }
+                }
+
                 throw TokenityTransportError.httpStatus(status, detail)
             }
         }
     }
 
-    private func isUnsupportedNativeMTPField(_ detail: String?) -> Bool {
+    private func isUnsupportedOptionalStartField(_ detail: String?) -> Bool {
         let normalized = detail?.lowercased() ?? ""
         return normalized.contains("extra inputs") && normalized.contains("not permitted")
+    }
+
+    private func isUnsupportedInstanceMetadataField(_ detail: String?) -> Bool {
+        let normalized = detail?.lowercased() ?? ""
+        return normalized.contains("instance_id")
+            || normalized.contains("operation_id")
+            || normalized.contains("memory_reservation_bytes")
+    }
+
+    private func isUnsupportedNativeMTPField(_ detail: String?) -> Bool {
+        let normalized = detail?.lowercased() ?? ""
+        return normalized.contains("native_mtp") && isUnsupportedOptionalStartField(detail)
     }
 
     private func stopBackendRole(_ role: String, on node: TokenityNode) async throws {
         guard let baseURL = URL(string: node.agentURL) else { throw TokenityTransportError.missingClusterControl }
         var request = try jsonRequest(
             url: baseURL.appendingPathComponent("/v1/node/stop-role"),
-            body: AgentStopRoleRequest(role: role, timeout: 10)
+            body: AgentStopRoleRequest(role: role, timeout: 10, instanceID: activeModelInstanceID)
         )
         request.timeoutInterval = 15
         let (data, response) = try await dataTransport(request)
         try validate(response, data: data)
+    }
+
+    private func cleanupActiveInstanceOrLegacy() async throws {
+        try await cleanupInstanceOrLegacy(
+            instanceID: activeModelInstanceID,
+            allowsGlobalFallback: managedModelInstances.isEmpty
+        )
+    }
+
+    private func cleanupInstanceOrLegacy(
+        instanceID: String?,
+        allowsGlobalFallback: Bool
+    ) async throws {
+        guard let instanceID,
+              let baseURL = clusterControlBaseURL() else {
+            if allowsGlobalFallback {
+                try await cleanupAllModelRoles()
+            }
+            return
+        }
+        var request = try jsonRequest(
+            url: baseURL.appendingPathComponent("/v1/node/instances/\(instanceID)/stop"),
+            body: AgentStopAllRequest(timeout: 10)
+        )
+        request.timeoutInterval = 15
+        do {
+            let (data, response) = try await dataTransport(request)
+            try validate(response, data: data)
+        } catch TokenityTransportError.httpStatus(let status, _) where status == 404 {
+            if allowsGlobalFallback {
+                try await cleanupAllModelRoles()
+            } else {
+                throw TokenityTransportError.httpStatus(
+                    status,
+                    "The requested model instance is no longer registered; sibling instances were left untouched."
+                )
+            }
+        }
+    }
+
+    private func restoreActiveManagedInstance() {
+        let nextModelID = managedModelInstances.keys
+            .filter { modelLoadStates[$0] == .loaded }
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+            .first
+        guard let nextModelID,
+              let next = managedModelInstances[nextModelID] else {
+            activeLoadedModelID = nil
+            loadedBackendRole = nil
+            loadedServiceModelName = nil
+            activeModelInstanceID = nil
+            activeModelServiceBaseURL = nil
+            modelPath = ""
+            return
+        }
+        activeLoadedModelID = next.modelID
+        loadedBackendRole = next.backendRole
+        loadedServiceModelName = next.serviceModelName
+        activeModelInstanceID = next.instanceID
+        activeModelServiceBaseURL = next.apiBaseURL
+        modelPath = modelLibraryRows.first(where: { $0.id == next.modelID })?.representativePath ?? ""
     }
 
     private func cleanupAllModelRoles() async throws {
@@ -1225,15 +2019,27 @@ final class TokenityStore: ObservableObject {
 
     private func renewModelLeasesIfNeeded() async {
         guard isModelTransitioning || loadedModelName != nil else { return }
+        let instanceIDs = Set(
+            managedModelInstances.values.map(\.instanceID)
+                + [activeModelInstanceID].compactMap { $0 }
+        )
+        let heartbeatInstanceIDs: [String?] = instanceIDs.isEmpty
+            ? [nil]
+            : instanceIDs.sorted().map(Optional.some)
         for node in selectedNodes {
-            guard let baseURL = URL(string: node.agentURL),
-                  let request = try? jsonRequest(
-                    url: baseURL.appendingPathComponent("/v1/node/heartbeat"),
-                    body: AgentHeartbeatRequest(ttlSeconds: modelLeaseSeconds)
-                  ) else { continue }
-            var heartbeat = request
-            heartbeat.timeoutInterval = 3
-            _ = try? await dataTransport(heartbeat)
+            for instanceID in heartbeatInstanceIDs {
+                guard let baseURL = URL(string: node.agentURL),
+                      let request = try? jsonRequest(
+                        url: baseURL.appendingPathComponent("/v1/node/heartbeat"),
+                        body: AgentHeartbeatRequest(
+                            ttlSeconds: modelLeaseSeconds,
+                            instanceID: instanceID
+                        )
+                      ) else { continue }
+                var heartbeat = request
+                heartbeat.timeoutInterval = 3
+                _ = try? await dataTransport(heartbeat)
+            }
         }
     }
 
@@ -1268,6 +2074,16 @@ final class TokenityStore: ObservableObject {
                         if readiness.phase != "ready" {
                             lastError = TokenityTransportError.modelServiceNotReady
                             continue
+                        }
+                        if let quorum = try await fetchInstanceQuorum() {
+                            applyRuntimeMemory(from: quorum)
+                            guard quorum.ready else {
+                                let detail = quorum.issues.joined(separator: " ")
+                                lastError = TokenityTransportError.backendExited(
+                                    detail.isEmpty ? "The planned rank quorum is not ready." : detail
+                                )
+                                continue
+                            }
                         }
                     }
                     return acceptedModel.id
@@ -1312,7 +2128,7 @@ final class TokenityStore: ObservableObject {
             probeBody = OpenAIChatRequest(
                 model: modelName,
                 messages: [OpenAIChatRequest.Message(role: "user", content: "Reply with OK.")],
-                stream: false,
+                stream: true,
                 maxTokens: 16,
                 temperature: 0.7,
                 topP: 0.8,
@@ -1326,7 +2142,7 @@ final class TokenityStore: ObservableObject {
             probeBody = OpenAIChatRequest(
                 model: modelName,
                 messages: [OpenAIChatRequest.Message(role: "user", content: "Reply with OK.")],
-                stream: false,
+                stream: true,
                 maxTokens: 16
             )
         }
@@ -1334,15 +2150,33 @@ final class TokenityStore: ObservableObject {
             url: url,
             body: probeBody
         )
+        request.addValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.timeoutInterval = 120
         let (data, response) = try await dataTransport(request)
         try validate(response, data: data)
-        let decoded = try JSONDecoder().decode(OpenAIChatResponse.self, from: data)
-        let content = decoded.choices.first?.message?.content?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let reasoning = decoded.choices.first?.message?.reasoningContent?.trimmingCharacters(in: .whitespacesAndNewlines)
-            ?? decoded.choices.first?.message?.reasoning?.trimmingCharacters(in: .whitespacesAndNewlines)
-            ?? ""
-        if decoded.choices.isEmpty || (content.isEmpty && reasoning.isEmpty) {
+        guard let eventStream = String(data: data, encoding: .utf8) else {
+            throw TokenityTransportError.invalidResponse
+        }
+        var receivedToken = false
+        var receivedDone = false
+        for line in eventStream.components(separatedBy: .newlines) {
+            guard line.hasPrefix("data:") else { continue }
+            let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            if payload == "[DONE]" {
+                receivedDone = true
+                continue
+            }
+            guard let chunkData = payload.data(using: .utf8),
+                  let chunk = try? JSONDecoder().decode(OpenAIChatChunk.self, from: chunkData)
+            else { continue }
+            let delta = chunk.choices.first?.delta
+            let content = delta?.content?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let reasoning = delta?.reasoningContent?.trimmingCharacters(in: .whitespacesAndNewlines)
+                ?? delta?.reasoning?.trimmingCharacters(in: .whitespacesAndNewlines)
+                ?? ""
+            receivedToken = receivedToken || !content.isEmpty || !reasoning.isEmpty
+        }
+        if !receivedToken || !receivedDone {
             throw TokenityTransportError.noChatContent
         }
     }
@@ -1353,7 +2187,18 @@ final class TokenityStore: ObservableObject {
         request.timeoutInterval = 5
         let (data, response) = try await dataTransport(request)
         try validate(response, data: data)
-        return try JSONDecoder().decode(NodeStatusResponse.self, from: data).roles.first { $0.role == role }
+        let roles = try JSONDecoder().decode(NodeStatusResponse.self, from: data).roles
+        let candidates = roles.filter { $0.role == role }
+        guard let activeModelInstanceID else {
+            return candidates.first
+        }
+        if let exact = candidates.first(where: { $0.instanceID == activeModelInstanceID }) {
+            return exact
+        }
+        guard coordinator?.agentContract?.supports("managed_instances") != true else {
+            return nil
+        }
+        return candidates.first(where: { $0.instanceID == nil })
     }
 
     private func fetchModelReadiness() async throws -> ModelReadinessResponse? {
@@ -1365,6 +2210,36 @@ final class TokenityStore: ObservableObject {
         return try JSONDecoder().decode(ModelReadinessResponse.self, from: data)
     }
 
+    private func fetchInstanceQuorum() async throws -> InstanceQuorumResponse? {
+        guard let instanceID = activeModelInstanceID else { return nil }
+        guard let baseURL = clusterControlBaseURL() else {
+            throw TokenityTransportError.missingClusterControl
+        }
+        var request = URLRequest(
+            url: baseURL.appendingPathComponent("/v1/node/instances/\(instanceID)/quorum")
+        )
+        request.timeoutInterval = 5
+        let (data, response) = try await dataTransport(request)
+        try validate(response, data: data)
+        let quorum = try JSONDecoder().decode(InstanceQuorumResponse.self, from: data)
+        guard quorum.instanceID == instanceID else {
+            throw TokenityTransportError.invalidResponse
+        }
+        return quorum
+    }
+
+    private func applyRuntimeMemory(from quorum: InstanceQuorumResponse) {
+        let rankNodes = plannedNodes
+        for evidence in quorum.ranks {
+            guard let runtime = evidence.runtime,
+                  let rank = runtime.rank,
+                  rankNodes.indices.contains(rank),
+                  let index = nodes.firstIndex(where: { $0.id == rankNodes[rank].id })
+            else { continue }
+            nodes[index].runtimeMemory = runtime.memory
+        }
+    }
+
     private func updateModelLoadProgress(_ readiness: ModelReadinessResponse, modelName: String) {
         nativeMTPRuntime = readiness.nativeMTP ?? legacyNativeMTPFallback
         let phaseProgress: Double?
@@ -1373,7 +2248,9 @@ final class TokenityStore: ObservableObject {
         case "distributed_init": phaseProgress = 0.05
         case "loading_model": phaseProgress = readiness.progress ?? 0.1
         case "compiling": phaseProgress = readiness.progress ?? 0.96
-        case "ready": phaseProgress = 1
+        // Readiness means the weights are resident, but Tokenity still runs a
+        // real inference probe before exposing the model as loaded.
+        case "ready": phaseProgress = 0.98
         default: phaseProgress = readiness.progress
         }
         if let phaseProgress {
@@ -1381,7 +2258,7 @@ final class TokenityStore: ObservableObject {
             modelLoadProgress = max(modelLoadProgress ?? 0, bounded)
         }
         if readiness.phase == "ready" {
-            modelLoadMessage = "Finalizing \(modelName)..."
+            modelLoadMessage = "Verifying inference for \(modelName)..."
         } else if let progress = modelLoadProgress {
             let percent = Int((progress * 100).rounded())
             modelLoadMessage = "Loading \(modelName)... \(percent)%"
@@ -1422,6 +2299,13 @@ final class TokenityStore: ObservableObject {
     }
 
     private func modelServiceURL(path: String) -> URL? {
+        if let activeModelServiceBaseURL,
+           var components = URLComponents(string: activeModelServiceBaseURL),
+           components.host != nil {
+            components.path = path
+            components.query = nil
+            return components.url
+        }
         guard
             let agentURL = coordinator?.agentURL,
             var components = URLComponents(string: agentURL),
@@ -1431,6 +2315,14 @@ final class TokenityStore: ObservableObject {
         components.path = path
         components.query = nil
         return components.url
+    }
+
+    private func chatServiceURL() -> URL? {
+        if activeModelInstanceID != nil,
+           let baseURL = clusterControlBaseURL() {
+            return baseURL.appendingPathComponent("/v1/chat/completions")
+        }
+        return modelServiceURL(path: "/v1/chat/completions")
     }
 
     private func jsonRequest<T: Encodable>(url: URL, body: T) throws -> URLRequest {
@@ -1455,7 +2347,17 @@ final class TokenityStore: ObservableObject {
             }
             if let details = object["detail"] as? [[String: Any]], !details.isEmpty {
                 return details.compactMap { item in
-                    item["msg"] as? String
+                    guard let message = item["msg"] as? String else { return nil }
+                    let location = (item["loc"] as? [Any])?
+                        .compactMap { component -> String? in
+                            if let string = component as? String { return string }
+                            if let number = component as? NSNumber { return number.stringValue }
+                            return nil
+                        }
+                        .filter { $0 != "body" }
+                        .joined(separator: ".")
+                    guard let location, !location.isEmpty else { return message }
+                    return "\(location): \(message)"
                 }.joined(separator: "; ")
             }
             if let error = object["error"] as? [String: Any],
@@ -1481,6 +2383,12 @@ final class TokenityStore: ObservableObject {
         return "The cluster service is not reachable."
     }
 
+    private func isExplicitStreamTransportFailure(_ error: Error) -> Bool {
+        if error is URLError { return true }
+        let bridged = error as NSError
+        return bridged.domain == NSURLErrorDomain
+    }
+
     private func streamClusterChat(
         serviceModelName: String,
         prompt: String,
@@ -1493,7 +2401,7 @@ final class TokenityStore: ObservableObject {
         tokenEstimate: inout Int
     ) async throws {
         try ensureActiveChatRequest(requestID)
-        guard let url = modelServiceURL(path: "/v1/chat/completions") else {
+        guard let url = chatServiceURL() else {
             throw TokenityTransportError.missingModelService
         }
         var request = URLRequest(url: url)
@@ -1508,17 +2416,41 @@ final class TokenityStore: ObservableObject {
             )
         )
 
-        chatMessages[assistantIndex].thinking = "Waiting for first response..."
         var didReceiveContent = false
         var didReceiveThinking = false
         var finishReason: String?
         var repetitionDetector = ChatRepetitionDetector()
+        var tagParser = ThinkingTagStreamParser()
         var pendingThinking = ""
         var pendingContent = ""
         var lastUIFlush = Date()
+        var reasoningStartedAt: Date?
+        var reasoningFinishedAt: Date?
+        var reasoningTokenCount = 0
+
+        func observeReasoning(_ text: String) {
+            guard !text.isEmpty else { return }
+            reasoningStartedAt = reasoningStartedAt ?? Date()
+            reasoningTokenCount += estimateTokens(text)
+            pendingThinking += text
+            didReceiveThinking = true
+        }
+
+        func observeAnswer(_ text: String) {
+            guard !text.isEmpty else { return }
+            if reasoningStartedAt != nil, reasoningFinishedAt == nil {
+                reasoningFinishedAt = Date()
+            }
+            pendingContent += text
+        }
 
         func flushPendingTokens() {
             guard !pendingThinking.isEmpty || !pendingContent.isEmpty else { return }
+            guard activeChatRequestID == requestID else {
+                pendingThinking = ""
+                pendingContent = ""
+                return
+            }
             let contentBefore = chatMessages[assistantIndex].content
             let thinkingBefore = chatMessages[assistantIndex].thinking
             if !pendingThinking.isEmpty {
@@ -1526,9 +2458,18 @@ final class TokenityStore: ObservableObject {
                     pendingThinking,
                     to: chatMessages[assistantIndex].thinking
                 )
+                if pendingContent.isEmpty {
+                    chatMessages[assistantIndex].generationState = .reasoning
+                }
+                if let reasoningStartedAt {
+                    let end = reasoningFinishedAt ?? Date()
+                    chatMessages[assistantIndex].reasoningDurationSeconds = end.timeIntervalSince(reasoningStartedAt)
+                    chatMessages[assistantIndex].reasoningTokenCount = reasoningTokenCount
+                }
             }
             if !pendingContent.isEmpty {
-                appendAssistantContent(pendingContent, assistantIndex: assistantIndex)
+                chatMessages[assistantIndex].content += pendingContent
+                chatMessages[assistantIndex].generationState = .answering
             }
             didReceiveContent = didReceiveContent || chatMessages[assistantIndex].content != contentBefore
             didReceiveThinking = didReceiveThinking || chatMessages[assistantIndex].thinking != thinkingBefore
@@ -1558,13 +2499,12 @@ final class TokenityStore: ObservableObject {
                     flushPendingTokens()
                     throw TokenityTransportError.repetitiveOutput
                 }
-                pendingThinking += thinking
+                observeReasoning(thinking)
                 if firstTokenAt == nil {
                     firstTokenAt = Date()
                     shouldFlushImmediately = true
                 }
                 tokenEstimate += estimateTokens(thinking)
-                didReceiveThinking = true
             }
             if let content = delta?.content, !content.isEmpty {
                 if repetitionDetector.observe(content) {
@@ -1575,16 +2515,29 @@ final class TokenityStore: ObservableObject {
                     firstTokenAt = Date()
                     shouldFlushImmediately = true
                 }
-                pendingContent += content
+                let fragment = tagParser.consume(content)
+                observeReasoning(fragment.reasoning)
+                observeAnswer(fragment.answer)
                 tokenEstimate += estimateTokens(content)
             }
+            if let completionTokens = chunk.usage?.completionTokens {
+                tokenEstimate = completionTokens
+            }
             let pendingBytes = pendingThinking.utf8.count + pendingContent.utf8.count
-            if shouldFlushImmediately || pendingBytes >= 4_096 || Date().timeIntervalSince(lastUIFlush) >= 0.05 {
+            if shouldFlushImmediately || pendingBytes >= 4_096 || Date().timeIntervalSince(lastUIFlush) >= 0.033 {
                 flushPendingTokens()
             }
         }
+        let trailing = tagParser.finish()
+        observeReasoning(trailing.reasoning)
+        observeAnswer(trailing.answer)
         flushPendingTokens()
         try ensureActiveChatRequest(requestID)
+        if let reasoningStartedAt {
+            let end = reasoningFinishedAt ?? Date()
+            chatMessages[assistantIndex].reasoningDurationSeconds = end.timeIntervalSince(reasoningStartedAt)
+            chatMessages[assistantIndex].reasoningTokenCount = reasoningTokenCount
+        }
         if finishReason == "tokenity_repetition" {
             throw TokenityTransportError.repetitiveOutput
         }
@@ -1593,13 +2546,26 @@ final class TokenityStore: ObservableObject {
             chatMessages[assistantIndex].includeInContext = false
             if finishReason == "length" {
                 chatMessages[assistantIndex].content = "The model reached the configured maximum output length while reasoning. Increase Max Output Tokens in Model Configuration and try again."
+                chatMessages[assistantIndex].generationState = .lengthLimited
+                chatMessages[assistantIndex].statusMessage = "Stopped at the configured output token limit while reasoning."
             } else {
                 chatMessages[assistantIndex].content = "The model returned reasoning but did not finish a final answer. Try again if you need the final response."
+                chatMessages[assistantIndex].generationState = .failed
+                chatMessages[assistantIndex].statusMessage = "Reasoning ended without a final answer."
             }
             return
         }
         if !didReceiveContent {
             throw TokenityTransportError.noChatContent
+        }
+        if finishReason == "length" {
+            chatMessages[userIndex].includeInContext = false
+            chatMessages[assistantIndex].includeInContext = false
+            chatMessages[assistantIndex].generationState = .lengthLimited
+            chatMessages[assistantIndex].statusMessage = "The answer reached the configured output token limit."
+        } else {
+            chatMessages[assistantIndex].generationState = .completed
+            chatMessages[assistantIndex].statusMessage = nil
         }
     }
 
@@ -1612,7 +2578,7 @@ final class TokenityStore: ObservableObject {
         tokenEstimate: inout Int
     ) async throws {
         try ensureActiveChatRequest(requestID)
-        guard let url = modelServiceURL(path: "/v1/chat/completions") else {
+        guard let url = chatServiceURL() else {
             throw TokenityTransportError.missingModelService
         }
         var request = try jsonRequest(
@@ -1646,13 +2612,25 @@ final class TokenityStore: ObservableObject {
         }
         if !reasoning.isEmpty {
             tokenEstimate += estimateTokens(reasoning)
+            chatMessages[assistantIndex].reasoningTokenCount = estimateTokens(reasoning)
         }
         if !content.isEmpty {
             tokenEstimate += estimateTokens(content)
         }
+        if let completionTokens = decoded.usage?.completionTokens {
+            tokenEstimate = completionTokens
+        }
 
         if chatMessages[assistantIndex].content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             chatMessages[assistantIndex].content = "The model returned reasoning but did not finish a final answer. Try again if you need the final response."
+            chatMessages[assistantIndex].generationState = .failed
+            chatMessages[assistantIndex].statusMessage = "Reasoning ended without a final answer."
+        } else if decoded.choices.first?.finishReason == "length" {
+            chatMessages[assistantIndex].generationState = .lengthLimited
+            chatMessages[assistantIndex].statusMessage = "The answer reached the configured output token limit."
+        } else {
+            chatMessages[assistantIndex].generationState = .completed
+            chatMessages[assistantIndex].statusMessage = nil
         }
         chatScrollRevision += 1
         if decoded.choices.first?.finishReason == "tokenity_repetition" {
@@ -1710,8 +2688,7 @@ final class TokenityStore: ObservableObject {
         let message = chatMessages[index]
         let content = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
         let thinking = message.thinking.trimmingCharacters(in: .whitespacesAndNewlines)
-        let placeholders: Set<String> = ["Preparing response...", "Waiting for first response..."]
-        return !content.isEmpty || (!thinking.isEmpty && !placeholders.contains(thinking))
+        return !content.isEmpty || !thinking.isEmpty
     }
 
     private func ensureActiveChatRequest(_ requestID: UUID) throws {
@@ -1736,14 +2713,12 @@ final class TokenityStore: ObservableObject {
         }
         if let assistantIndex = activeChatAssistantIndex, chatMessages.indices.contains(assistantIndex) {
             chatMessages[assistantIndex].includeInContext = false
-            let thinking = chatMessages[assistantIndex].thinking.trimmingCharacters(in: .whitespacesAndNewlines)
-            if thinking == "Preparing response..." || thinking == "Waiting for first response..." || thinking == "Retrying without streaming..." {
-                chatMessages[assistantIndex].thinking = ""
-            }
             let content = chatMessages[assistantIndex].content.trimmingCharacters(in: .whitespacesAndNewlines)
             chatMessages[assistantIndex].content = content.isEmpty
                 ? message
                 : "\(chatMessages[assistantIndex].content)\n\n\(message)"
+            chatMessages[assistantIndex].generationState = .stopped
+            chatMessages[assistantIndex].statusMessage = message
         }
         activeChatRequestID = nil
         activeChatUserIndex = nil
@@ -1763,50 +2738,91 @@ final class TokenityStore: ObservableObject {
     }
 
     private func appendAssistantContent(_ rawToken: String, assistantIndex: Int) {
-        let parsed = Self.splitThinking(rawToken)
-        if !parsed.thinking.isEmpty {
-            chatMessages[assistantIndex].thinking = appendToken(parsed.thinking, to: chatMessages[assistantIndex].thinking)
+        let fragment = ThinkingTagStreamParser.parseComplete(rawToken)
+        if !fragment.reasoning.isEmpty {
+            chatMessages[assistantIndex].thinking = appendToken(fragment.reasoning, to: chatMessages[assistantIndex].thinking)
         }
-        if !parsed.answer.isEmpty {
-            chatMessages[assistantIndex].content += parsed.answer
+        if !fragment.answer.isEmpty {
+            chatMessages[assistantIndex].content += fragment.answer
         }
     }
 
     private func appendToken(_ token: String, to existing: String) -> String {
-        if existing.isEmpty || existing == "Preparing response..." || existing == "Waiting for first response..." {
-            return token
-        }
-        return existing + token
+        existing + token
     }
 
     private func syncActiveChatSession() {
         guard let index = chatSessions.firstIndex(where: { $0.id == activeChatSessionID }) else { return }
         var session = chatSessions[index]
-        session.messages = chatMessages
-        session.metrics = chatMetrics
-        session.updatedAt = Date()
-        if let firstPrompt = chatMessages.first(where: { $0.role == .user })?.content {
+        if session.titleWasEdited != true,
+           let firstPrompt = chatMessages.first(where: { $0.role == .user })?.content {
             let clean = firstPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
             if !clean.isEmpty {
                 session.title = String(clean.prefix(48))
             }
         }
+        guard session.messages != chatMessages
+                || session.metrics != chatMetrics
+                || session.title != chatSessions[index].title else { return }
+        session.messages = chatMessages
+        session.metrics = chatMetrics
+        session.updatedAt = Date()
         chatSessions[index] = session
         chatSessions.sort { $0.updatedAt > $1.updatedAt }
         persistChatSessions()
     }
 
     private func persistChatSessions() {
-        if let encoded = try? JSONEncoder().encode(chatSessions) {
-            userDefaults.set(encoded, forKey: chatSessionsKey)
+        chatHistoryRevision += 1
+        let snapshot = chatSessions
+        if writesChatHistorySynchronously {
+            if let encoded = try? JSONEncoder().encode(snapshot) {
+                userDefaults.set(encoded, forKey: chatSessionsKey)
+            }
+            return
+        }
+        let defaults = UncheckedSendableBox(value: userDefaults)
+        let key = chatSessionsKey
+        chatHistoryQueue.async {
+            guard let encoded = try? JSONEncoder().encode(snapshot) else { return }
+            defaults.value.set(encoded, forKey: key)
         }
     }
 
-    private func finishChatMetrics(start: Date, firstTokenAt: Date?, tokenEstimate: Int) {
+    private nonisolated static func loadChatSessions(from defaults: UserDefaults, key: String) -> [ChatSession]? {
+        guard let data = defaults.data(forKey: key),
+              let decoded = try? JSONDecoder().decode([ChatSession].self, from: data),
+              !decoded.isEmpty else { return nil }
+        return decoded.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    private func waitForPendingChatHistoryWrites() async {
+        guard !writesChatHistorySynchronously else { return }
+        await withCheckedContinuation { continuation in
+            chatHistoryQueue.async {
+                continuation.resume()
+            }
+        }
+    }
+
+    private func finishChatMetrics(
+        start: Date,
+        firstTokenAt: Date?,
+        tokenEstimate: Int,
+        assistantIndex: Int? = nil
+    ) {
         let total = Date().timeIntervalSince(start)
         let first = firstTokenAt?.timeIntervalSince(start)
         let rate = total > 0 ? Double(tokenEstimate) / total : nil
-        chatMetrics = ChatMetrics(firstTokenSeconds: first, totalSeconds: total, outputTokensPerSecond: rate)
+        chatMetrics = ChatMetrics(
+            firstTokenSeconds: first,
+            totalSeconds: total,
+            outputTokensPerSecond: rate,
+            outputTokens: tokenEstimate
+        )
+        if let assistantIndex, chatMessages.indices.contains(assistantIndex) {
+            chatMessages[assistantIndex].metrics = chatMetrics
+        }
     }
 
     private func estimateTokens(_ text: String) -> Int {
@@ -1831,6 +2847,11 @@ final class TokenityStore: ObservableObject {
                     }
                     guard (200..<300).contains(httpResponse.statusCode) else {
                         throw TokenityTransportError.httpStatus(httpResponse.statusCode, nil)
+                    }
+                    guard httpResponse.value(forHTTPHeaderField: "Content-Type")?
+                        .lowercased()
+                        .hasPrefix("text/event-stream") == true else {
+                        throw TokenityTransportError.invalidResponse
                     }
                     for try await line in bytes.lines {
                         retry: while !Task.isCancelled {
@@ -1857,22 +2878,7 @@ final class TokenityStore: ObservableObject {
     }
 
     static func splitThinking(_ text: String) -> (thinking: String, answer: String) {
-        var thinking = ""
-        var answer = ""
-        var remaining = text[...]
-
-        while let start = remaining.range(of: "<think>") {
-            answer += remaining[..<start.lowerBound]
-            remaining = remaining[start.upperBound...]
-            if let end = remaining.range(of: "</think>") {
-                thinking += remaining[..<end.lowerBound]
-                remaining = remaining[end.upperBound...]
-            } else {
-                thinking += remaining
-                return (String(thinking), String(answer))
-            }
-        }
-        answer += remaining
-        return (String(thinking), String(answer))
+        let fragment = ThinkingTagStreamParser.parseComplete(text)
+        return (fragment.reasoning, fragment.answer)
     }
 }

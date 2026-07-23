@@ -13,7 +13,7 @@ struct TokenityRootView: View {
             switch store.selectedSection ?? .overview {
             case .overview: OverviewPage()
             case .cluster: ClusterPage()
-            case .chat: ChatPage()
+            case .chat: ChatWorkspaceView()
             case .models: ModelsPage()
             case .network: NetworkPage()
             case .api: APIAccessPage()
@@ -24,9 +24,6 @@ struct TokenityRootView: View {
         .navigationSplitViewStyle(.balanced)
         .frame(minWidth: 1_120, idealWidth: 1_280, minHeight: 720, idealHeight: 820)
         .background(theme.window)
-        .task {
-            await store.startStatusRefreshLoop()
-        }
     }
 }
 
@@ -583,324 +580,6 @@ struct NetworkPage: View {
     }
 }
 
-struct ChatPage: View {
-    @EnvironmentObject private var store: TokenityStore
-    @Environment(\.tokenityTheme) private var theme
-    @State private var showsHistory = true
-
-    private let chatBottomID = "tokenity-chat-bottom"
-
-    var body: some View {
-        HStack(spacing: 0) {
-            VStack(spacing: 0) {
-                chatHeader
-                Divider()
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(spacing: 14) {
-                            ForEach(store.chatMessages) { message in
-                                ChatBubble(message: message)
-                            }
-                            Color.clear
-                                .frame(height: 1)
-                                .id(chatBottomID)
-                        }
-                        .padding(24)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .scrollIndicators(.visible)
-                    .contentShape(Rectangle())
-                    .background(theme.window)
-                    .onAppear {
-                        proxy.scrollTo(chatBottomID, anchor: .bottom)
-                    }
-                    .onChange(of: store.chatScrollRevision) { _, _ in
-                        proxy.scrollTo(chatBottomID, anchor: .bottom)
-                    }
-                }
-                Divider()
-                composer
-                    .padding(16)
-                    .background(theme.window)
-            }
-
-            ChatHistoryToggleRail(isExpanded: $showsHistory)
-
-            if showsHistory {
-                Divider()
-                ChatHistorySidebar()
-                    .frame(width: 270)
-            }
-        }
-        .frame(minWidth: 860, minHeight: 650)
-    }
-
-    private var chatHeader: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Chat")
-                        .font(.tokenityText(20, weight: .semibold))
-                    Text("Measure response latency after the cluster is created and a model is loaded.")
-                        .font(.tokenityText(12))
-                        .foregroundStyle(theme.secondaryText)
-                }
-                Spacer()
-                Button {
-                    store.newChatSession()
-                } label: {
-                    Label("New Chat", systemImage: "square.and.pencil")
-                }
-                .disabled(store.isChatRunning)
-                StatusPill(text: chatStatusText, tone: chatStatusTone)
-            }
-
-            HStack(spacing: 10) {
-                metricTile("First response", secondsText(store.chatMetrics.firstTokenSeconds))
-                metricTile("Total time", secondsText(store.chatMetrics.totalSeconds))
-                metricTile("Speed", speedText(store.chatMetrics.outputTokensPerSecond))
-                Spacer()
-            }
-        }
-        .padding(.horizontal, 24)
-        .padding(.vertical, 16)
-        .background(theme.window)
-    }
-
-    private var composer: some View {
-        HStack(alignment: .bottom, spacing: 10) {
-            TextField(store.isChatReady ? "Ask the loaded model..." : "Create a cluster and load a model first", text: $store.chatInput, axis: .vertical)
-                .textFieldStyle(.roundedBorder)
-                .lineLimit(1...4)
-                .onSubmit {
-                    store.beginSendingChatMessage()
-                }
-            Button {
-                if store.isChatRunning {
-                    store.cancelChatGeneration()
-                } else {
-                    store.beginSendingChatMessage()
-                }
-            } label: {
-                Label(
-                    store.isChatRunning ? "Stop" : "Send",
-                    systemImage: store.isChatRunning ? "stop.circle.fill" : "paperplane.fill"
-                )
-            }
-            .disabled(
-                !store.isChatRunning
-                    && (store.chatInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !store.isChatReady)
-            )
-        }
-    }
-
-    private var chatStatusText: String {
-        if store.isChatReady { return "Ready" }
-        if store.phase == .running { return "Load a model" }
-        return "Create cluster"
-    }
-
-    private var chatStatusTone: StatusPill.Tone {
-        store.isChatReady ? .good : .warning
-    }
-
-    private func metricTile(_ label: String, _ value: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(label)
-                .font(.tokenityText(11, weight: .semibold))
-                .foregroundStyle(theme.tertiaryText)
-            Text(value)
-                .font(.tokenityText(14, weight: .semibold))
-                .foregroundStyle(theme.text)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
-        .frame(minWidth: 120, alignment: .leading)
-        .background(theme.group, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(theme.border.opacity(0.8), lineWidth: 0.5)
-        )
-    }
-
-    private func secondsText(_ value: Double?) -> String {
-        guard let value else { return "-" }
-        return String(format: "%.2fs", value)
-    }
-
-    private func speedText(_ value: Double?) -> String {
-        guard let value else { return "-" }
-        return String(format: "%.1f tok/s", value)
-    }
-}
-
-private struct ChatHistoryToggleRail: View {
-    @Binding var isExpanded: Bool
-
-    @Environment(\.tokenityTheme) private var theme
-
-    var body: some View {
-        VStack(spacing: 0) {
-            Spacer()
-                .frame(height: 92)
-            Button {
-                isExpanded.toggle()
-            } label: {
-                Image(systemName: isExpanded ? "chevron.right" : "chevron.left")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(theme.secondaryText)
-                    .frame(width: 20, height: 42)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .background(theme.group, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .stroke(theme.border.opacity(0.8), lineWidth: 0.5)
-            )
-            .help(isExpanded ? "Collapse chat history" : "Expand chat history")
-            .accessibilityLabel(isExpanded ? "Collapse chat history" : "Expand chat history")
-            Spacer(minLength: 0)
-        }
-        .frame(width: 24)
-        .frame(maxHeight: .infinity)
-        .background(theme.window)
-    }
-}
-
-private struct ChatBubble: View {
-    let message: ChatMessage
-
-    @Environment(\.tokenityTheme) private var theme
-    @State private var isThinkingExpanded = true
-
-    var body: some View {
-        HStack {
-            if message.role == .user {
-                Spacer(minLength: 80)
-                bubble
-            } else {
-                bubble
-                Spacer(minLength: 80)
-            }
-        }
-    }
-
-    private var bubble: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text(message.role == .user ? "You" : "Tokenity")
-                    .font(.tokenityText(11, weight: .semibold))
-                    .foregroundStyle(message.role == .user ? Color.white.opacity(0.9) : theme.secondaryText)
-                Spacer()
-            }
-
-            if message.role == .assistant, !message.thinking.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                DisclosureGroup(isExpanded: $isThinkingExpanded) {
-                    Text(message.thinking)
-                        .font(.tokenityText(12))
-                        .foregroundStyle(theme.secondaryText)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.top, 4)
-                } label: {
-                    Label("Thinking", systemImage: "brain.head.profile")
-                        .font(.tokenityText(12, weight: .medium))
-                        .foregroundStyle(theme.secondaryText)
-                }
-                .padding(10)
-                .background(theme.group.opacity(0.75), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            }
-
-            Text(message.content.isEmpty ? "..." : message.content)
-                .font(.tokenityText(13))
-                .foregroundStyle(message.role == .user ? Color.white : theme.text)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(12)
-        .frame(maxWidth: 580, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(message.role == .user ? theme.accent : theme.group)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(message.role == .user ? Color.clear : theme.border.opacity(0.8), lineWidth: 0.5)
-        )
-    }
-}
-
-private struct ChatHistorySidebar: View {
-    @EnvironmentObject private var store: TokenityStore
-    @Environment(\.tokenityTheme) private var theme
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text("History")
-                    .font(.tokenityText(14, weight: .semibold))
-                Spacer()
-                Button {
-                    store.newChatSession()
-                } label: {
-                    Image(systemName: "plus")
-                }
-                .buttonStyle(.borderless)
-                .help("New chat")
-                .disabled(store.isChatRunning)
-            }
-            .padding(14)
-
-            Divider()
-
-            ScrollView {
-                LazyVStack(spacing: 6) {
-                    ForEach(store.chatSessions) { session in
-                        historyRow(session)
-                    }
-                }
-                .padding(10)
-            }
-        }
-        .background(theme.sidebar)
-    }
-
-    private func historyRow(_ session: ChatSession) -> some View {
-        HStack(spacing: 6) {
-            Button {
-                store.selectChatSession(session.id)
-            } label: {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(session.title)
-                        .font(.tokenityText(12, weight: .medium))
-                        .lineLimit(2)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    Text(session.updatedAt.formatted(date: .abbreviated, time: .shortened))
-                        .font(.tokenityText(10))
-                        .foregroundStyle(theme.tertiaryText)
-                }
-                .padding(9)
-                .background(
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .fill(session.id == store.activeChatSessionID ? theme.accent.opacity(0.14) : Color.clear)
-                )
-            }
-            .buttonStyle(.plain)
-
-            Button {
-                store.deleteChatSession(session.id)
-            } label: {
-                Image(systemName: "trash")
-                    .foregroundStyle(theme.tertiaryText)
-            }
-            .buttonStyle(.borderless)
-            .help("Delete chat")
-            .disabled(store.isChatRunning)
-        }
-    }
-}
-
 struct ModelsPage: View {
     @EnvironmentObject private var store: TokenityStore
     @Environment(\.tokenityTheme) private var theme
@@ -1039,8 +718,12 @@ private struct ModelLoadRow: View {
                     HStack(spacing: 8) {
                         if let loadingProgress {
                             ProgressView(value: loadingProgress, total: 1)
-                            Text("\(Int((loadingProgress * 100).rounded()))%")
-                                .frame(width: 36, alignment: .trailing)
+                            if loadingProgress >= 0.98 {
+                                Text("Verifying inference...")
+                            } else {
+                                Text("\(Int((loadingProgress * 100).rounded()))%")
+                                    .frame(width: 36, alignment: .trailing)
+                            }
                         } else {
                             ProgressView()
                             Text("Preparing ranks...")
@@ -1090,7 +773,7 @@ private struct ModelLoadRow: View {
                     Label("Unloading", systemImage: "hourglass")
                 }
                 .disabled(true)
-            case .notLoaded:
+            case .notLoaded, .failed:
                 Button {
                     loadAction()
                 } label: {
@@ -1114,7 +797,7 @@ private struct ModelLoadRow: View {
         switch row.loadState {
         case .loaded: return .good
         case .loading, .unloading: return .warning
-        case .notLoaded: return .danger
+        case .notLoaded, .failed: return .danger
         }
     }
 
@@ -1131,7 +814,7 @@ private struct ModelLoadRow: View {
         switch row.loadState {
         case .loaded: return theme.success
         case .loading, .unloading: return theme.warning
-        case .notLoaded: return theme.danger
+        case .notLoaded, .failed: return theme.danger
         }
     }
 }
