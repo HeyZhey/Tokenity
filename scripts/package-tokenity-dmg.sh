@@ -11,8 +11,11 @@ SCRIPTS_DIR="$WORK_DIR/scripts"
 DMG_ROOT="$WORK_DIR/dmg-root"
 RUNTIME_CACHE="$DIST_DIR/runtime-cache/TokenityRuntime"
 RUNTIME_SOURCE="${TOKENITY_RUNTIME_SOURCE:-/Users/Shared/TokenityRuntime}"
-PKG_PATH="$DIST_DIR/Tokenity-${VERSION}.pkg"
+NODE_AGENT_PACKAGE_MODE="${TOKENITY_NODE_AGENT_PACKAGE:-auto}"
+PKG_PATH="$DIST_DIR/Tokenity-NodeAgent-Runtime-${VERSION}.pkg"
 DMG_PATH="$DIST_DIR/Tokenity-${VERSION}.dmg"
+DMG_CHECKSUM_PATH="$DMG_PATH.sha256"
+APP_BUNDLE="$DMG_ROOT/TokenityControl.app"
 BACKEND_SOURCE="$ROOT/tokenity/serving/distributed_openai.py"
 
 if ! grep -q '^class TokenityDistributedRuntime' "$BACKEND_SOURCE"; then
@@ -55,28 +58,56 @@ copy_runtime_dir() {
   rsync -a --delete --delete-excluded "${runtime_excludes[@]}" "$source" "$destination/"
 }
 
+case "$NODE_AGENT_PACKAGE_MODE" in
+  auto)
+    if [[ -d "$RUNTIME_SOURCE/current/.venv" || -d "$RUNTIME_CACHE/current/.venv" ]]; then
+      BUILD_NODE_AGENT_PACKAGE=1
+    else
+      BUILD_NODE_AGENT_PACKAGE=0
+    fi
+    ;;
+  required)
+    BUILD_NODE_AGENT_PACKAGE=1
+    ;;
+  skip)
+    BUILD_NODE_AGENT_PACKAGE=0
+    ;;
+  *)
+    echo "TOKENITY_NODE_AGENT_PACKAGE must be auto, required, or skip." >&2
+    exit 1
+    ;;
+esac
+
+if [[ "${TOKENITY_INCLUDE_MODEL:-0}" == "1" && "$BUILD_NODE_AGENT_PACKAGE" != "1" ]]; then
+  echo "TOKENITY_INCLUDE_MODEL=1 requires TOKENITY_NODE_AGENT_PACKAGE=required and a runtime source." >&2
+  exit 1
+fi
+
 echo "Preparing package workspace..."
 rm -rf "$WORK_DIR"
-mkdir -p "$PAYLOAD_DIR/Applications" \
-  "$PAYLOAD_DIR/Users/Shared/TokenityCode" \
-  "$PAYLOAD_DIR/Users/Shared/TokenityRuntime" \
-  "$PAYLOAD_DIR/Users/Shared/TokenityModels" \
-  "$PAYLOAD_DIR/Library/LaunchDaemons" \
-  "$SCRIPTS_DIR" \
-  "$DMG_ROOT" \
-  "$DIST_DIR"
+rm -f "$PKG_PATH" "$DMG_PATH" "$DMG_CHECKSUM_PATH"
+mkdir -p "$SCRIPTS_DIR" "$DMG_ROOT" "$DIST_DIR"
 
 echo "Building TokenityControl.app..."
 TOKENITY_BUILD_CONFIGURATION=release \
-TOKENITY_APP_BUNDLE_PATH="$PAYLOAD_DIR/Applications/TokenityControl.app" \
+TOKENITY_APP_BUNDLE_PATH="$APP_BUNDLE" \
 TOKENITY_BUNDLE_IDENTIFIER=ai.tokenity.control \
 "$ROOT/scripts/build-tokenity-control-app.sh" >/dev/null
+
+codesign --verify --deep --strict "$APP_BUNDLE"
+ln -s /Applications "$DMG_ROOT/Applications"
+
+if [[ "$BUILD_NODE_AGENT_PACKAGE" == "1" ]]; then
+mkdir -p "$PAYLOAD_DIR/Users/Shared/TokenityCode" \
+  "$PAYLOAD_DIR/Users/Shared/TokenityRuntime" \
+  "$PAYLOAD_DIR/Users/Shared/TokenityModels" \
+  "$PAYLOAD_DIR/Library/LaunchDaemons"
 
 echo "Copying Tokenity backend code..."
 copy_dir "$ROOT/" "$PAYLOAD_DIR/Users/Shared/TokenityCode"
 
 echo "Preparing Tokenity runtime..."
-if [[ -d "$RUNTIME_SOURCE" ]]; then
+if [[ -d "$RUNTIME_SOURCE/current/.venv" ]]; then
   copy_runtime_dir "$RUNTIME_SOURCE/" "$RUNTIME_CACHE"
 elif [[ -d "$RUNTIME_CACHE/current/.venv" ]]; then
   echo "Using the cached Tokenity runtime at $RUNTIME_CACHE."
@@ -159,7 +190,7 @@ if [[ -n "$AGENT_USER" && "$AGENT_USER" != "root" && "$AGENT_USER" != "loginwind
 fi
 
 /bin/mkdir -p /Users/Shared/TokenityLogs /Users/Shared/TokenityModels /usr/local/bin
-/usr/sbin/chown -R root:wheel /Applications/TokenityControl.app "$NODE_AGENT_PLIST" 2>/dev/null || true
+/usr/sbin/chown root:wheel "$NODE_AGENT_PLIST" 2>/dev/null || true
 /usr/sbin/chown -R "$AGENT_USER":staff /Users/Shared/TokenityLogs 2>/dev/null || true
 /bin/chmod 644 "$NODE_AGENT_PLIST"
 /bin/chmod -R a+rX /Users/Shared/TokenityCode /Users/Shared/TokenityRuntime /Users/Shared/TokenityModels 2>/dev/null || true
@@ -258,7 +289,6 @@ SCRIPT
 /bin/chmod 755 "$SCRIPTS_DIR/postinstall"
 
 echo "Building installer package..."
-rm -f "$PKG_PATH" "$DMG_PATH"
 /usr/bin/xattr -cr "$PAYLOAD_DIR" 2>/dev/null || true
 /usr/bin/dot_clean -m "$PAYLOAD_DIR" 2>/dev/null || true
 pkgbuild \
@@ -268,28 +298,56 @@ pkgbuild \
   --filter '(^|/)CVS(/|$)' \
   --root "$PAYLOAD_DIR" \
   --scripts "$SCRIPTS_DIR" \
-  --identifier "ai.tokenity.installer" \
+  --identifier "ai.tokenity.node-agent.installer" \
   --version "$VERSION" \
   --install-location "/" \
   "$PKG_PATH"
+cp "$PKG_PATH" "$DMG_ROOT/Install Tokenity Node Agent.pkg"
+else
+  if [[ "$NODE_AGENT_PACKAGE_MODE" == "required" ]]; then
+    echo "Tokenity runtime not found. Set TOKENITY_RUNTIME_SOURCE to a local directory." >&2
+    exit 1
+  fi
+  echo "Tokenity runtime was not found; building a controller-only drag-install DMG."
+  echo "Set TOKENITY_NODE_AGENT_PACKAGE=required and TOKENITY_RUNTIME_SOURCE to include the Node Agent installer."
+fi
 
+if [[ "$BUILD_NODE_AGENT_PACKAGE" == "1" ]]; then
 cat > "$DMG_ROOT/README.txt" <<README
 Tokenity ${VERSION}
 
-Open Tokenity-${VERSION}.pkg to install:
-- /Applications/TokenityControl.app
+1. Drag TokenityControl.app onto the Applications folder.
+2. Run "Install Tokenity Node Agent.pkg" on every Mac that will execute models.
+
+The Node Agent package installs:
 - /Users/Shared/TokenityCode
 - /Users/Shared/TokenityRuntime
 - NodeAgent LaunchDaemon on port 9100
 
-The Qwen model weights are not included by default because they are very large.
-Expected model path after install:
-/Users/Shared/TokenityModels/Qwen3.5-122B-A10B-4bit
+Model weights are not included by default because they are very large.
+Place compatible MLX models under:
+/Users/Shared/TokenityModels
 
 To build an offline DMG with the model included, rerun package-tokenity-dmg.sh
 with TOKENITY_INCLUDE_MODEL=1.
 README
-cp "$PKG_PATH" "$DMG_ROOT/Tokenity-${VERSION}.pkg"
+else
+cat > "$DMG_ROOT/README.txt" <<README
+Tokenity ${VERSION}
+
+Drag TokenityControl.app onto the Applications folder, then open it from
+Applications.
+
+This controller-only DMG does not contain the privileged Node Agent runtime.
+Before running models, install a compatible Tokenity Node Agent on every Mac
+that will participate in inference. The Agent listens on port 9100 and models
+belong under:
+/Users/Shared/TokenityModels
+
+The first-launch guide in Tokenity explains the Cluster -> Models -> Chat
+workflow.
+README
+fi
 
 echo "Creating DMG..."
 hdiutil create \
@@ -299,6 +357,11 @@ hdiutil create \
   -format UDZO \
   "$DMG_PATH"
 
+shasum -a 256 "$DMG_PATH" > "$DMG_CHECKSUM_PATH"
+
 echo "Built:"
-echo "$PKG_PATH"
+if [[ "$BUILD_NODE_AGENT_PACKAGE" == "1" ]]; then
+  echo "$PKG_PATH"
+fi
 echo "$DMG_PATH"
+echo "$DMG_CHECKSUM_PATH"

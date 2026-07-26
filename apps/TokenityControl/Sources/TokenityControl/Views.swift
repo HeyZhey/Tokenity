@@ -27,21 +27,52 @@ struct TokenityRootView: View {
     }
 }
 
-private struct SidebarView: View {
+struct SidebarView: View {
     @Binding var selection: AppSection?
 
     @Environment(\.tokenityTheme) private var theme
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
+            sidebarBrand
+
+            Rectangle()
+                .fill(theme.border.opacity(0.72))
+                .frame(height: 0.5)
+                .padding(.horizontal, 8)
+
             sidebarGroup("Cluster", sections: AppSection.allCases.filter { $0.group == "Cluster" })
             sidebarGroup("Operations", sections: AppSection.allCases.filter { $0.group == "Operations" })
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 18)
+        .padding(.top, 20)
+        .padding(.bottom, 18)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(theme.sidebar)
+    }
+
+    private var sidebarBrand: some View {
+        HStack(spacing: 10) {
+            TokenityBrandMark()
+                .frame(width: 21, height: 21)
+                .foregroundStyle(theme.accent)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Tokenity")
+                    .font(.tokenityText(16, weight: .semibold))
+                    .foregroundStyle(theme.text)
+                Text("Distributed AI")
+                    .font(.tokenityText(9, weight: .medium))
+                    .foregroundStyle(theme.tertiaryText)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 8)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Tokenity, Distributed AI")
+        .accessibilityIdentifier("tokenity-sidebar-brand")
     }
 
     private func sidebarGroup(_ title: String, sections: [AppSection]) -> some View {
@@ -50,6 +81,7 @@ private struct SidebarView: View {
                 .font(.tokenityText(11, weight: .semibold))
                 .foregroundStyle(theme.tertiaryText)
                 .padding(.horizontal, 8)
+                .accessibilityAddTraits(.isHeader)
             ForEach(sections) { section in
                 Button {
                     selection = section
@@ -1305,6 +1337,19 @@ struct SettingsPage: View {
                 }
                 InfoRow(label: "Tokenity") {
                     StatusPill(text: "Stable target", tone: .accent)
+                }
+            }
+
+            InfoGroup(title: "Getting Started") {
+                InfoRow(label: "Welcome guide") {
+                    HStack {
+                        Text("Review installation, cluster setup, model loading, and Chat.")
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Show Guide") {
+                            store.presentOnboarding()
+                        }
+                    }
                 }
             }
         }

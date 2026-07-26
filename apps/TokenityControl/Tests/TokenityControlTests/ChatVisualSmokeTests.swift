@@ -11,6 +11,11 @@ final class ChatVisualSmokeTests: XCTestCase {
             let defaults = UserDefaults(suiteName: suiteName)!
             defer { defaults.removePersistentDomain(forName: suiteName) }
             let store = TokenityStore(userDefaults: defaults)
+            store.renameChatSession(store.activeChatSessionID, title: "Model setup notes")
+            store.newChatSession()
+            store.renameChatSession(store.activeChatSessionID, title: "SwiftUI review")
+            store.newChatSession()
+            store.renameChatSession(store.activeChatSessionID, title: "Release checklist")
             store.chatMessages = [
                 ChatMessage(role: .user, content: "Show a Markdown and code example."),
                 ChatMessage(
@@ -54,16 +59,85 @@ final class ChatVisualSmokeTests: XCTestCase {
                 .environmentObject(store)
                 .tokenityThemed()
                 .environment(\.colorScheme, scheme)
+                .environment(\.displayScale, 2)
             let hostingView = NSHostingView(rootView: root)
             hostingView.frame = NSRect(x: 0, y: 0, width: 1_200, height: 800)
             hostingView.layoutSubtreeIfNeeded()
 
             let representation = try XCTUnwrap(hostingView.bitmapImageRepForCachingDisplay(in: hostingView.bounds))
             hostingView.cacheDisplay(in: hostingView.bounds, to: representation)
+            try assertChatSurfacesAreContinuous(in: representation, logicalSize: hostingView.bounds.size)
             let data = try XCTUnwrap(representation.representation(using: .png, properties: [:]))
             let name = scheme == .light ? "light" : "dark"
             try data.write(to: URL(fileURLWithPath: "/tmp/tokenity-chat-\(name).png"))
             XCTAssertGreaterThan(data.count, 10_000)
+        }
+    }
+
+    private func assertChatSurfacesAreContinuous(
+        in representation: NSBitmapImageRep,
+        logicalSize: NSSize
+    ) throws {
+        let pixelsPerPoint = CGFloat(representation.pixelsWide) / logicalSize.width
+        let historyBoundaryX = Int(((logicalSize.width - 326) * pixelsPerPoint).rounded())
+        let headerY = Int((20 * pixelsPerPoint).rounded())
+        let bodyY = Int((logicalSize.height * 0.5 * pixelsPerPoint).rounded())
+
+        let mainHeader = try XCTUnwrap(
+            representation.colorAt(
+                x: Int((300 * pixelsPerPoint).rounded()),
+                y: headerY
+            )
+        )
+        let historyHeader = try XCTUnwrap(
+            representation.colorAt(
+                x: Int(((logicalSize.width - 150) * pixelsPerPoint).rounded()),
+                y: headerY
+            )
+        )
+        assertColor(mainHeader, matches: historyHeader, message: "Chat and History headers use different surfaces")
+
+        for y in [headerY, bodyY] {
+            let reference = try XCTUnwrap(representation.colorAt(x: historyBoundaryX - 4, y: y))
+            for x in (historyBoundaryX - 3)...(historyBoundaryX + 3) {
+                let candidate = try XCTUnwrap(representation.colorAt(x: x, y: y))
+                assertColor(
+                    candidate,
+                    matches: reference,
+                    message: "Unexpected pixel seam at the History boundary (x: \(x), y: \(y))"
+                )
+            }
+        }
+    }
+
+    private func assertColor(_ lhs: NSColor, matches rhs: NSColor, message: String) {
+        guard let left = lhs.usingColorSpace(.deviceRGB),
+              let right = rhs.usingColorSpace(.deviceRGB) else {
+            XCTFail("\(message): colors could not be converted to device RGB")
+            return
+        }
+        let tolerance = CGFloat(1.0 / 255.0)
+        XCTAssertEqual(left.redComponent, right.redComponent, accuracy: tolerance, message)
+        XCTAssertEqual(left.greenComponent, right.greenComponent, accuracy: tolerance, message)
+        XCTAssertEqual(left.blueComponent, right.blueComponent, accuracy: tolerance, message)
+        XCTAssertEqual(left.alphaComponent, right.alphaComponent, accuracy: tolerance, message)
+    }
+
+    func testSidebarNavigationRendersBrandInLightAndDarkAppearances() throws {
+        for scheme in [ColorScheme.light, .dark] {
+            let root = SidebarView(selection: .constant(.overview))
+                .tokenityThemed()
+                .environment(\.colorScheme, scheme)
+            let hostingView = NSHostingView(rootView: root)
+            hostingView.frame = NSRect(x: 0, y: 0, width: 218, height: 800)
+            hostingView.layoutSubtreeIfNeeded()
+
+            let representation = try XCTUnwrap(hostingView.bitmapImageRepForCachingDisplay(in: hostingView.bounds))
+            hostingView.cacheDisplay(in: hostingView.bounds, to: representation)
+            let data = try XCTUnwrap(representation.representation(using: .png, properties: [:]))
+            let name = scheme == .light ? "light" : "dark"
+            try data.write(to: URL(fileURLWithPath: "/tmp/tokenity-sidebar-navigation-\(name).png"))
+            XCTAssertGreaterThan(data.count, 4_000)
         }
     }
 

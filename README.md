@@ -356,16 +356,18 @@ Build an ad-hoc development app bundle:
 ./scripts/build-tokenity-control-app.sh
 ```
 
-Build the installer DMG using the configured runtime source:
+Build a standard drag-to-Applications DMG:
 
 ```bash
 ./scripts/package-tokenity-dmg.sh
 ```
 
-Model weights are excluded by default. Set `TOKENITY_INCLUDE_MODEL=1` only when
-you intentionally need a very large offline installer. See
-[Installer DMG](docs/installer-dmg.md) for runtime sources, signing, and
-verification details.
+The DMG always contains `TokenityControl.app` and an Applications link. When a
+Tokenity runtime source or cached runtime is available, it also contains a
+separate **Install Tokenity Node Agent.pkg** for every Mac that will execute
+models. Without a runtime, the script still produces a controller-only DMG.
+Model weights are excluded by default. See [Installer DMG](docs/installer-dmg.md)
+for runtime modes, signing, and verification details.
 
 ## Troubleshooting
 

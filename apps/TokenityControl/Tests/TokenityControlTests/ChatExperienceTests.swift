@@ -57,22 +57,92 @@ final class ChatParsingTests: XCTestCase {
     func testTranscriptStopsFollowingAfterManualScrollAndCanResume() {
         var state = ChatTranscriptFollowState()
         state.userDidScroll()
-        state.update(bottomDistance: 300)
-        XCTAssertFalse(state.followsLatest)
-
-        state.update(bottomDistance: 100)
         XCTAssertFalse(state.followsLatest)
 
         state.resume()
         XCTAssertTrue(state.followsLatest)
     }
 
-    func testTranscriptContentGrowthDoesNotLookLikeUserScrolling() {
-        var state = ChatTranscriptFollowState()
+    func testTranscriptScrollTransitionsAreCoalescedAcrossTenThousandTicks() {
+        var gate = TranscriptFollowTransitionGate()
+        var emissions: [Bool] = []
 
-        state.update(bottomDistance: 500)
+        for _ in 0..<10_000 {
+            if let value = gate.valueToEmit(for: false) {
+                emissions.append(value)
+            }
+        }
+        for _ in 0..<10_000 {
+            if let value = gate.valueToEmit(for: true) {
+                emissions.append(value)
+            }
+        }
 
-        XCTAssertTrue(state.followsLatest)
+        XCTAssertEqual(emissions, [false, true])
+    }
+
+    func testTranscriptTransitionGateTracksExternalResume() {
+        var gate = TranscriptFollowTransitionGate()
+
+        XCTAssertEqual(gate.valueToEmit(for: false), false)
+        gate.synchronize(with: true)
+        XCTAssertEqual(gate.valueToEmit(for: false), false)
+    }
+
+    func testTranscriptBottomDistanceSupportsFlippedAndUnflippedDocuments() {
+        let document = CGRect(x: 0, y: 0, width: 800, height: 1_000)
+
+        XCTAssertTrue(
+            TranscriptScrollGeometry.isNearBottom(
+                documentBounds: document,
+                visibleRect: CGRect(x: 0, y: 828, width: 800, height: 100),
+                isFlipped: true
+            )
+        )
+        XCTAssertFalse(
+            TranscriptScrollGeometry.isNearBottom(
+                documentBounds: document,
+                visibleRect: CGRect(x: 0, y: 827, width: 800, height: 100),
+                isFlipped: true
+            )
+        )
+        XCTAssertTrue(
+            TranscriptScrollGeometry.isNearBottom(
+                documentBounds: document,
+                visibleRect: CGRect(x: 0, y: 72, width: 800, height: 100),
+                isFlipped: false
+            )
+        )
+        XCTAssertFalse(
+            TranscriptScrollGeometry.isNearBottom(
+                documentBounds: document,
+                visibleRect: CGRect(x: 0, y: 73, width: 800, height: 100),
+                isFlipped: false
+            )
+        )
+    }
+
+    func testTranscriptAvoidsKnownScrollLayoutFeedbackPrimitives() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = packageRoot
+            .appendingPathComponent("Sources/TokenityControl/ChatViews.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        let start = try XCTUnwrap(source.range(of: "struct ChatTranscriptView"))
+        let end = try XCTUnwrap(
+            source.range(of: "private struct ChatEmptyState", range: start.upperBound..<source.endIndex)
+        )
+        let transcriptImplementation = source[start.lowerBound..<end.lowerBound]
+
+        XCTAssertFalse(transcriptImplementation.contains("PreferenceKey"))
+        XCTAssertFalse(transcriptImplementation.contains(".onPreferenceChange("))
+        XCTAssertFalse(transcriptImplementation.contains("TranscriptBottomPreferenceKey"))
+        XCTAssertFalse(
+            transcriptImplementation.contains("LazyVStack"),
+            "The transcript must not use lazy virtualization with nested selectable scroll views"
+        )
     }
 }
 

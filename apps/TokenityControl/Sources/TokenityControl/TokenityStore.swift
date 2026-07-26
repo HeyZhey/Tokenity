@@ -259,6 +259,7 @@ final class TokenityStore: ObservableObject {
     @Published private(set) var isChatHistoryLoading = false
     @Published private(set) var apiAccessStatus = "Not checked"
     @Published private(set) var modelConfigurations: [String: ModelRuntimeConfiguration] = [:]
+    @Published private(set) var isOnboardingPresented = false
     @Published var logs: [String] = [
         "Tokenity Control opened.",
         "No cluster is running."
@@ -270,6 +271,8 @@ final class TokenityStore: ObservableObject {
     private let modelConfigurationsKey = "TokenityModelRuntimeConfigurations.v1"
     private let residentAutoPreferencesKey = "TokenityResidentAutoPreferences.v1"
     private let chatSessionsKey = "TokenityChatSessions.v1"
+    private let onboardingRevisionKey = "TokenityOnboarding.completedRevision"
+    private static let currentOnboardingRevision = 1
     private let chatHistoryQueue = DispatchQueue(label: "ai.tokenity.chat-history", qos: .utility)
     private let writesChatHistorySynchronously: Bool
     private var chatHistoryRevision = 0
@@ -353,6 +356,23 @@ final class TokenityStore: ObservableObject {
             }
         }
         rebuildLaunchPreview()
+    }
+
+    func prepareForAppLaunch() {
+        isOnboardingPresented =
+            userDefaults.integer(forKey: onboardingRevisionKey) < Self.currentOnboardingRevision
+    }
+
+    func presentOnboarding() {
+        isOnboardingPresented = true
+    }
+
+    func completeOnboarding(opening section: AppSection? = nil) {
+        userDefaults.set(Self.currentOnboardingRevision, forKey: onboardingRevisionKey)
+        if let section {
+            selectedSection = section
+        }
+        isOnboardingPresented = false
     }
 
     var selectedNodes: [TokenityNode] {

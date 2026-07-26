@@ -10,8 +10,32 @@ struct TokenityControlApp: App {
             TokenityRootView()
                 .environmentObject(appDelegate.store)
                 .tokenityThemed()
+                .sheet(
+                    isPresented: Binding(
+                        get: { appDelegate.store.isOnboardingPresented },
+                        set: { isPresented in
+                            if isPresented {
+                                appDelegate.store.presentOnboarding()
+                            } else {
+                                appDelegate.store.completeOnboarding()
+                            }
+                        }
+                    )
+                ) {
+                    TokenityOnboardingView()
+                        .environmentObject(appDelegate.store)
+                        .tokenityThemed()
+                }
         }
+        .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentSize)
+        .commands {
+            CommandGroup(after: .help) {
+                Button("Show Tokenity Welcome") {
+                    appDelegate.store.presentOnboarding()
+                }
+            }
+        }
 
         MenuBarExtra {
             TokenityMenuBarContentHost(store: appDelegate.store)
@@ -28,6 +52,7 @@ final class TokenityAppDelegate: NSObject, NSApplicationDelegate {
     private var terminationInProgress = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        store.prepareForAppLaunch()
         store.startStatusMonitoring()
     }
 

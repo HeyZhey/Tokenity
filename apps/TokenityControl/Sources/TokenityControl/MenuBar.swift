@@ -398,37 +398,42 @@ struct TokenityMenuBarLabel: View, Equatable {
     }
 }
 
-struct TokenityMenuBarMark: View {
-    let level: TokenityMenuBarLevel
-
+struct TokenityBrandMark: View {
     private static let spokeCount = 10
 
     var body: some View {
         ZStack {
-            ZStack {
-                ForEach(0..<Self.spokeCount, id: \.self) { index in
-                    Capsule(style: .continuous)
-                        .frame(
-                            width: index.isMultiple(of: 2) ? 2.7 : 2.1,
-                            height: index.isMultiple(of: 2) ? 5.8 : 4.8
-                        )
-                        .offset(y: -5.8)
-                        .rotationEffect(
-                            .degrees(Double(index) * (360 / Double(Self.spokeCount)))
-                        )
-                }
-
-                RoundedRectangle(cornerRadius: 1.7, style: .continuous)
-                    .stroke(lineWidth: 1.25)
-                    .frame(width: 5.2, height: 5.2)
-
-                Circle()
-                    .frame(width: 1.7, height: 1.7)
+            ForEach(0..<Self.spokeCount, id: \.self) { index in
+                Capsule(style: .continuous)
+                    .frame(
+                        width: index.isMultiple(of: 2) ? 2.7 : 2.1,
+                        height: index.isMultiple(of: 2) ? 5.8 : 4.8
+                    )
+                    .offset(y: -5.8)
+                    .rotationEffect(
+                        .degrees(Double(index) * (360 / Double(Self.spokeCount)))
+                    )
             }
-            .foregroundStyle(.primary)
-            .frame(width: 18, height: 18)
-            .accessibilityHidden(true)
 
+            RoundedRectangle(cornerRadius: 1.7, style: .continuous)
+                .stroke(lineWidth: 1.25)
+                .frame(width: 5.2, height: 5.2)
+
+            Circle()
+                .frame(width: 1.7, height: 1.7)
+        }
+        .foregroundStyle(.primary)
+        .frame(width: 18, height: 18)
+        .accessibilityHidden(true)
+    }
+}
+
+struct TokenityMenuBarMark: View {
+    let level: TokenityMenuBarLevel
+
+    var body: some View {
+        ZStack {
+            TokenityBrandMark()
             Circle()
                 .fill(level.color)
                 .frame(width: 4.8, height: 4.8)

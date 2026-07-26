@@ -122,18 +122,58 @@ enum ChatHistoryGroup: Int, CaseIterable, Identifiable {
 struct ChatTranscriptFollowState: Equatable {
     private(set) var followsLatest = true
 
-    mutating func update(bottomDistance: CGFloat) {
-        if bottomDistance <= 72 {
-            followsLatest = true
-        }
-    }
-
     mutating func userDidScroll() {
         followsLatest = false
     }
 
     mutating func resume() {
         followsLatest = true
+    }
+}
+
+struct TranscriptFollowTransitionGate: Equatable {
+    private(set) var lastEmittedValue: Bool?
+
+    mutating func valueToEmit(for value: Bool) -> Bool? {
+        guard value != lastEmittedValue else { return nil }
+        lastEmittedValue = value
+        return value
+    }
+
+    mutating func synchronize(with value: Bool) {
+        lastEmittedValue = value
+    }
+
+    mutating func reset() {
+        lastEmittedValue = nil
+    }
+}
+
+enum TranscriptScrollGeometry {
+    static let nearBottomThreshold: CGFloat = 72
+
+    static func bottomDistance(
+        documentBounds: CGRect,
+        visibleRect: CGRect,
+        isFlipped: Bool
+    ) -> CGFloat {
+        let distance = isFlipped
+            ? documentBounds.maxY - visibleRect.maxY
+            : visibleRect.minY - documentBounds.minY
+        return max(0, distance)
+    }
+
+    static func isNearBottom(
+        documentBounds: CGRect,
+        visibleRect: CGRect,
+        isFlipped: Bool,
+        threshold: CGFloat = nearBottomThreshold
+    ) -> Bool {
+        bottomDistance(
+            documentBounds: documentBounds,
+            visibleRect: visibleRect,
+            isFlipped: isFlipped
+        ) <= threshold
     }
 }
 

@@ -4,6 +4,7 @@ import SwiftUI
 struct ChatWorkspaceView: View {
     @EnvironmentObject private var store: TokenityStore
     @Environment(\.tokenityTheme) private var theme
+    @Environment(\.displayScale) private var displayScale
     @State private var showsHistory = true
 
     var body: some View {
@@ -12,28 +13,27 @@ struct ChatWorkspaceView: View {
                 ChatWorkspaceHeader(showsHistory: $showsHistory)
                 Rectangle()
                     .fill(theme.border.opacity(0.55))
-                    .frame(height: 0.5)
+                    .frame(height: hairlineWidth)
                 ChatTranscriptView()
                 ChatComposerView()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(theme.window)
 
             if showsHistory {
-                Divider()
                 ChatSidebarView()
                     .frame(minWidth: 244, idealWidth: 278, maxWidth: 326)
+                    .clipped()
                     .transition(.move(edge: .trailing).combined(with: .opacity))
             }
         }
-        .background {
-            LinearGradient(
-                colors: [theme.window, theme.accent.opacity(0.018)],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-        }
+        .background(theme.window)
         .frame(minWidth: 780, minHeight: 620)
         .animation(.easeInOut(duration: 0.18), value: showsHistory)
+    }
+
+    private var hairlineWidth: CGFloat {
+        1 / max(displayScale, 1)
     }
 }
 
@@ -46,7 +46,7 @@ private struct ChatWorkspaceHeader: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .center, spacing: 12) {
                 Text(currentTitle)
-                    .font(.tokenityText(19, weight: .semibold))
+                    .font(.tokenityText(20, weight: .semibold))
                     .lineLimit(1)
                     .truncationMode(.tail)
                 Spacer(minLength: 12)
@@ -109,9 +109,9 @@ private struct ChatWorkspaceHeader: View {
             .font(.tokenityText(11))
             .foregroundStyle(theme.secondaryText)
         }
-        .padding(.horizontal, 20)
+        .padding(.horizontal, 24)
         .padding(.vertical, 12)
-        .background(.ultraThinMaterial)
+        .background(theme.window)
     }
 
     private var currentTitle: String {
@@ -149,14 +149,13 @@ struct ChatTranscriptView: View {
     @Environment(\.tokenityTheme) private var theme
     @State private var followState = ChatTranscriptFollowState()
     private let bottomID = "tokenity-modern-chat-bottom"
-    private let coordinateSpace = "tokenity-chat-transcript"
 
     var body: some View {
         GeometryReader { viewport in
             ScrollViewReader { proxy in
                 ZStack(alignment: .bottomTrailing) {
                     ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 24) {
+                        VStack(alignment: .leading, spacing: 24) {
                             if store.chatMessages.isEmpty {
                                 ChatEmptyState()
                                     .frame(maxWidth: .infinity)
@@ -167,31 +166,34 @@ struct ChatTranscriptView: View {
                                         .id(message.id)
                                 }
                             }
-                            GeometryReader { geometry in
-                                Color.clear.preference(
-                                    key: TranscriptBottomPreferenceKey.self,
-                                    value: geometry.frame(in: .named(coordinateSpace)).maxY
-                                )
-                            }
-                            .frame(height: 1)
-                            .id(bottomID)
+                            Color.clear
+                                .frame(height: 1)
+                                .id(bottomID)
                         }
                         .id(store.activeChatSessionID)
                         .frame(maxWidth: 900, alignment: .leading)
                         .padding(.horizontal, 30)
                         .padding(.vertical, 30)
                         .frame(maxWidth: .infinity)
-                        .background {
-                            TranscriptScrollActivityObserver {
+                    }
+                    .scrollIndicators(.visible)
+                    .background(Color.clear)
+                    .overlay(alignment: .topLeading) {
+                        TranscriptScrollPositionObserver(
+                            currentFollowsLatest: followState.followsLatest
+                        ) { followsLatest in
+                            guard followState.followsLatest != followsLatest else {
+                                return
+                            }
+                            if followsLatest {
+                                followState.resume()
+                            } else {
                                 followState.userDidScroll()
                             }
                         }
-                    }
-                    .coordinateSpace(name: coordinateSpace)
-                    .scrollIndicators(.visible)
-                    .background(Color.clear)
-                    .onPreferenceChange(TranscriptBottomPreferenceKey.self) { bottom in
-                        followState.update(bottomDistance: bottom - viewport.size.height)
+                        .frame(width: 1, height: 1)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
                     }
                     .onAppear {
                         proxy.scrollTo(bottomID, anchor: .bottom)
@@ -236,18 +238,15 @@ struct ChatTranscriptView: View {
     }
 }
 
-private struct TranscriptBottomPreferenceKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
-    }
-}
-
-private struct TranscriptScrollActivityObserver: NSViewRepresentable {
-    let onUserScroll: () -> Void
+private struct TranscriptScrollPositionObserver: NSViewRepresentable {
+    let currentFollowsLatest: Bool
+    let onFollowChange: (Bool) -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onUserScroll: onUserScroll)
+        Coordinator(
+            currentFollowsLatest: currentFollowsLatest,
+            onFollowChange: onFollowChange
+        )
     }
 
     func makeNSView(context: Context) -> ObserverView {
@@ -257,16 +256,31 @@ private struct TranscriptScrollActivityObserver: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: ObserverView, context: Context) {
-        context.coordinator.onUserScroll = onUserScroll
+        context.coordinator.onFollowChange = onFollowChange
         nsView.coordinator = context.coordinator
         context.coordinator.attachIfPossible(from: nsView)
+        context.coordinator.synchronizeFollowState(currentFollowsLatest)
+    }
+
+    static func dismantleNSView(_ nsView: ObserverView, coordinator: Coordinator) {
+        nsView.coordinator = nil
+        coordinator.detach()
     }
 
     final class ObserverView: NSView {
         weak var coordinator: Coordinator?
 
+        override func viewDidMoveToSuperview() {
+            super.viewDidMoveToSuperview()
+            scheduleAttachment()
+        }
+
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
+            scheduleAttachment()
+        }
+
+        private func scheduleAttachment() {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.coordinator?.attachIfPossible(from: self)
@@ -275,63 +289,172 @@ private struct TranscriptScrollActivityObserver: NSViewRepresentable {
     }
 
     final class Coordinator {
-        var onUserScroll: () -> Void
+        var onFollowChange: (Bool) -> Void
         private weak var scrollView: NSScrollView?
         private var observers: [NSObjectProtocol] = []
-        private var eventMonitor: Any?
+        private var isBracketedLiveScroll = false
+        private var latestNearBottom = true
+        private var transitionGate = TranscriptFollowTransitionGate()
+        private var pendingFollowValue: Bool?
+        private var emissionScheduled = false
+        private var attachmentGeneration = 0
+        private var synchronizedFollowsLatest: Bool
 
-        init(onUserScroll: @escaping () -> Void) {
-            self.onUserScroll = onUserScroll
+        init(
+            currentFollowsLatest: Bool,
+            onFollowChange: @escaping (Bool) -> Void
+        ) {
+            self.onFollowChange = onFollowChange
+            synchronizedFollowsLatest = currentFollowsLatest
+            transitionGate.synchronize(with: currentFollowsLatest)
         }
 
         deinit {
             detach()
         }
 
+        func synchronizeFollowState(_ followsLatest: Bool) {
+            synchronizedFollowsLatest = followsLatest
+            transitionGate.synchronize(with: followsLatest)
+        }
+
         func attachIfPossible(from view: NSView) {
-            var ancestor = view.superview
-            while let candidate = ancestor, !(candidate is NSScrollView) {
-                ancestor = candidate.superview
+            if let scrollView, scrollView.window === view.window {
+                return
             }
-            guard let scrollView = ancestor as? NSScrollView,
+            guard let scrollView = transcriptScrollView(near: view),
                   self.scrollView !== scrollView else { return }
             detach()
             self.scrollView = scrollView
+            transitionGate.synchronize(with: synchronizedFollowsLatest)
+            refreshNearBottom()
+
             let center = NotificationCenter.default
-            for name in [NSScrollView.willStartLiveScrollNotification, NSScrollView.didLiveScrollNotification] {
-                observers.append(center.addObserver(forName: name, object: scrollView, queue: .main) { [weak self] _ in
-                    self?.onUserScroll()
-                })
-            }
-            eventMonitor = NSEvent.addLocalMonitorForEvents(
-                matching: [.scrollWheel, .leftMouseDown, .leftMouseDragged]
-            ) { [weak self, weak scrollView] event in
-                guard let self, let scrollView,
-                      event.window === scrollView.window
-                else { return event }
-                let point = scrollView.convert(event.locationInWindow, from: nil)
-                let isScrollWheelInsideTranscript = event.type == .scrollWheel
-                    && scrollView.bounds.contains(point)
-                let isDraggingTranscriptScroller = event.type != .scrollWheel
-                    && [scrollView.verticalScroller, scrollView.horizontalScroller]
-                        .compactMap { $0 }
-                        .contains(where: { !$0.isHidden && $0.frame.contains(point) })
-                if isScrollWheelInsideTranscript || isDraggingTranscriptScroller {
-                    self.onUserScroll()
+            observers.append(
+                center.addObserver(
+                    forName: NSScrollView.willStartLiveScrollNotification,
+                    object: scrollView,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.liveScrollWillStart()
                 }
-                return event
-            }
+            )
+            observers.append(
+                center.addObserver(
+                    forName: NSScrollView.didLiveScrollNotification,
+                    object: scrollView,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.liveScrollDidMove()
+                }
+            )
+            observers.append(
+                center.addObserver(
+                    forName: NSScrollView.didEndLiveScrollNotification,
+                    object: scrollView,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.liveScrollDidEnd()
+                }
+            )
         }
 
-        private func detach() {
+        private func transcriptScrollView(near view: NSView) -> NSScrollView? {
+            guard let root = view.window?.contentView else { return nil }
+            let pointInWindow = view.convert(
+                CGPoint(x: view.bounds.midX, y: view.bounds.midY),
+                to: nil
+            )
+            return scrollViews(in: root)
+                .filter { scrollView in
+                    guard scrollView.hasVerticalScroller,
+                          let verticalScroller = scrollView.verticalScroller,
+                          !verticalScroller.isHidden
+                    else { return false }
+                    let frameInWindow = scrollView.convert(scrollView.bounds, to: nil)
+                    return frameInWindow.contains(pointInWindow)
+                }
+                .max { lhs, rhs in
+                    lhs.bounds.width * lhs.bounds.height < rhs.bounds.width * rhs.bounds.height
+                }
+        }
+
+        private func scrollViews(in view: NSView) -> [NSScrollView] {
+            var result: [NSScrollView] = []
+            if let scrollView = view as? NSScrollView {
+                result.append(scrollView)
+            }
+            for subview in view.subviews {
+                result.append(contentsOf: scrollViews(in: subview))
+            }
+            return result
+        }
+
+        func detach() {
+            attachmentGeneration += 1
             let center = NotificationCenter.default
             observers.forEach(center.removeObserver)
             observers.removeAll()
-            if let eventMonitor {
-                NSEvent.removeMonitor(eventMonitor)
-                self.eventMonitor = nil
-            }
             scrollView = nil
+            isBracketedLiveScroll = false
+            latestNearBottom = true
+            transitionGate.reset()
+            pendingFollowValue = nil
+            emissionScheduled = false
+        }
+
+        private func liveScrollWillStart() {
+            isBracketedLiveScroll = true
+            refreshNearBottom()
+            scheduleFollowChange(false)
+        }
+
+        private func liveScrollDidMove() {
+            refreshNearBottom()
+
+            // Modern trackpad and scroller gestures are bracketed by start/end
+            // notifications. Keep position local during those high-frequency
+            // updates. Legacy mouse wheels may only emit didLiveScroll, so
+            // report their threshold crossing through the same transition gate.
+            if !isBracketedLiveScroll {
+                scheduleFollowChange(latestNearBottom)
+            }
+        }
+
+        private func liveScrollDidEnd() {
+            refreshNearBottom()
+            isBracketedLiveScroll = false
+            scheduleFollowChange(latestNearBottom)
+        }
+
+        private func refreshNearBottom() {
+            guard let documentView = scrollView?.documentView else {
+                latestNearBottom = true
+                return
+            }
+            latestNearBottom = TranscriptScrollGeometry.isNearBottom(
+                documentBounds: documentView.bounds,
+                visibleRect: documentView.visibleRect,
+                isFlipped: documentView.isFlipped
+            )
+        }
+
+        private func scheduleFollowChange(_ followsLatest: Bool) {
+            pendingFollowValue = followsLatest
+            guard !emissionScheduled else { return }
+            emissionScheduled = true
+            let generation = attachmentGeneration
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.attachmentGeneration == generation else { return }
+                self.emissionScheduled = false
+                guard let pendingFollowValue = self.pendingFollowValue else { return }
+                self.pendingFollowValue = nil
+                guard let value = self.transitionGate.valueToEmit(for: pendingFollowValue) else {
+                    return
+                }
+                self.onFollowChange(value)
+            }
         }
     }
 }
@@ -1152,6 +1275,7 @@ private final class ComposerNSTextView: NSTextView {
 struct ChatSidebarView: View {
     @EnvironmentObject private var store: TokenityStore
     @Environment(\.tokenityTheme) private var theme
+    @Environment(\.colorScheme) private var colorScheme
     @State private var searchText = ""
     @State private var renameCandidate: ChatSession?
     @State private var renameDraft = ""
@@ -1159,29 +1283,18 @@ struct ChatSidebarView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Text("History")
-                    .font(.tokenityText(14, weight: .semibold))
-                Spacer()
-                Button {
-                    store.newChatSession()
-                } label: {
-                    Image(systemName: "plus")
-                }
-                .buttonStyle(.borderless)
-                .disabled(store.isChatRunning)
-                .help("New conversation")
-                .accessibilityLabel("New conversation")
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 12)
+            sidebarHeader
+
+            Rectangle()
+                .fill(theme.border.opacity(0.62))
+                .frame(height: 0.5)
 
             if store.isChatRunning {
                 Label("Stop generation to switch conversations", systemImage: "lock")
                     .font(.tokenityText(10))
                     .foregroundStyle(theme.secondaryText)
                     .padding(.horizontal, 14)
-                    .padding(.bottom, 8)
+                    .padding(.top, 10)
             }
 
             if store.isChatHistoryLoading {
@@ -1207,30 +1320,43 @@ struct ChatSidebarView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(20)
             } else {
-                List(selection: selection) {
-                    ForEach(ChatHistoryGroup.allCases) { group in
-                        let sessions = sessions(in: group)
-                        if !sessions.isEmpty {
-                            Section(group.title) {
-                                ForEach(sessions) { session in
-                                    ChatHistoryRow(session: session)
-                                        .tag(session.id)
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 15) {
+                        ForEach(ChatHistoryGroup.allCases) { group in
+                            let groupSessions = sessions(in: group)
+                            if !groupSessions.isEmpty {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text(group.title.uppercased())
+                                        .font(.tokenityText(9, weight: .semibold))
+                                        .foregroundStyle(theme.tertiaryText)
+                                        .tracking(0.45)
+                                        .padding(.horizontal, 7)
+
+                                    ForEach(groupSessions) { session in
+                                        ChatHistoryRow(
+                                            session: session,
+                                            isSelected: store.activeChatSessionID == session.id
+                                        ) {
+                                            store.selectChatSession(session.id)
+                                        }
                                         .contextMenu {
                                             Button("Rename…") { beginRename(session) }
                                             Divider()
                                             Button("Delete…", role: .destructive) { deleteCandidate = session }
                                         }
+                                        .disabled(store.isChatRunning)
+                                    }
                                 }
                             }
                         }
                     }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 10)
                 }
-                .listStyle(.sidebar)
-                .disabled(store.isChatRunning)
+                .scrollIndicators(.visible)
             }
         }
-        .background(theme.sidebar)
-        .searchable(text: $searchText, placement: .sidebar, prompt: "Search conversations")
+        .background(theme.window)
         .sheet(item: $renameCandidate) { session in
             RenameConversationSheet(
                 title: $renameDraft,
@@ -1252,14 +1378,66 @@ struct ChatSidebarView: View {
         }
     }
 
-    private var selection: Binding<UUID?> {
-        Binding(
-            get: { store.activeChatSessionID },
-            set: { id in
-                guard let id else { return }
-                store.selectChatSession(id)
+    private var sidebarHeader: some View {
+        VStack(spacing: 10) {
+            HStack {
+                Text("History")
+                    .font(.tokenityText(14, weight: .semibold))
+                    .foregroundStyle(theme.text)
+                Spacer()
+                Button {
+                    store.newChatSession()
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(width: 24, height: 24)
+                        .background(theme.group, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(theme.secondaryText)
+                .disabled(store.isChatRunning)
+                .help("New conversation")
+                .accessibilityLabel("New conversation")
             }
-        )
+            .padding(.horizontal, 14)
+
+            HStack(spacing: 7) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(theme.tertiaryText)
+
+                TextField("Search conversations", text: $searchText)
+                    .textFieldStyle(.plain)
+                    .font(.tokenityText(11))
+
+                if !searchText.isEmpty {
+                    Button {
+                        searchText = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(theme.tertiaryText)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Clear search")
+                    .accessibilityLabel("Clear search")
+                }
+            }
+            .padding(.horizontal, 9)
+            .frame(height: 29)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(theme.group)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .stroke(theme.border.opacity(colorScheme == .dark ? 0.8 : 0.55), lineWidth: 0.5)
+            }
+            .padding(.horizontal, 12)
+        }
+        .padding(.top, 12)
+        .padding(.bottom, 11)
+        .background(theme.window)
     }
 
     private var filteredSessions: [ChatSession] {
@@ -1287,27 +1465,65 @@ struct ChatSidebarView: View {
 
 private struct ChatHistoryRow: View {
     let session: ChatSession
+    let isSelected: Bool
+    let action: () -> Void
+
     @Environment(\.tokenityTheme) private var theme
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var isHovered = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(session.title)
-                    .font(.tokenityText(12, weight: .medium))
-                    .lineLimit(1)
-                Spacer(minLength: 2)
-                Text(session.updatedAt, style: .relative)
-                    .font(.tokenityText(9))
-                    .foregroundStyle(theme.tertiaryText)
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Capsule()
+                    .fill(isSelected ? theme.accent.opacity(0.82) : Color.clear)
+                    .frame(width: 2.5, height: 30)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(session.title)
+                            .font(.tokenityText(12, weight: isSelected ? .semibold : .medium))
+                            .foregroundStyle(theme.text)
+                            .lineLimit(1)
+                        Spacer(minLength: 2)
+                        Text(session.updatedAt, style: .relative)
+                            .font(.tokenityText(9))
+                            .foregroundStyle(theme.tertiaryText)
+                    }
+                    Text(session.preview)
+                        .font(.tokenityText(10))
+                        .foregroundStyle(theme.secondaryText)
+                        .lineLimit(2)
+                }
             }
-            Text(session.preview)
-                .font(.tokenityText(10))
-                .foregroundStyle(theme.secondaryText)
-                .lineLimit(2)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
-        .padding(.vertical, 4)
+        .buttonStyle(.plain)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(rowBackground)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(
+                    isSelected ? theme.border.opacity(colorScheme == .dark ? 0.92 : 0.72) : Color.clear,
+                    lineWidth: 0.5
+                )
+        }
+        .onHover { isHovered = $0 }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(session.title), \(session.preview)")
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+    }
+
+    private var rowBackground: Color {
+        if isSelected {
+            return theme.text.opacity(colorScheme == .dark ? 0.08 : 0.055)
+        }
+        return isHovered ? theme.text.opacity(colorScheme == .dark ? 0.05 : 0.035) : Color.clear
     }
 }
 

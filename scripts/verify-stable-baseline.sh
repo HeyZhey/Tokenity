@@ -11,6 +11,9 @@ fi
 echo "Checking consolidated distributed backend..."
 "$PYTHON" -c 'from tokenity.serving.distributed_openai import TokenityDistributedRuntime; assert TokenityDistributedRuntime.__name__ == "TokenityDistributedRuntime"'
 
+echo "Checking installer scripts..."
+bash -n "$ROOT/scripts/package-tokenity-dmg.sh"
+
 echo "Running Python tests..."
 "$PYTHON" -m pytest -q "$ROOT/tests"
 
@@ -25,7 +28,9 @@ test -x "$APP_EXECUTABLE"
 for marker in \
   "The model returned reasoning but did not finish a final answer." \
   "ThinkingTagStreamParser" \
-  "Search conversations"; do
+  "Tokenity, Distributed AI" \
+  "Search conversations" \
+  "WELCOME TO TOKENITY"; do
   if ! LC_ALL=C grep -aFq "$marker" "$APP_EXECUTABLE"; then
     echo "Built app does not contain the current Chat workspace marker: $marker" >&2
     exit 1

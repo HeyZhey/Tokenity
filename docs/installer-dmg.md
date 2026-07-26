@@ -1,95 +1,133 @@
-# Tokenity Installer DMG
+# Tokenity Drag-Install DMG
 
-The installer build script is:
+Build from the Stable source of truth:
 
 ```bash
-cd /Users/zxc/Documents/Tokenity
+cd /Users/zxc/Documents/Tokenity-Stable
 ./scripts/package-tokenity-dmg.sh
 ```
 
-Default outputs:
+The build always produces:
 
 ```text
-/Users/zxc/Documents/Tokenity/dist/Tokenity-0.1.0.pkg
-/Users/zxc/Documents/Tokenity/dist/Tokenity-0.1.0.dmg
+dist/Tokenity-0.1.0.dmg
+dist/Tokenity-0.1.0.dmg.sha256
 ```
 
-## What The Installer Installs
+The mounted DMG uses the conventional macOS layout:
 
-The DMG contains a macOS installer package. The package installs:
+```text
+TokenityControl.app
+Applications -> /Applications
+README.txt
+```
 
-- `/Applications/TokenityControl.app`
-- `/Users/Shared/TokenityCode`
-- `/Users/Shared/TokenityRuntime`
-- `/Users/Shared/TokenityModels`
-- `/Library/LaunchDaemons/ai.tokenity.node-agent.plist`
+Users install the control app by dragging `TokenityControl.app` onto
+`Applications`.
 
-The postinstall script starts NodeAgent on port `9100` as a launchd-managed
-service for the current console user. This is the supported multi-Mac runtime;
-the app and Agents coordinate ranks over HTTP and do not configure SSH.
+## Control App And Node Agent
+
+Tokenity separates the unprivileged control app from the privileged inference
+service:
+
+- `TokenityControl.app` is always present and is installed by dragging.
+- When a runtime source is available, the DMG also contains
+  `Install Tokenity Node Agent.pkg`.
+- The Node Agent package should be run on every Mac that will execute model
+  ranks. It installs `/Users/Shared/TokenityCode`,
+  `/Users/Shared/TokenityRuntime`, `/Users/Shared/TokenityModels`, and
+  `/Library/LaunchDaemons/ai.tokenity.node-agent.plist`.
+
+The package starts Node Agent on port `9100` as a launchd-managed service for
+the current console user. The app and Agents coordinate ranks over typed HTTP;
+product startup does not use SSH.
 
 For the current known Mac A and Mac B LAN addresses, the postinstall script also installs and starts Thunderbolt keepalive:
 
 - Mac A LAN address detected: configures `en4`, `192.168.0.1`, peer `192.168.0.2`
 - Mac B LAN address detected: configures `en5`, `192.168.0.2`, peer `192.168.0.1`
 
-Other Macs still get the UI, backend code, runtime, and NodeAgent. They do not get a Thunderbolt keepalive config unless the installer script is extended for their LAN/RDMA layout.
+Other Macs still get the backend code, runtime, and Node Agent. They do not get
+a Thunderbolt keepalive configuration unless the installer script is extended
+for their LAN/RDMA layout.
 
-## Runtime Source
+## Node Agent Package Modes
 
-The local development machine currently does not have `/Users/Shared/TokenityRuntime`.
+`TOKENITY_NODE_AGENT_PACKAGE` accepts:
 
-By default, `package-tokenity-dmg.sh` uses the local shared runtime or its local
-build cache. Override the local source with:
+- `auto` (default): include the package when a runtime source/cache exists;
+  otherwise build a controller-only DMG.
+- `required`: fail unless the Node Agent runtime can be included.
+- `skip`: intentionally build a controller-only DMG.
+
+To require a complete cluster DMG:
 
 ```bash
-TOKENITY_RUNTIME_SOURCE=/path/to/TokenityRuntime ./scripts/package-tokenity-dmg.sh
+TOKENITY_NODE_AGENT_PACKAGE=required \
+TOKENITY_RUNTIME_SOURCE=/path/to/TokenityRuntime \
+./scripts/package-tokenity-dmg.sh
 ```
 
-Runtime cache and temporary build outputs are under `/Users/zxc/Documents/Tokenity/dist`, which is git-ignored.
+When included, the additional standalone output is:
+
+```text
+dist/Tokenity-NodeAgent-Runtime-0.1.0.pkg
+```
+
+Runtime cache and temporary build outputs are under `dist/`, which is
+git-ignored.
 
 ## Model Weights
 
-The default DMG does not include `Qwen3.5-122B-A10B-4bit` weights because the model is about `65GB`.
-
-The installed expected model path is still:
+The default DMG does not include model weights. Compatible MLX model folders
+belong under:
 
 ```text
-/Users/Shared/TokenityModels/Qwen3.5-122B-A10B-4bit
+/Users/Shared/TokenityModels
 ```
 
 To build a very large offline installer that includes model weights:
 
 ```bash
-TOKENITY_INCLUDE_MODEL=1 ./scripts/package-tokenity-dmg.sh
+TOKENITY_NODE_AGENT_PACKAGE=required \
+TOKENITY_INCLUDE_MODEL=1 \
+./scripts/package-tokenity-dmg.sh
 ```
 
 Set `TOKENITY_MODEL_SOURCE` when the weights are in another local directory.
 
 ## Signing Note
 
-The app bundle is ad-hoc signed so its resources are sealed locally.
+The app bundle is ad-hoc signed so its resources are sealed locally. The
+current build machine has no Developer ID identities configured.
 
-The installer package is not Developer ID signed because no Developer ID Installer certificate is configured on this machine. It is suitable as a local/internal installer, but Gatekeeper signature verification reports:
+The optional Node Agent package is not Developer ID signed because no Developer
+ID Installer certificate is configured on this machine. It is suitable as a
+local/internal installer, but Gatekeeper signature verification reports:
 
 ```text
 Status: no signature
 ```
 
-For distribution outside the local Macs, sign the package with `productsign` using a Developer ID Installer certificate and notarize the final DMG.
+For public distribution, sign the app and package with the relevant Developer
+ID certificates and notarize the final DMG.
 
 ## Verification Commands
 
-Check package payload:
+Mount-check the DMG and verify the drag-install layout:
 
 ```bash
-pkgutil --payload-files /Users/zxc/Documents/Tokenity/dist/Tokenity-0.1.0.pkg | egrep 'TokenityControl.app|TokenityCode/tokenity|TokenityRuntime/current|ai.tokenity.node-agent.plist'
+hdiutil attach -readonly -nobrowse \
+  /Users/zxc/Documents/Tokenity-Stable/dist/Tokenity-0.1.0.dmg
+ls -la "/Volumes/Tokenity 0.1.0"
 ```
 
-Mount-check the DMG:
+When the Node Agent package is present, check its payload:
 
 ```bash
-hdiutil attach -readonly /Users/zxc/Documents/Tokenity/dist/Tokenity-0.1.0.dmg
+pkgutil --payload-files \
+  /Users/zxc/Documents/Tokenity-Stable/dist/Tokenity-NodeAgent-Runtime-0.1.0.pkg \
+  | egrep 'TokenityCode/tokenity|TokenityRuntime/current|ai.tokenity.node-agent.plist'
 ```
 
 After installing on a Mac:
