@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import getpass
 import hashlib
 import http.client
 import importlib.metadata
 import json
+import logging
 import os
 import platform
 import re
@@ -28,12 +30,25 @@ from starlette.concurrency import run_in_threadpool
 
 from tokenity import __version__
 from tokenity.control import (
+    AutoRouter,
+    CapabilityRegistry,
+    GenerationQueueFull,
+    GenerationSlotCancelled,
+    GenerationSlotScheduler,
+    GenerationSlotTimeout,
     InstanceConflict,
     InstanceLifecycle,
     InstanceRegistry,
     InstanceRouter,
+    MemoryReservationBreakdown,
+    ModelCapabilityProfile,
+    ModelRuntimeState,
     ResourceAdmissionError,
     ResourceLedger,
+    RouteContext,
+    RouteDecision,
+    RoutePolicy,
+    RouteReason,
 )
 from tokenity.inference.native_mtp import scan_native_mtp_capability
 from tokenity.mlx.hostfile import ClusterNode, ConnectionMode, HostfileError, build_hostfile
@@ -51,6 +66,46 @@ NODE_AGENT_CAPABILITIES = (
     "managed_instances",
     "native_mtp",
 )
+MANAGED_INSTANCE_CAPABILITIES = frozenset(
+    {
+        "cluster_runtime",
+        "instance_quorum",
+        "instance_runtimes",
+        "managed_instances",
+    }
+)
+TOKENITY_AUTO_MODEL_ID = "tokenity-auto"
+TOKENITY_ROUTE_FIELDS = frozenset(
+    {
+        "tokenity_route_policy",
+        "tokenity_session_id",
+        "tokenity_lock_model",
+        "tokenity_constraints",
+    }
+)
+COMMON_CHAT_RUNTIME_PARAMETERS = frozenset(
+    {
+        "frequency_penalty",
+        "logprobs",
+        "max_completion_tokens",
+        "max_tokens",
+        "metadata",
+        "min_p",
+        "n",
+        "presence_penalty",
+        "repetition_penalty",
+        "seed",
+        "service_tier",
+        "stop",
+        "stream",
+        "stream_options",
+        "temperature",
+        "top_k",
+        "top_logprobs",
+        "top_p",
+        "user",
+    }
+)
 MODEL_ROLES = (
     "distributed-openai",
     "distributed-openai-rank",
@@ -61,6 +116,20 @@ MODEL_ROLES = (
 
 class _LaunchCancelled(RuntimeError):
     pass
+
+
+class _GatewayStreamingResponse(StreamingResponse):
+    """Streaming response whose cleanup covers the complete ASGI lifecycle."""
+
+    def __init__(self, *args, on_close, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._on_close = on_close
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._on_close()
 
 
 class ClusterNodePayload(BaseModel):
@@ -187,6 +256,9 @@ def create_app(
     rank_connected_fn=None,
     runtime_preflight_fn=None,
     gateway_open_fn=None,
+    capability_profiles=None,
+    generation_queue_depth: int = 32,
+    generation_slot_timeout: float = 30.0,
 ) -> FastAPI:
     app = FastAPI(title="Tokenity Node Agent", version=__version__)
     roles = supervisor or RoleSupervisor()
@@ -199,12 +271,20 @@ def create_app(
     gateway_open = gateway_open_fn or _open_gateway_upstream
     instances = InstanceRegistry()
     instance_router = InstanceRouter(instances)
+    generation_scheduler = GenerationSlotScheduler(
+        max_queue_depth=generation_queue_depth,
+        registry=instances,
+    )
+    capability_registry = CapabilityRegistry()
+    for profile in capability_profiles or ():
+        capability_registry.register(profile)
+    auto_router = AutoRouter()
+    session_routes: dict[str, tuple[str, str]] = {}
     resource_ledger = ResourceLedger(_total_memory_bytes() or 0)
     instance_workers: dict[str, list[str]] = {}
     instance_roles: dict[str, str] = {}
     instance_ports: dict[str, int] = {}
     instance_status_paths: dict[str, str] = {}
-    distributed_workers: list[str] = []
     lifecycle_lock = threading.RLock()
     watchdog_stop = threading.Event()
     launch_generation = 0
@@ -238,6 +318,11 @@ def create_app(
         with lifecycle_lock:
             lease_deadline = time.monotonic() + ttl_seconds
             return lease_deadline
+
+    def clear_legacy_lease() -> None:
+        nonlocal lease_deadline
+        with lifecycle_lock:
+            lease_deadline = None
 
     def set_cluster_runtime(request: RankStartRequest, role: str) -> None:
         nonlocal cluster_runtime
@@ -277,6 +362,50 @@ def create_app(
                 dict(cluster_runtimes[instance_id])
                 for instance_id in sorted(cluster_runtimes)
             ]
+
+    def reconcile_instance_memory(
+        instance,
+        runtime: dict[str, object] | None,
+    ) -> str | None:
+        if not isinstance(runtime, dict):
+            return None
+        memory = runtime.get("memory")
+        if not isinstance(memory, dict):
+            return None
+        peak_candidates = [
+            value
+            for value in (
+                memory.get("mlx_peak_bytes"),
+                memory.get("model_resident_observed_bytes"),
+            )
+            if isinstance(value, int)
+        ]
+        active = memory.get("mlx_active_bytes")
+        cache = memory.get("mlx_cache_bytes")
+        if isinstance(active, int) and isinstance(cache, int):
+            peak_candidates.append(active + cache)
+        observed_peak = max(peak_candidates) if peak_candidates else None
+        footprint = memory.get("process_phys_footprint_bytes")
+        observed_footprint = footprint if isinstance(footprint, int) else None
+        if observed_peak is None and observed_footprint is None:
+            return None
+        breakdown = instance.memory_breakdown()
+        try:
+            reservation = resource_ledger.reconcile(
+                instance.instance_id,
+                observed_peak_bytes=observed_peak,
+                observed_footprint_bytes=observed_footprint,
+                safety_margin_ratio=0.1,
+                breakdown=breakdown,
+            )
+        except ResourceAdmissionError as exc:
+            return str(exc)
+        instance.memory_reservation_bytes = reservation
+        instance.memory_reservation_breakdown = breakdown.with_observation(
+            peak_bytes=observed_peak,
+            footprint_bytes=observed_footprint,
+        )
+        return None
 
     def supervisor_start(
         role: str,
@@ -331,9 +460,9 @@ def create_app(
             return wait(role, timeout)
 
     def clear_lease() -> None:
-        nonlocal lease_deadline, cluster_runtime
+        nonlocal cluster_runtime
         with lifecycle_lock:
-            lease_deadline = None
+            clear_legacy_lease()
             cluster_runtime = None
             cluster_runtimes.clear()
 
@@ -397,10 +526,69 @@ def create_app(
 
     def worker_urls(*, clear: bool = False) -> list[str]:
         with lifecycle_lock:
-            urls = list(distributed_workers)
+            urls = sorted(
+                {
+                    agent_url
+                    for workers in instance_workers.values()
+                    for agent_url in workers
+                }
+            )
             if clear:
-                distributed_workers.clear()
+                instance_workers.clear()
         return urls
+
+    def require_managed_instance_capabilities(nodes: list[ClusterNode]) -> None:
+        issues: list[dict[str, object]] = []
+        local_missing = sorted(
+            MANAGED_INSTANCE_CAPABILITIES.difference(NODE_AGENT_CAPABILITIES)
+        )
+        if local_missing:
+            issues.append(
+                {
+                    "node": nodes[0].id,
+                    "agent_url": _agent_url(nodes[0]),
+                    "missing_capabilities": local_missing,
+                }
+            )
+        for node in nodes[1:]:
+            agent_url = _agent_url(node)
+            try:
+                info = get_json(f"{agent_url}/v1/node/info", 3.0)
+            except Exception as exc:
+                issues.append(
+                    {
+                        "node": node.id,
+                        "agent_url": agent_url,
+                        "error": str(exc),
+                        "missing_capabilities": sorted(MANAGED_INSTANCE_CAPABILITIES),
+                    }
+                )
+                continue
+            contract = info.get("agent_contract") if isinstance(info, dict) else None
+            capabilities = contract.get("capabilities") if isinstance(contract, dict) else None
+            advertised = (
+                {str(capability) for capability in capabilities}
+                if isinstance(capabilities, list)
+                else set()
+            )
+            missing = sorted(MANAGED_INSTANCE_CAPABILITIES.difference(advertised))
+            if missing:
+                issues.append(
+                    {
+                        "node": node.id,
+                        "agent_url": agent_url,
+                        "missing_capabilities": missing,
+                    }
+                )
+        if issues:
+            raise HTTPException(
+                status_code=412,
+                detail={
+                    "stage": "agent_capabilities",
+                    "required_capabilities": sorted(MANAGED_INSTANCE_CAPABILITIES),
+                    "issues": issues,
+                },
+            )
 
     def request_known_workers_stop() -> list[dict[str, object]]:
         results: list[dict[str, object]] = []
@@ -475,12 +663,14 @@ def create_app(
         }
 
     def lease_watchdog() -> None:
+        next_health_refresh = 0.0
         while not watchdog_stop.wait(1.0):
             with lifecycle_lock:
                 expired = lease_deadline is not None and time.monotonic() >= lease_deadline
             if expired:
                 stop_everything(3.0, notify_workers=False)
             now = time.time()
+            monotonic_now = time.monotonic()
             for snapshot in instances.snapshots():
                 deadline = snapshot.get("deadline")
                 if not isinstance(deadline, (int, float)) or deadline > now:
@@ -491,6 +681,19 @@ def create_app(
                     stop_instance(str(snapshot["instance_id"]), StopAllRequest(timeout=3.0))
                 except Exception:
                     continue
+            if monotonic_now >= next_health_refresh:
+                next_health_refresh = monotonic_now + 5.0
+                for snapshot in instances.snapshots():
+                    if snapshot.get("state") not in {"ready", "busy"}:
+                        continue
+                    try:
+                        instance_quorum(str(snapshot["instance_id"]))
+                    except Exception:
+                        instance = instances.get(str(snapshot["instance_id"]))
+                        if instance is not None:
+                            instance.health_ready = False
+                            instance.health_sampled_at = time.time()
+                            instance.health_issues = ["Health refresh failed."]
 
     @app.on_event("startup")
     def startup_cleanup() -> None:
@@ -566,6 +769,7 @@ def create_app(
         role = instance_roles.get(instance_id)
         status = supervisor_status(role, instance_id) if role else None
         runtime = _read_runtime_status(instance_status_paths.get(instance_id))
+        resource_issue = reconcile_instance_memory(instance, runtime)
         if status is not None and getattr(status, "state", None) in {"failed", "stopped"}:
             if instance.state not in {InstanceLifecycle.FAILED, InstanceLifecycle.STOPPED, InstanceLifecycle.UNLOADING}:
                 try:
@@ -583,6 +787,7 @@ def create_app(
             "instance": instance.to_dict(),
             "process": status.__dict__ if status is not None else None,
             "runtime": runtime,
+            "resource_issue": resource_issue,
         }
 
     @app.get("/v1/node/instances/{instance_id}/quorum")
@@ -612,6 +817,9 @@ def create_app(
             runtime = item.get("runtime")
             process = item.get("process")
             node = str(item.get("node"))
+            resource_issue = item.get("resource_issue")
+            if isinstance(resource_issue, str) and resource_issue:
+                issues.append(f"{node}: memory reservation reconciliation failed: {resource_issue}")
             if not isinstance(runtime, dict):
                 issues.append(f"{node}: runtime readiness is unavailable.")
                 continue
@@ -673,6 +881,9 @@ def create_app(
         if not rank0_probe_succeeded:
             issues.append("Rank 0 one-token isolated readiness probe did not succeed.")
         ready = not issues and len(ranks) == instance.world_size
+        instance.health_ready = ready
+        instance.health_sampled_at = time.time()
+        instance.health_issues = list(issues)
         instance.actual_memory_bytes = (
             observed_runtime_bytes if observed_rank_count == instance.world_size else None
         )
@@ -717,35 +928,405 @@ def create_app(
 
     def refresh_gateway_candidates(model_or_instance_id: str) -> None:
         for snapshot in instances.snapshots():
-            if model_or_instance_id not in {
-                str(snapshot.get("instance_id") or ""),
-                str(snapshot.get("requested_model_id") or ""),
-            }:
-                continue
-            if snapshot.get("state") in {"ready", "busy"}:
-                # BUSY is still routable: the runtime owns concurrency and
-                # queue limits, while the request lease prevents unload.
-                get_instance(str(snapshot["instance_id"]))
+            if (
+                model_or_instance_id != TOKENITY_AUTO_MODEL_ID
+                and model_or_instance_id
+                not in {
+                    str(snapshot.get("instance_id") or ""),
+                    str(snapshot.get("requested_model_id") or ""),
+                }
+            ):
                 continue
             try:
                 instance_quorum(str(snapshot["instance_id"]))
             except HTTPException:
                 continue
 
+    def routing_inputs(
+        allowed_instance_ids: frozenset[str] | None = None,
+    ) -> tuple[
+        list[ModelCapabilityProfile],
+        list[ModelRuntimeState],
+    ]:
+        grouped: dict[tuple[str, str], list[dict[str, object]]] = {}
+        for snapshot in instances.snapshots():
+            if (
+                allowed_instance_ids is not None
+                and str(snapshot["instance_id"]) not in allowed_instance_ids
+            ):
+                continue
+            model_id = str(snapshot["requested_model_id"])
+            revision = _routing_revision(snapshot.get("model_revision"))
+            grouped.setdefault((model_id, revision), []).append(snapshot)
+
+        profiles: list[ModelCapabilityProfile] = []
+        runtimes: list[ModelRuntimeState] = []
+        now = time.time()
+        for (model_id, revision), snapshots in sorted(grouped.items()):
+            profile = capability_registry.get(model_id, revision)
+            if profile is None:
+                profile = _infer_gateway_model_profile(
+                    model_id,
+                    revision,
+                    str(snapshots[0].get("resolved_path") or ""),
+                )
+                capability_registry.register(profile)
+            profiles.append(profile)
+            routable = [
+                snapshot
+                for snapshot in snapshots
+                if snapshot.get("state") in {"ready", "busy"}
+                and snapshot.get("health_ready") is not False
+            ]
+            load_source = routable or snapshots
+            best = min(
+                load_source,
+                key=lambda item: (
+                    int(item.get("active_request_count") or 0)
+                    + int(item.get("queued_request_count") or 0),
+                    str(item["instance_id"]),
+                ),
+            )
+            sampled_at = best.get("health_sampled_at") or best.get("heartbeat_at")
+            heartbeat_age = (
+                max(0.0, now - float(sampled_at))
+                if isinstance(sampled_at, (int, float))
+                else 0.0
+            )
+            # GenerationSlotScheduler mirrors each waiter into the registry, so
+            # queued_request_count is the single authoritative routing signal.
+            queue_depth = int(best.get("queued_request_count") or 0)
+            runtimes.append(
+                ModelRuntimeState(
+                    model_id=model_id,
+                    revision=revision,
+                    ready=bool(routable),
+                    quorum_ready=bool(routable),
+                    state=str(best.get("state") or "stopped"),
+                    queue_depth=queue_depth,
+                    active_request_count=int(best.get("active_request_count") or 0),
+                    heartbeat_age_seconds=heartbeat_age,
+                    actual_memory_bytes=(
+                        int(best["actual_memory_bytes"])
+                        if isinstance(best.get("actual_memory_bytes"), int)
+                        else None
+                    ),
+                    recent_failure_rate=1.0 if best.get("last_error") else 0.0,
+                    predicted_queue_wait_ms=float(queue_depth * 1_000),
+                )
+            )
+        return profiles, runtimes
+
+    def parse_route_request(payload: object) -> dict[str, object]:
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
+        model = payload.get("model")
+        if not isinstance(model, str) or not model.strip():
+            raise HTTPException(status_code=400, detail="A model alias or instance_id is required.")
+        policy_name = payload.get("tokenity_route_policy", "balanced")
+        if not isinstance(policy_name, str) or policy_name not in {"fast", "balanced", "quality"}:
+            raise HTTPException(
+                status_code=422,
+                detail="tokenity_route_policy must be fast, balanced, or quality.",
+            )
+        session_id = payload.get("tokenity_session_id")
+        if session_id is not None and (
+            not isinstance(session_id, str) or not session_id.strip()
+        ):
+            raise HTTPException(status_code=422, detail="tokenity_session_id must be a non-empty string.")
+        normalized_session_id = session_id.strip() if isinstance(session_id, str) else None
+        lock_model = payload.get("tokenity_lock_model", False)
+        if not isinstance(lock_model, (bool, str)):
+            raise HTTPException(
+                status_code=422,
+                detail="tokenity_lock_model must be a boolean or model ID.",
+            )
+        constraints = payload.get("tokenity_constraints") or {}
+        if not isinstance(constraints, dict):
+            raise HTTPException(status_code=422, detail="tokenity_constraints must be an object.")
+        allowed_instance_ids_raw = constraints.get("allowed_instance_ids")
+        if allowed_instance_ids_raw is not None and (
+            not isinstance(allowed_instance_ids_raw, list)
+            or any(
+                not isinstance(value, str) or not value.strip()
+                for value in allowed_instance_ids_raw
+            )
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="tokenity_constraints.allowed_instance_ids must be a list of non-empty strings.",
+            )
+        allowed_instance_ids = (
+            frozenset(value.strip() for value in allowed_instance_ids_raw)
+            if isinstance(allowed_instance_ids_raw, list)
+            else None
+        )
+        with lifecycle_lock:
+            sticky_route = (
+                session_routes.get(normalized_session_id)
+                if normalized_session_id is not None
+                else None
+            )
+        sticky_model_id = sticky_route[0] if sticky_route is not None else None
+        sticky_revision = sticky_route[1] if sticky_route is not None else None
+        locked_model_id = (
+            lock_model.strip()
+            if isinstance(lock_model, str) and lock_model.strip()
+            else sticky_model_id if lock_model is True else None
+        )
+        locked_revision = sticky_revision if lock_model is True else None
+        context, features = _derive_gateway_route_context(
+            payload,
+            constraints,
+            session_id=normalized_session_id,
+            sticky_model_id=sticky_model_id,
+            sticky_revision=sticky_revision,
+            locked_model_id=locked_model_id,
+            locked_revision=locked_revision,
+        )
+        return {
+            "requested_model": model.strip(),
+            "is_auto": model.strip() == TOKENITY_AUTO_MODEL_ID,
+            "policy": RoutePolicy.from_name(policy_name),
+            "policy_name": policy_name,
+            "session_id": normalized_session_id,
+            "lock_model": lock_model,
+            "constraints": constraints,
+            "allowed_instance_ids": allowed_instance_ids,
+            "context": context,
+            "features": features,
+        }
+
+    def excluded_instance_ids_for_route(
+        parsed: dict[str, object],
+    ) -> frozenset[str]:
+        allowed = parsed.get("allowed_instance_ids")
+        if parsed["is_auto"] is not True or not isinstance(allowed, frozenset):
+            return frozenset()
+        return frozenset(
+            str(snapshot["instance_id"])
+            for snapshot in instances.snapshots()
+            if str(snapshot["instance_id"]) not in allowed
+        )
+
+    def decide_route(parsed: dict[str, object]) -> tuple[
+        RouteDecision,
+        object,
+        ModelCapabilityProfile,
+    ]:
+        requested_model = str(parsed["requested_model"])
+        refresh_gateway_candidates(requested_model)
+        excluded_instance_ids = excluded_instance_ids_for_route(parsed)
+        parsed["excluded_instance_ids"] = excluded_instance_ids
+        allowed_instance_ids = parsed.get("allowed_instance_ids")
+        profiles, runtimes = routing_inputs(
+            allowed_instance_ids
+            if parsed["is_auto"] is True
+            and isinstance(allowed_instance_ids, frozenset)
+            else None
+        )
+        profile_by_key = {
+            (profile.model_id, profile.revision): profile for profile in profiles
+        }
+        runtime_by_key = {
+            (runtime.model_id, runtime.revision): runtime for runtime in runtimes
+        }
+        if parsed["is_auto"] is True:
+            context = parsed["context"]
+            assert isinstance(context, RouteContext)
+            constraints = parsed["constraints"]
+            assert isinstance(constraints, dict)
+            configured_default = constraints.get("default_model_id")
+            default_model_id = (
+                configured_default
+                if isinstance(configured_default, str) and configured_default
+                else _default_gateway_model_id(profiles)
+            )
+            context = RouteContext(
+                **{
+                    **context.__dict__,
+                    "default_model_id": default_model_id,
+                }
+            )
+            policy = parsed["policy"]
+            assert isinstance(policy, RoutePolicy)
+            decision = auto_router.decide(profiles, runtimes, context, policy)
+            if decision.model_id is None or decision.revision is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "stage": "route_decision",
+                        **decision.to_dict(),
+                    },
+                )
+            default_candidates = [
+                candidate
+                for candidate in decision.candidates
+                if candidate.eligible and candidate.model_id == default_model_id
+            ]
+            default_candidates.sort(
+                key=lambda candidate: (
+                    -(candidate.score if candidate.score is not None else float("-inf")),
+                    candidate.revision,
+                )
+            )
+            parsed["effective_default_model_id"] = default_model_id
+            parsed["effective_default_revision"] = (
+                default_candidates[0].revision if default_candidates else None
+            )
+            selected = instance_router.resolve(
+                decision.model_id,
+                revision=decision.revision,
+                exclude_instance_ids=excluded_instance_ids,
+            )
+            profile = profile_by_key[(decision.model_id, decision.revision)]
+            actual_reasons = auto_router.hard_constraint_reasons(
+                profile,
+                runtime_by_key.get((decision.model_id, decision.revision)),
+                context,
+            )
+            if actual_reasons:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "stage": "selected_instance_constraints",
+                        "model_id": decision.model_id,
+                        "revision": decision.revision,
+                        "instance_id": selected.instance_id,
+                        "reasons": list(actual_reasons),
+                    },
+                )
+            return decision, selected, profile
+
+        started = time.perf_counter()
+        parsed["effective_default_model_id"] = None
+        parsed["effective_default_revision"] = None
+        selected = instance_router.resolve(requested_model)
+        revision = _routing_revision(selected.model_revision)
+        profile = profile_by_key.get((selected.requested_model_id, revision))
+        if profile is None:
+            profile = _infer_gateway_model_profile(
+                selected.requested_model_id,
+                revision,
+                selected.resolved_path,
+            )
+            capability_registry.register(profile)
+        decision = RouteDecision(
+            model_id=selected.requested_model_id,
+            revision=revision,
+            category="explicit",
+            reason=RouteReason.EXPLICIT_MODEL,
+            confidence=1.0,
+            routing_latency_ms=(time.perf_counter() - started) * 1_000,
+            candidates=(),
+            hard_constraints_satisfied=True,
+        )
+        return decision, selected, profile
+
+    def decision_payload(
+        parsed: dict[str, object],
+        decision: RouteDecision,
+        selected,
+    ) -> dict[str, object]:
+        return {
+            **decision.to_dict(),
+            "selected_instance_id": selected.instance_id,
+            "routed_model": selected.requested_model_id,
+            "model_revision": selected.model_revision,
+            "policy": parsed["policy_name"],
+            "session_sticky": decision.reason == RouteReason.SESSION_STICKY,
+            "derived_features": parsed["features"],
+        }
+
+    def fallback_targets(
+        parsed: dict[str, object],
+        decision: RouteDecision,
+    ) -> list[tuple[str, str, str]]:
+        if decision.model_id is None or decision.revision is None:
+            return []
+        result = [(decision.model_id, decision.revision, "primary")]
+        if parsed["is_auto"] is not True:
+            return result
+        profiles, _ = routing_inputs()
+        profiles_by_key = {
+            (profile.model_id, profile.revision): profile for profile in profiles
+        }
+        eligible = sorted(
+            (
+                candidate
+                for candidate in decision.candidates
+                if candidate.eligible and candidate.model_id != decision.model_id
+            ),
+            key=lambda candidate: (
+                -(candidate.score if candidate.score is not None else float("-inf")),
+                candidate.model_id,
+                candidate.revision,
+            ),
+        )
+        for candidate in eligible:
+            profile = profiles_by_key.get((candidate.model_id, candidate.revision))
+            if profile is None:
+                continue
+            if decision.category in profile.task_tags:
+                target = (
+                    candidate.model_id,
+                    candidate.revision,
+                    "same_capability",
+                )
+                if target[:2] not in [item[:2] for item in result]:
+                    result.append(target)
+        default_model_id = parsed.get("effective_default_model_id")
+        default_revision = parsed.get("effective_default_revision")
+        if (
+            isinstance(default_model_id, str)
+            and default_model_id
+            and isinstance(default_revision, str)
+            and (default_model_id, default_revision)
+            not in [item[:2] for item in result]
+        ):
+            result.append((default_model_id, default_revision, "default"))
+        return result
+
     @app.get("/v1/gateway/routes")
     def gateway_routes() -> dict[str, object]:
         routes = []
+        scheduler_snapshot = generation_scheduler.snapshot()
+        queued_by_instance = scheduler_snapshot["queued_by_instance"]
         for snapshot in instances.snapshots():
-            if snapshot.get("state") not in {"ready", "busy"}:
+            if (
+                snapshot.get("state") not in {"ready", "busy"}
+                or snapshot.get("health_ready") is False
+            ):
                 continue
+            revision = _routing_revision(snapshot.get("model_revision"))
+            model_id = str(snapshot["requested_model_id"])
+            profile = capability_registry.get(model_id, revision)
+            if profile is None:
+                profile = _infer_gateway_model_profile(
+                    model_id,
+                    revision,
+                    str(snapshot.get("resolved_path") or ""),
+                )
+                capability_registry.register(profile)
             routes.append(
                 {
-                    "model": snapshot["requested_model_id"],
+                    "model": model_id,
                     "instance_id": snapshot["instance_id"],
+                    "model_revision": revision,
                     "execution_mode": snapshot["execution_mode"],
                     "state": snapshot["state"],
                     "active_request_count": snapshot["active_request_count"],
+                    "queue_depth": queued_by_instance.get(snapshot["instance_id"], 0),
                     "api_base_url": f"http://127.0.0.1:{snapshot['http_port']}/v1",
+                    "capabilities": {
+                        "tools": profile.supports_tools,
+                        "json": profile.supports_json,
+                        "thinking": profile.supports_thinking,
+                        "modalities": sorted(profile.modalities),
+                        "task_tags": sorted(profile.task_tags),
+                    },
+                    "warm_ttft_p50_ms": profile.warm_ttft_p50_ms,
+                    "warm_ttft_p95_ms": profile.warm_ttft_p95_ms,
                 }
             )
         return {"data": routes}
@@ -753,101 +1334,286 @@ def create_app(
     @app.get("/v1/models")
     def gateway_models() -> dict[str, object]:
         now = int(time.time())
-        data = []
+        ready_models: dict[str, dict[str, object]] = {}
         for snapshot in instances.snapshots():
-            if snapshot.get("state") not in {"ready", "busy"}:
+            if (
+                snapshot.get("state") not in {"ready", "busy"}
+                or snapshot.get("health_ready") is False
+            ):
                 continue
-            data.append(
+            model_id = str(snapshot["requested_model_id"])
+            item = ready_models.setdefault(
+                model_id,
                 {
-                    "id": snapshot["requested_model_id"],
+                    "id": model_id,
                     "object": "model",
                     "created": now,
                     "owned_by": "tokenity",
                     "tokenity_instance_id": snapshot["instance_id"],
+                    "tokenity_instance_ids": [],
                     "tokenity_execution_mode": snapshot["execution_mode"],
-                }
+                },
             )
+            instance_ids = item["tokenity_instance_ids"]
+            if isinstance(instance_ids, list):
+                instance_ids.append(snapshot["instance_id"])
+        data = [
+            {
+                "id": "tokenity-auto",
+                "object": "model",
+                "created": now,
+                "owned_by": "tokenity",
+                "tokenity_virtual": True,
+            },
+            *[ready_models[model_id] for model_id in sorted(ready_models)],
+        ]
         return {"object": "list", "data": data}
+
+    @app.post("/v1/router/decision")
+    async def gateway_router_decision(request: FastAPIRequest) -> dict[str, object]:
+        try:
+            payload = json.loads(await request.body())
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Request body must be valid JSON.") from exc
+        parsed = parse_route_request(payload)
+        try:
+            decision, selected, _ = decide_route(parsed)
+        except InstanceConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return decision_payload(parsed, decision, selected)
 
     @app.post("/v1/chat/completions")
     async def gateway_chat_completions(request: FastAPIRequest) -> Response:
-        body = await request.body()
         try:
-            payload = json.loads(body)
+            payload = json.loads(await request.body())
         except json.JSONDecodeError as exc:
             raise HTTPException(status_code=400, detail="Request body must be valid JSON.") from exc
-        model = payload.get("model") if isinstance(payload, dict) else None
-        if not isinstance(model, str) or not model.strip():
-            raise HTTPException(status_code=400, detail="A model alias or instance_id is required.")
-        refresh_gateway_candidates(model)
+        parsed = parse_route_request(payload)
         try:
-            selected = instance_router.resolve(model)
-            instances.acquire_request_lease(selected.instance_id)
+            decision, primary, _ = decide_route(parsed)
         except InstanceConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-
         upstream_headers = {"Content-Type": "application/json"}
         authorization = request.headers.get("authorization")
         if authorization:
             upstream_headers["Authorization"] = authorization
-        try:
-            connection, upstream = await run_in_threadpool(
-                gateway_open,
-                f"http://127.0.0.1:{selected.http_port}/v1/chat/completions",
-                body,
-                upstream_headers,
-                600.0,
-            )
-        except Exception as exc:
-            instances.release_request_lease(selected.instance_id)
-            raise HTTPException(
-                status_code=502,
-                detail=f"Model instance {selected.instance_id} could not accept the request: {exc}",
-            ) from exc
+        attempted_instances: set[str] = set()
+        excluded_instance_ids = parsed.get("excluded_instance_ids")
+        if not isinstance(excluded_instance_ids, frozenset):
+            excluded_instance_ids = frozenset()
+        candidate_targets = fallback_targets(parsed, decision)
+        selected = primary
+        last_open_error: Exception | None = None
+        open_failures = 0
+        exact_instance_request = (
+            parsed["is_auto"] is not True
+            and str(parsed["requested_model"]) == primary.instance_id
+        )
 
-        response_headers = {
-            "X-Tokenity-Instance-ID": selected.instance_id,
-            "X-Tokenity-Model": selected.requested_model_id,
-        }
-        content_type = upstream.getheader("Content-Type")
-        if content_type:
-            response_headers["Content-Type"] = content_type
-        upstream_request_id = upstream.getheader("X-Tokenity-Request-ID")
-        if upstream_request_id:
-            response_headers["X-Tokenity-Request-ID"] = upstream_request_id
-        is_stream = bool(payload.get("stream"))
-        if is_stream:
-            response_headers.update(
-                {
-                    "Cache-Control": "no-cache, no-transform",
-                    "X-Accel-Buffering": "no",
+        for candidate_model_id, candidate_revision, fallback_kind in candidate_targets:
+            while True:
+                if (
+                    selected.requested_model_id != candidate_model_id
+                    or _routing_revision(selected.model_revision) != candidate_revision
+                    or selected.instance_id in attempted_instances
+                ):
+                    try:
+                        selected = instance_router.resolve(
+                            candidate_model_id,
+                            revision=candidate_revision,
+                            exclude_instance_ids=attempted_instances | excluded_instance_ids,
+                        )
+                    except InstanceConflict:
+                        break
+                if exact_instance_request and attempted_instances:
+                    break
+                attempted_instances.add(selected.instance_id)
+                revision = _routing_revision(selected.model_revision)
+                profile = capability_registry.get(selected.requested_model_id, revision)
+                if profile is None:
+                    profile = _infer_gateway_model_profile(
+                        selected.requested_model_id,
+                        revision,
+                        selected.resolved_path,
+                    )
+                    capability_registry.register(profile)
+                try:
+                    slot = await _acquire_generation_slot(
+                        generation_scheduler,
+                        selected.instance_id,
+                        selected.selected_nodes,
+                        timeout=generation_slot_timeout,
+                        disconnect_checker=request.is_disconnected,
+                    )
+                except (GenerationQueueFull, GenerationSlotTimeout) as exc:
+                    raise HTTPException(
+                        status_code=429,
+                        detail=str(exc),
+                        headers={"Retry-After": "1"},
+                    ) from exc
+                except GenerationSlotCancelled as exc:
+                    raise HTTPException(status_code=499, detail=str(exc)) from exc
+                try:
+                    instances.acquire_request_lease(selected.instance_id)
+                except InstanceConflict as exc:
+                    slot.release()
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+                release_lock = threading.Lock()
+                released = False
+                selected_instance_id = selected.instance_id
+
+                def release_gateway_resources() -> None:
+                    nonlocal released
+                    with release_lock:
+                        if released:
+                            return
+                        released = True
+                    try:
+                        instances.release_request_lease(selected_instance_id)
+                    except InstanceConflict:
+                        pass
+                    finally:
+                        slot.release()
+
+                upstream_payload = _gateway_upstream_payload(payload, selected, profile)
+                upstream_body = json.dumps(
+                    upstream_payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                try:
+                    if await request.is_disconnected():
+                        raise GenerationSlotCancelled(
+                            f"Client disconnected before opening {selected_instance_id}."
+                        )
+                    connection, upstream = await _run_gateway_open(
+                        gateway_open,
+                        f"http://127.0.0.1:{selected.http_port}/v1/chat/completions",
+                        upstream_body,
+                        upstream_headers,
+                        600.0,
+                    )
+                    if upstream.status >= 500:
+                        connection.close()
+                        raise RuntimeError(f"Upstream returned HTTP {upstream.status}.")
+                except BaseException as exc:
+                    release_gateway_resources()
+                    if not isinstance(exc, Exception):
+                        raise
+                    if isinstance(exc, GenerationSlotCancelled):
+                        raise HTTPException(status_code=499, detail=str(exc)) from exc
+                    last_open_error = exc
+                    open_failures += 1
+                    selected.health_ready = False
+                    selected.health_sampled_at = time.time()
+                    selected.health_issues = [f"Gateway open failed: {type(exc).__name__}."]
+                    if exact_instance_request:
+                        break
+                    try:
+                        selected = instance_router.resolve(
+                            candidate_model_id,
+                            revision=candidate_revision,
+                            exclude_instance_ids=attempted_instances | excluded_instance_ids,
+                        )
+                    except InstanceConflict:
+                        break
+                    continue
+
+                if open_failures:
+                    auto_router.metrics.fallback_count += 1
+                with lifecycle_lock:
+                    session_id = parsed["session_id"]
+                    if isinstance(session_id, str):
+                        session_routes[session_id] = (
+                            selected.requested_model_id,
+                            revision,
+                        )
+                route_reason = decision.reason.value
+                if open_failures:
+                    if fallback_kind == "primary":
+                        route_reason = "fallback_same_model_replica"
+                    elif fallback_kind == "default":
+                        route_reason = "fallback_default_model"
+                    else:
+                        route_reason = "fallback_same_capability_model"
+                response_headers = {
+                    "X-Tokenity-Routed-Model": selected.requested_model_id,
+                    "X-Tokenity-Instance-ID": selected.instance_id,
+                    "X-Tokenity-Model-Revision": selected.model_revision or revision,
+                    "X-Tokenity-Route-Reason": route_reason,
+                    "X-Tokenity-Route-Confidence": f"{decision.confidence:.3f}",
+                    "X-Tokenity-Routing-Latency-Ms": f"{decision.routing_latency_ms:.3f}",
+                    "X-Tokenity-Model": selected.requested_model_id,
+                    "X-Tokenity-Queue-Wait-Ms": f"{slot.waited_seconds * 1_000:.3f}",
                 }
-            )
-            return StreamingResponse(
-                _gateway_body_chunks(
-                    connection,
-                    upstream,
-                    on_close=lambda: instances.release_request_lease(selected.instance_id),
-                ),
-                status_code=upstream.status,
-                headers=response_headers,
-                media_type=None,
-            )
+                try:
+                    content_type = upstream.getheader("Content-Type")
+                    if content_type:
+                        response_headers["Content-Type"] = content_type
+                    upstream_request_id = upstream.getheader("X-Tokenity-Request-ID")
+                    if upstream_request_id:
+                        response_headers["X-Tokenity-Request-ID"] = upstream_request_id
+                    is_stream = bool(payload.get("stream"))
+                    if is_stream:
+                        response_headers.update(
+                            {
+                                "Cache-Control": "no-cache, no-transform",
+                                "X-Accel-Buffering": "no",
+                            }
+                        )
+                        stream_close_lock = threading.Lock()
+                        stream_closed = False
 
-        try:
-            response_body = await run_in_threadpool(upstream.read)
-        finally:
-            connection.close()
-            instances.release_request_lease(selected.instance_id)
-        return Response(
-            content=response_body,
-            status_code=upstream.status,
-            headers=response_headers,
-            media_type=None,
+                        def close_gateway_stream() -> None:
+                            nonlocal stream_closed
+                            with stream_close_lock:
+                                if stream_closed:
+                                    return
+                                stream_closed = True
+                            connection.close()
+                            release_gateway_resources()
+
+                        return _GatewayStreamingResponse(
+                            _gateway_body_chunks(
+                                connection,
+                                upstream,
+                                on_close=close_gateway_stream,
+                            ),
+                            on_close=close_gateway_stream,
+                            status_code=upstream.status,
+                            headers=response_headers,
+                            media_type=None,
+                        )
+
+                    try:
+                        response_body = await run_in_threadpool(upstream.read)
+                    finally:
+                        connection.close()
+                        release_gateway_resources()
+                    return Response(
+                        content=response_body,
+                        status_code=upstream.status,
+                        headers=response_headers,
+                        media_type=None,
+                    )
+                except BaseException:
+                    connection.close()
+                    release_gateway_resources()
+                    raise
+
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"No routed model instance could accept the request: {last_open_error}"
+                if last_open_error is not None
+                else "No routed model instance could accept the request."
+            ),
         )
 
     @app.post("/v1/node/heartbeat")
     def heartbeat(request: HeartbeatRequest) -> dict[str, object]:
+        worker_renewals: list[dict[str, object]] = []
         if request.instance_id:
             instance = instances.get(request.instance_id)
             if instance is None:
@@ -855,13 +1621,41 @@ def create_app(
             instance.heartbeat(request.ttl_seconds)
             deadline = instance.deadline
             deadline_kind = "epoch"
+            for agent_url in instance_workers.get(request.instance_id, []):
+                try:
+                    result = post_json(
+                        f"{agent_url}/v1/node/heartbeat",
+                        request.model_dump(mode="json"),
+                        3.0,
+                    )
+                    worker_renewals.append(
+                        {"agent_url": agent_url, "status": "ok", "result": result}
+                    )
+                except Exception as exc:
+                    worker_renewals.append(
+                        {"agent_url": agent_url, "status": "error", "error": str(exc)}
+                    )
         else:
+            managed_instances = [
+                snapshot
+                for snapshot in instances.snapshots()
+                if snapshot.get("state") not in {"stopped", "failed", "orphaned"}
+            ]
+            if managed_instances:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "A managed instance is active; heartbeat must include its "
+                        "instance_id instead of renewing the legacy global lease."
+                    ),
+                )
             deadline = renew_lease(request.ttl_seconds)
             deadline_kind = "monotonic"
         return {
             "status": "ok",
             "lease_seconds": request.ttl_seconds,
             f"deadline_{deadline_kind}": deadline,
+            "worker_renewals": worker_renewals,
         }
 
     @app.post("/v1/node/start-official-mlx-lm")
@@ -892,6 +1686,22 @@ def create_app(
         request.operation_id = operation_id
         if len(nodes) == 1:
             request.connection_mode = ConnectionMode.RING
+        else:
+            requested_connection_mode = request.connection_mode
+            request.connection_mode = _stable_connection_mode_for_model(
+                request.model,
+                request.connection_mode,
+            )
+            if request.connection_mode != requested_connection_mode:
+                logging.warning(
+                    "Tokenity selected %s instead of %s for GLM-5.2 because "
+                    "reusing the direct JACCL path across requests can fail "
+                    "with Recv error -12.",
+                    request.connection_mode.value,
+                    requested_connection_mode.value,
+                )
+            if not request.dry_run:
+                require_managed_instance_capabilities(nodes)
         model_revision = _model_revision(request.model)
         if not request.dry_run:
             issues = runtime_preflight(request.python, request.model, model_revision)
@@ -900,11 +1710,13 @@ def create_app(
                     status_code=412,
                     detail={"stage": "preflight", "instance_id": instance_id, "issues": issues},
                 )
-            request.port = _allocate_instance_port(request.port, resource_ledger.snapshot())
+            ledger_snapshot = resource_ledger.snapshot()
+            request.port = _allocate_instance_port(request.port, ledger_snapshot)
             request.starting_port = _allocate_collective_port(
                 request.starting_port,
                 len(nodes),
-                resource_ledger.snapshot(),
+                ledger_snapshot,
+                excluded_ports={request.port},
             )
         try:
             rank_requests = _http_rank_requests(request, nodes, model_revision=model_revision)
@@ -922,9 +1734,25 @@ def create_app(
                 "launch_plan": plan,
             }
 
+        reservation_breakdown = _estimated_memory_reservation_breakdown(
+            request.model,
+            len(nodes),
+            max_tokens=request.max_tokens,
+            prompt_cache_size=request.prompt_cache_size,
+            prefill_step_size=request.prefill_step_size,
+            decode_concurrency=request.decode_concurrency,
+            prompt_concurrency=request.prompt_concurrency,
+        )
         reservation = request.memory_reservation_bytes
         if reservation is None:
-            reservation = _estimated_memory_reservation(request.model, len(nodes))
+            reservation = reservation_breakdown.estimated_total_bytes
+        else:
+            reservation_breakdown = MemoryReservationBreakdown(
+                legacy_unattributed_bytes=reservation
+            )
+        # Managed instances own independent epoch leases. A stale legacy lease
+        # must never retain authority to stop every sibling instance.
+        clear_legacy_lease()
         try:
             instance, created = instances.create(
                 instance_id=instance_id,
@@ -942,6 +1770,7 @@ def create_app(
                 http_port=request.port,
                 starting_port=request.starting_port,
                 memory_reservation_bytes=reservation,
+                memory_reservation_breakdown=reservation_breakdown,
             )
         except InstanceConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -1033,14 +1862,7 @@ def create_app(
                         8.0,
                     )
                 except Exception:
-                    try:
-                        post_json(
-                            f"{agent_url}/v1/node/stop-all",
-                            {"timeout": 5},
-                            8.0,
-                        )
-                    except Exception:
-                        pass
+                    pass
             supervisor_stop(local_role, 5, instance_id)
             resource_ledger.release(instance_id)
             remove_cluster_runtime(instance_id)
@@ -1053,7 +1875,6 @@ def create_app(
             raise HTTPException(status_code=502, detail=f"Could not start worker rank over HTTP: {exc}") from exc
 
         with lifecycle_lock:
-            distributed_workers[:] = started_workers
             instance_workers[instance_id] = list(started_workers)
         if len(nodes) > 1:
             instance.transition(InstanceLifecycle.LOADING_METADATA)
@@ -1111,9 +1932,22 @@ def create_app(
         runtime_port = request.port
         generation = begin_launch(instance_id)
         set_cluster_runtime(request, "worker")
+        reservation_breakdown = _estimated_memory_reservation_breakdown(
+            request.model,
+            request.world_size,
+            max_tokens=request.max_tokens,
+            prompt_cache_size=request.prompt_cache_size,
+            prefill_step_size=request.prefill_step_size,
+            decode_concurrency=request.decode_concurrency,
+            prompt_concurrency=request.prompt_concurrency,
+        )
         reservation = request.memory_reservation_bytes
         if reservation is None:
-            reservation = _estimated_memory_reservation(request.model, request.world_size)
+            reservation = reservation_breakdown.estimated_total_bytes
+        else:
+            reservation_breakdown = MemoryReservationBreakdown(
+                legacy_unattributed_bytes=reservation
+            )
         try:
             instance, created = instances.create(
                 instance_id=instance_id,
@@ -1131,6 +1965,7 @@ def create_app(
                 http_port=request.port,
                 starting_port=request.starting_port,
                 memory_reservation_bytes=reservation,
+                memory_reservation_breakdown=reservation_breakdown,
             )
             if created:
                 resource_ledger.reserve(
@@ -1290,6 +2125,100 @@ def create_app(
     return app
 
 
+async def _acquire_generation_slot(
+    scheduler: GenerationSlotScheduler,
+    instance_id: str,
+    selected_nodes,
+    *,
+    timeout: float | None,
+    disconnect_checker=None,
+):
+    """Acquire in a worker while retaining ownership across cancellation races."""
+
+    cancel_event = threading.Event()
+    holder_lock = threading.Lock()
+    holder: dict[str, object] = {}
+
+    def acquire():
+        lease = scheduler.acquire(
+            instance_id,
+            selected_nodes,
+            timeout=timeout,
+            cancel_event=cancel_event,
+        )
+        with holder_lock:
+            if cancel_event.is_set():
+                lease.release()
+                raise GenerationSlotCancelled(
+                    f"Generation slot request for {instance_id} was cancelled."
+                )
+            holder["lease"] = lease
+        return lease
+
+    future = asyncio.get_running_loop().run_in_executor(None, acquire)
+    try:
+        while True:
+            done, _ = await asyncio.wait({future}, timeout=0.05)
+            if done:
+                lease = future.result()
+                break
+            if disconnect_checker is not None and await disconnect_checker():
+                raise GenerationSlotCancelled(
+                    f"Client disconnected while waiting for {instance_id}."
+                )
+    except BaseException:
+        cancel_event.set()
+        with holder_lock:
+            held = holder.pop("lease", None)
+        if held is not None:
+            held.release()
+        if not future.done():
+            future.add_done_callback(
+                lambda completed: (
+                    None
+                    if completed.cancelled()
+                    else completed.exception()
+                )
+            )
+        raise
+    with holder_lock:
+        holder.pop("lease", None)
+    return lease
+
+
+async def _run_gateway_open(open_fn, *args):
+    """Close a late upstream connection if its awaiting request is cancelled."""
+
+    cancel_event = threading.Event()
+    holder_lock = threading.Lock()
+    holder: dict[str, object] = {}
+
+    def open_upstream():
+        result = open_fn(*args)
+        with holder_lock:
+            if cancel_event.is_set():
+                result[0].close()
+                raise GenerationSlotCancelled(
+                    "Gateway open completed after its request was cancelled."
+                )
+            holder["result"] = result
+        return result
+
+    future = asyncio.get_running_loop().run_in_executor(None, open_upstream)
+    try:
+        result = await future
+    except BaseException:
+        cancel_event.set()
+        with holder_lock:
+            held = holder.pop("result", None)
+        if held is not None:
+            held[0].close()
+        raise
+    with holder_lock:
+        holder.pop("result", None)
+    return result
+
+
 def _open_gateway_upstream(
     url: str,
     body: bytes,
@@ -1321,6 +2250,7 @@ def _gateway_body_chunks(
     *,
     on_close,
 ):
+    del connection
     try:
         while True:
             # read1 returns currently available bytes instead of waiting to fill
@@ -1330,11 +2260,386 @@ def _gateway_body_chunks(
                 break
             yield chunk
     finally:
-        connection.close()
         try:
             on_close()
         except InstanceConflict:
             pass
+
+
+def _routing_revision(value: object) -> str:
+    return str(value) if isinstance(value, str) and value else "unversioned"
+
+
+def _infer_gateway_model_profile(
+    model_id: str,
+    revision: str,
+    resolved_path: str,
+) -> ModelCapabilityProfile:
+    config = _read_model_config(Path(resolved_path) / "config.json")
+    identity = f"{model_id} {resolved_path}".lower()
+    context_length = _first_positive_int(
+        config,
+        "max_position_embeddings",
+        "context_length",
+        "model_max_length",
+        default=32_768,
+    )
+    max_output_length = _first_positive_int(
+        config,
+        "max_output_length",
+        "max_new_tokens",
+        default=min(8_192, context_length),
+    )
+    tags = {"general"}
+    if any(marker in identity for marker in ("coder", "code", "devstral")):
+        tags.add("coding")
+    if any(marker in identity for marker in ("reason", "thinking", "r1", "qwq")):
+        tags.add("reasoning")
+    if any(marker in identity for marker in ("tool", "function")):
+        tags.add("tool-use")
+    if any(marker in identity for marker in ("fast", "mini", "small", "flash")):
+        tags.add("fast-chat")
+    if context_length >= 65_536 or any(
+        marker in identity for marker in ("long", "128k", "256k", "1m")
+    ):
+        tags.add("long-context")
+
+    parameter_scales_billions = [
+        float(match)
+        for match in re.findall(
+            r"(?:^|[^0-9])(\d+(?:\.\d+)?)b(?:[^a-z0-9]|$)",
+            identity,
+        )
+    ]
+    largest_parameter_scale = (
+        max(parameter_scales_billions) if parameter_scales_billions else None
+    )
+    is_large = any(
+        marker in identity
+        for marker in ("large", "strong", "70b", "72b", "122b", "235b", "405b")
+    ) or bool(largest_parameter_scale is not None and largest_parameter_scale >= 70)
+    is_fast = "fast-chat" in tags or any(
+        marker in identity for marker in ("1b", "3b", "7b", "8b")
+    ) or bool(largest_parameter_scale is not None and largest_parameter_scale <= 8)
+    base_quality = 0.92 if is_large else 0.72 if is_fast else 0.82
+    warm_ttft_p95_ms = 1_200.0 if is_large else 120.0 if is_fast else 450.0
+    task_quality = {
+        "general": base_quality,
+        "fast-chat": max(0.65, base_quality - (0.08 if is_large else 0.0)),
+        "coding": 0.96 if "coding" in tags else max(0.5, base_quality - 0.12),
+        "reasoning": 0.96 if "reasoning" in tags else max(0.5, base_quality - 0.12),
+        "long-context": 0.94 if "long-context" in tags else max(0.45, base_quality - 0.18),
+        "tool-use": 0.94 if "tool-use" in tags else max(0.45, base_quality - 0.18),
+    }
+    supports_thinking = (
+        "reasoning" in tags
+        or "qwen3" in identity
+        or "glm" in identity
+    )
+    supports_tools = (
+        "tool-use" in tags
+        or "qwen" in identity
+        or bool(config.get("supports_tools"))
+    )
+    supports_json = supports_tools or "json" in identity or bool(config.get("supports_json"))
+    sampling_defaults: dict[str, object] = {"temperature": 0.7, "top_p": 0.9}
+    if "qwen3" in identity:
+        sampling_defaults = {
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 20,
+            "presence_penalty": 1.5,
+        }
+    elif "coding" in tags:
+        sampling_defaults["temperature"] = 0.2
+    elif "reasoning" in tags:
+        sampling_defaults["temperature"] = 0.6
+    configured_template_defaults = config.get("tokenity_chat_template_defaults")
+    if isinstance(configured_template_defaults, dict):
+        chat_template_defaults = dict(configured_template_defaults)
+    elif "qwen3" in identity:
+        chat_template_defaults = {"enable_thinking": True}
+    else:
+        # GLM and other reasoning families keep their own template behavior;
+        # never inject Qwen's private enable_thinking switch into them.
+        chat_template_defaults = {}
+    configured_runtime_parameters = config.get(
+        "tokenity_supported_runtime_parameters"
+    )
+    if isinstance(configured_runtime_parameters, list):
+        supported_runtime_parameters = {
+            str(value)
+            for value in configured_runtime_parameters
+            if isinstance(value, str) and value
+        }
+    else:
+        supported_runtime_parameters = set(COMMON_CHAT_RUNTIME_PARAMETERS)
+        if supports_tools:
+            supported_runtime_parameters.update(
+                {"parallel_tool_calls", "tool_choice", "tools"}
+            )
+        if supports_json:
+            supported_runtime_parameters.add("response_format")
+        if "qwen3" in identity or chat_template_defaults:
+            supported_runtime_parameters.add("chat_template_kwargs")
+    configured_template_parameters = config.get(
+        "tokenity_supported_chat_template_parameters"
+    )
+    if isinstance(configured_template_parameters, list):
+        supported_template_parameters = {
+            str(value)
+            for value in configured_template_parameters
+            if isinstance(value, str) and value
+        }
+    else:
+        supported_template_parameters = {
+            str(key) for key in chat_template_defaults
+        }
+    return ModelCapabilityProfile(
+        model_id=model_id,
+        revision=revision,
+        tokenizer=None,
+        context_length=context_length,
+        max_output_length=max_output_length,
+        task_tags=frozenset(tags),
+        task_quality=task_quality,
+        supports_tools=supports_tools,
+        supports_json=supports_json,
+        supports_thinking=supports_thinking,
+        allow_auto=bool(config.get("tokenity_allow_auto", True)),
+        user_priority=float(config.get("tokenity_user_priority") or 0.0),
+        privacy_tier=int(config.get("tokenity_privacy_tier") or 0),
+        sampling_defaults=sampling_defaults,
+        chat_template_defaults=chat_template_defaults,
+        supported_runtime_parameters=frozenset(supported_runtime_parameters),
+        supported_chat_template_parameters=frozenset(
+            supported_template_parameters
+        ),
+        warm_ttft_p50_ms=warm_ttft_p95_ms / 1.5,
+        warm_ttft_p95_ms=warm_ttft_p95_ms,
+    )
+
+
+def _first_positive_int(
+    values: dict[str, object],
+    *keys: str,
+    default: int,
+) -> int:
+    for key in keys:
+        value = values.get(key)
+        if isinstance(value, int) and value > 0:
+            return value
+    return default
+
+
+def _derive_gateway_route_context(
+    payload: dict[str, object],
+    constraints: dict[str, object],
+    *,
+    session_id: str | None,
+    sticky_model_id: str | None,
+    sticky_revision: str | None,
+    locked_model_id: str | None,
+    locked_revision: str | None,
+) -> tuple[RouteContext, dict[str, object]]:
+    messages = payload.get("messages")
+    message_list = messages if isinstance(messages, list) else []
+    all_text_parts: list[str] = []
+    last_user_text = ""
+    modality = str(constraints.get("modality") or "text")
+    for message in message_list:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        text, has_image = _gateway_message_text(content)
+        if text:
+            all_text_parts.append(text)
+        if has_image:
+            modality = "image"
+        if message.get("role") == "user":
+            last_user_text = text
+    input_tokens = max(
+        0,
+        int(constraints.get("input_tokens") or 0),
+        sum(max(1, (len(text) + 3) // 4) for text in all_text_parts),
+    )
+    requested_output_tokens = payload.get("max_tokens")
+    if not isinstance(requested_output_tokens, int):
+        requested_output_tokens = payload.get("max_completion_tokens")
+    if not isinstance(requested_output_tokens, int):
+        requested_output_tokens = int(constraints.get("requested_output_tokens") or 0)
+    lowered = last_user_text.lower()
+    contains_code = bool(
+        re.search(
+            r"```|\b(?:python|swift|rust|javascript|typescript|java|c\+\+|function|class|def)\b",
+            lowered,
+        )
+    )
+    has_compiler_error = bool(
+        re.search(r"traceback|compiler error|build failed|syntaxerror|typeerror|exception:", lowered)
+    )
+    has_file_diff = bool(re.search(r"(^|\n)(?:diff --git|@@ |\+\+\+ |--- )", last_user_text))
+    multi_step_reasoning = bool(
+        re.search(
+            r"\b(?:prove|derive|step by step|reasoning|theorem|calculate)\b|证明|推导|逐步|多步",
+            lowered,
+        )
+    )
+    is_translation = bool(re.search(r"\btranslat(?:e|ion)\b|翻译|译成", lowered))
+    is_rewrite = bool(re.search(r"\brewrite\b|改写|润色", lowered))
+    long_document = input_tokens >= int(constraints.get("long_document_tokens") or 8_192)
+    tools = payload.get("tools")
+    response_format = payload.get("response_format")
+    chat_template_kwargs = payload.get("chat_template_kwargs")
+    requires_tools = bool(tools) or bool(constraints.get("requires_tools"))
+    requires_json = (
+        isinstance(response_format, dict)
+        and response_format.get("type") in {"json_object", "json_schema"}
+    ) or bool(constraints.get("requires_json"))
+    requires_thinking = (
+        isinstance(chat_template_kwargs, dict)
+        and chat_template_kwargs.get("enable_thinking") is True
+    ) or bool(constraints.get("requires_thinking"))
+    language = "zh" if re.search(r"[\u3400-\u9fff]", last_user_text) else "en"
+    allowed_raw = constraints.get("allowed_model_ids")
+    allowed_model_ids = {
+        str(value)
+        for value in allowed_raw
+        if isinstance(value, str) and value
+    } if isinstance(allowed_raw, list) else set()
+    if locked_model_id:
+        if allowed_model_ids and locked_model_id not in allowed_model_ids:
+            allowed_model_ids = {"__tokenity_no_eligible_locked_model__"}
+        else:
+            allowed_model_ids = {locked_model_id}
+    topic_changed = bool(constraints.get("topic_changed")) and not bool(locked_model_id)
+    category = constraints.get("category")
+    if not isinstance(category, str):
+        category = None
+    context = RouteContext(
+        category=category,
+        input_tokens=input_tokens,
+        requested_output_tokens=max(0, requested_output_tokens),
+        language=language,
+        requires_tools=requires_tools,
+        requires_json=requires_json,
+        requires_thinking=requires_thinking,
+        modality=modality,
+        allowed_model_ids=frozenset(allowed_model_ids),
+        minimum_privacy_tier=max(0, int(constraints.get("minimum_privacy_tier") or 0)),
+        runtime_parameters=frozenset(
+            str(key)
+            for key in payload
+            if key not in TOKENITY_ROUTE_FIELDS and key not in {"model", "messages"}
+        ),
+        chat_template_parameters=frozenset(
+            str(key)
+            for key in chat_template_kwargs
+        )
+        if isinstance(chat_template_kwargs, dict)
+        else frozenset(),
+        session_id=session_id,
+        sticky_model_id=locked_model_id or sticky_model_id,
+        sticky_revision=locked_revision if locked_model_id else sticky_revision,
+        topic_changed=topic_changed,
+        contains_code=contains_code,
+        has_compiler_error=has_compiler_error,
+        has_file_diff=has_file_diff,
+        multi_step_reasoning=multi_step_reasoning,
+        long_document=long_document,
+        is_translation=is_translation,
+        is_rewrite=is_rewrite,
+    )
+    features = {
+        "input_tokens": input_tokens,
+        "requested_output_tokens": max(0, requested_output_tokens),
+        "language": language,
+        "requires_tools": requires_tools,
+        "requires_json": requires_json,
+        "requires_thinking": requires_thinking,
+        "modality": modality,
+        "contains_code": contains_code,
+        "has_compiler_error": has_compiler_error,
+        "has_file_diff": has_file_diff,
+        "multi_step_reasoning": multi_step_reasoning,
+        "long_document": long_document,
+        "is_translation": is_translation,
+        "is_rewrite": is_rewrite,
+    }
+    return context, features
+
+
+def _gateway_message_text(content: object) -> tuple[str, bool]:
+    if isinstance(content, str):
+        return content, False
+    if not isinstance(content, list):
+        return "", False
+    texts: list[str] = []
+    has_image = False
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") in {"image", "image_url", "input_image"}:
+            has_image = True
+        text = item.get("text")
+        if isinstance(text, str):
+            texts.append(text)
+    return "\n".join(texts), has_image
+
+
+def _default_gateway_model_id(profiles: list[ModelCapabilityProfile]) -> str | None:
+    if not profiles:
+        return None
+    return max(
+        profiles,
+        key=lambda profile: (
+            profile.user_priority,
+            profile.quality_for("general"),
+            profile.context_length,
+            profile.model_id,
+        ),
+    ).model_id
+
+
+def _gateway_upstream_payload(
+    payload: dict[str, object],
+    selected,
+    profile: ModelCapabilityProfile,
+) -> dict[str, object]:
+    upstream = {
+        key: value
+        for key, value in payload.items()
+        if key not in TOKENITY_ROUTE_FIELDS
+    }
+    upstream["model"] = selected.requested_model_id
+    allowed_template_parameters = set(
+        profile.supported_chat_template_parameters
+    )
+    allowed_template_parameters.update(
+        str(key) for key in profile.chat_template_defaults
+    )
+    existing_template = upstream.get("chat_template_kwargs")
+    if isinstance(existing_template, dict) and allowed_template_parameters:
+        filtered_template = {
+            str(key): value
+            for key, value in existing_template.items()
+            if str(key) in allowed_template_parameters
+        }
+        if filtered_template:
+            upstream["chat_template_kwargs"] = filtered_template
+        else:
+            upstream.pop("chat_template_kwargs", None)
+    else:
+        upstream.pop("chat_template_kwargs", None)
+    for key, value in profile.sampling_defaults.items():
+        upstream.setdefault(str(key), value)
+    if profile.chat_template_defaults:
+        existing = upstream.get("chat_template_kwargs")
+        explicit = dict(existing) if isinstance(existing, dict) else {}
+        merged = dict(profile.chat_template_defaults)
+        merged.update(explicit)
+        upstream["chat_template_kwargs"] = merged
+    return upstream
 
 
 def scan_models(root: Path) -> list[dict[str, object]]:
@@ -1386,6 +2691,23 @@ def _read_model_config(path: Path) -> dict[str, object]:
     except (OSError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _stable_connection_mode_for_model(
+    model: str,
+    requested: ConnectionMode,
+) -> ConnectionMode:
+    if requested != ConnectionMode.JACCL:
+        return requested
+    config = _read_model_config(Path(model) / "config.json")
+    identities = [Path(model).name, str(config.get("model_type", ""))]
+    architectures = config.get("architectures")
+    if isinstance(architectures, list):
+        identities.extend(str(item) for item in architectures)
+    identity = " ".join(identities).lower()
+    if "glm" in identity and ("moe" in identity or "5.2" in identity):
+        return ConnectionMode.JACCL_RING
+    return requested
 
 
 def _quantization_description(config: dict[str, object], model_path: Path) -> str | None:
@@ -1569,6 +2891,12 @@ def _rank_command_and_environment(request: RankStartRequest) -> tuple[list[str],
     if request.rank >= request.world_size:
         raise HostfileError("Rank must be smaller than world size.")
 
+    post_load_barrier_default = (
+        "1"
+        if request.world_size > 1
+        and request.connection_mode in {ConnectionMode.JACCL, ConnectionMode.JACCL_RING}
+        else "0"
+    )
     env = {
         "PATH": _distributed_path(request.python),
         "PYTHONPATH": _distributed_code_root(),
@@ -1583,7 +2911,10 @@ def _rank_command_and_environment(request: RankStartRequest) -> tuple[list[str],
         "TOKENITY_MLX_LOAD_EVAL_CHUNK_SIZE": os.environ.get("TOKENITY_MLX_LOAD_EVAL_CHUNK_SIZE", "1"),
         "TOKENITY_MLX_LOAD_EVAL_LOG_INTERVAL": os.environ.get("TOKENITY_MLX_LOAD_EVAL_LOG_INTERVAL", "100"),
         "TOKENITY_MLX_LOAD_EVAL_SLEEP_SECONDS": os.environ.get("TOKENITY_MLX_LOAD_EVAL_SLEEP_SECONDS", "0.05"),
-        "TOKENITY_MLX_LOAD_POST_BARRIER": os.environ.get("TOKENITY_MLX_LOAD_POST_BARRIER", "0"),
+        "TOKENITY_MLX_LOAD_POST_BARRIER": os.environ.get(
+            "TOKENITY_MLX_LOAD_POST_BARRIER",
+            post_load_barrier_default,
+        ),
         "TOKENITY_MLX_DISTRIBUTED_INIT_RANK0_DELAY_SECONDS": os.environ.get(
             "TOKENITY_MLX_DISTRIBUTED_INIT_RANK0_DELAY_SECONDS", "0"
         ),
@@ -1824,8 +3155,8 @@ def _runtime_preflight(
 
     mlx_version = _package_version("mlx")
     mlx_lm_version = _package_version("mlx-lm")
-    if mlx_version != "0.31.2":
-        issues.append(f"mlx 0.31.2 is required; found {mlx_version or 'not installed'}.")
+    if mlx_version != "0.32.0":
+        issues.append(f"mlx 0.32.0 is required; found {mlx_version or 'not installed'}.")
     if mlx_lm_version is None or _version_release(mlx_lm_version) < (0, 31, 3):
         issues.append(f"mlx-lm >= 0.31.3 is required; found {mlx_lm_version or 'not installed'}.")
 
@@ -1892,7 +3223,16 @@ def _tokenity_code_revision() -> str | None:
     return digest.hexdigest()
 
 
-def _estimated_memory_reservation(model: str, world_size: int) -> int:
+def _estimated_memory_reservation_breakdown(
+    model: str,
+    world_size: int,
+    *,
+    max_tokens: int,
+    prompt_cache_size: int,
+    prefill_step_size: int,
+    decode_concurrency: int,
+    prompt_concurrency: int,
+) -> MemoryReservationBreakdown:
     root = Path(model)
     total = 0
     try:
@@ -1900,11 +3240,63 @@ def _estimated_memory_reservation(model: str, world_size: int) -> int:
             if path.is_file() and path.suffix in {".safetensors", ".gguf"}:
                 total += path.stat().st_size
     except OSError:
-        return 0
-    if total == 0:
-        return 0
-    shard = (total + max(1, world_size) - 1) // max(1, world_size)
-    return int(shard * 1.15) + (2 * 1024**3)
+        pass
+    ranks = max(1, world_size)
+    weights = (total + ranks - 1) // ranks if total else 0
+
+    config: dict[str, object] = {}
+    try:
+        candidate = json.loads((root / "config.json").read_text(encoding="utf-8"))
+        if isinstance(candidate, dict):
+            config = candidate
+    except (OSError, json.JSONDecodeError):
+        pass
+    if total == 0 and not config:
+        return MemoryReservationBreakdown()
+    hidden_size = config.get("hidden_size")
+    layer_count = config.get("num_hidden_layers")
+    attention_heads = config.get("num_attention_heads")
+    kv_heads = config.get("num_key_value_heads", attention_heads)
+    head_dim = config.get("head_dim")
+    if not isinstance(head_dim, int) and isinstance(hidden_size, int) and isinstance(attention_heads, int):
+        head_dim = max(1, hidden_size // max(1, attention_heads))
+    if not all(isinstance(value, int) and value > 0 for value in (layer_count, kv_heads, head_dim)):
+        # Unknown architectures keep a bounded conservative cache allowance;
+        # observed phys_footprint/MLX peak replaces this estimate after warmup.
+        kv_cache = max(512 * 1024**2, weights // 20 if weights else 0)
+        prompt_cache = max(256 * 1024**2, weights // 40 if weights else 0)
+    else:
+        bytes_per_token = 2 * int(layer_count) * int(kv_heads) * int(head_dim) * 2
+        live_tokens = max_tokens * max(1, decode_concurrency)
+        cached_tokens = min(max_tokens, prefill_step_size) * max(1, prompt_cache_size)
+        kv_cache = (bytes_per_token * live_tokens * max(1, prompt_concurrency) + ranks - 1) // ranks
+        prompt_cache = (bytes_per_token * cached_tokens + ranks - 1) // ranks
+
+    mlx_cache = max(512 * 1024**2, weights // 20 if weights else 0)
+    runtime_peak = max(1024**3, weights // 10 if weights else 0)
+    os_headroom = max(2 * 1024**3, (weights + kv_cache + prompt_cache) // 20)
+    return MemoryReservationBreakdown(
+        weights_bytes=weights,
+        kv_cache_bytes=kv_cache,
+        prompt_cache_bytes=prompt_cache,
+        mlx_cache_bytes=mlx_cache,
+        runtime_peak_bytes=runtime_peak,
+        os_headroom_bytes=os_headroom,
+    )
+
+
+def _estimated_memory_reservation(model: str, world_size: int) -> int:
+    """Compatibility estimate for callers that do not provide runtime sizing."""
+
+    return _estimated_memory_reservation_breakdown(
+        model,
+        world_size,
+        max_tokens=32_768,
+        prompt_cache_size=4,
+        prefill_step_size=2_048,
+        decode_concurrency=1,
+        prompt_concurrency=1,
+    ).estimated_total_bytes
 
 
 def _allocate_instance_port(preferred: int, ledger: dict[str, object]) -> int:
@@ -1917,14 +3309,22 @@ def _allocate_instance_port(preferred: int, ledger: dict[str, object]) -> int:
     raise HTTPException(status_code=409, detail=f"No free HTTP port near {preferred}.")
 
 
-def _allocate_collective_port(preferred: int, world_size: int, ledger: dict[str, object]) -> int:
+def _allocate_collective_port(
+    preferred: int,
+    world_size: int,
+    ledger: dict[str, object],
+    *,
+    excluded_ports: set[int] | None = None,
+) -> int:
     reserved = {int(port) for port in dict(ledger.get("ports") or {}).keys()}
+    reserved.update(excluded_ports or set())
     width = max(1, world_size)
-    for starting_port in range(preferred, min(65_536 - width, preferred + 256)):
-        ports = range(starting_port, starting_port + width)
+    last_starting_port = min(65_536 - width, preferred + 255)
+    for starting_port in range(preferred, last_starting_port + 1):
+        ports = tuple(range(starting_port, starting_port + width))
         if any(port in reserved for port in ports):
             continue
-        if _tcp_port_available(starting_port):
+        if all(_tcp_port_available(port) for port in ports):
             return starting_port
     raise HTTPException(status_code=409, detail=f"No free collective port range near {preferred}.")
 

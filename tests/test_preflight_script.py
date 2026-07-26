@@ -35,7 +35,7 @@ def test_node_evaluation_requires_runtime_model_and_rdma_evidence():
         "ips": ["192.168.5.75"],
         "architecture": "arm64",
         "python_path": "/runtime/python",
-        "mlx_version": "0.31.2",
+        "mlx_version": "0.32.0",
         "mlx_lm_version": "0.31.10",
         "tokenity_code_revision": "same-revision",
         "rdma": {

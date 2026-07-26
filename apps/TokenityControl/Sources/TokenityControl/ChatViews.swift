@@ -10,9 +10,10 @@ struct ChatWorkspaceView: View {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
                 ChatWorkspaceHeader(showsHistory: $showsHistory)
-                Divider()
+                Rectangle()
+                    .fill(theme.border.opacity(0.55))
+                    .frame(height: 0.5)
                 ChatTranscriptView()
-                Divider()
                 ChatComposerView()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -20,11 +21,17 @@ struct ChatWorkspaceView: View {
             if showsHistory {
                 Divider()
                 ChatSidebarView()
-                    .frame(minWidth: 250, idealWidth: 290, maxWidth: 340)
+                    .frame(minWidth: 244, idealWidth: 278, maxWidth: 326)
                     .transition(.move(edge: .trailing).combined(with: .opacity))
             }
         }
-        .background(theme.window)
+        .background {
+            LinearGradient(
+                colors: [theme.window, theme.accent.opacity(0.018)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        }
         .frame(minWidth: 780, minHeight: 620)
         .animation(.easeInOut(duration: 0.18), value: showsHistory)
     }
@@ -36,45 +43,75 @@ private struct ChatWorkspaceHeader: View {
     @Binding var showsHistory: Bool
 
     var body: some View {
-        HStack(spacing: 14) {
-            VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 12) {
                 Text(currentTitle)
-                    .font(.tokenityText(18, weight: .semibold))
+                    .font(.tokenityText(19, weight: .semibold))
                     .lineLimit(1)
-                HStack(spacing: 8) {
-                    Label(store.selectedModelName, systemImage: "cube")
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Text("·")
-                    Label(connectionLabel, systemImage: store.selectedNodes.count > 1 ? "point.3.connected.trianglepath.dotted" : "desktopcomputer")
-                        .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 12)
+                StatusPill(text: generationLabel, tone: generationTone)
+                Button {
+                    store.newChatSession()
+                } label: {
+                    Image(systemName: "square.and.pencil")
+                        .frame(width: 28, height: 28)
                 }
-                .font(.tokenityText(11))
+                .buttonStyle(.plain)
                 .foregroundStyle(theme.secondaryText)
+                .background(theme.group, in: Circle())
+                .disabled(store.isChatRunning)
+                .keyboardShortcut("n", modifiers: [.command])
+                .help(store.isChatRunning ? "Stop generation before starting a new conversation" : "New conversation")
+                .accessibilityLabel("New conversation")
+
+                Button {
+                    showsHistory.toggle()
+                } label: {
+                    Image(systemName: "sidebar.trailing")
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(theme.secondaryText)
+                .background(theme.group, in: Circle())
+                .help(showsHistory ? "Hide conversation history" : "Show conversation history")
+                .accessibilityLabel(showsHistory ? "Hide conversation history" : "Show conversation history")
             }
-            Spacer(minLength: 12)
-            StatusPill(text: generationLabel, tone: generationTone)
-            Button {
-                store.newChatSession()
-            } label: {
-                Label("New Chat", systemImage: "square.and.pencil")
+
+            HStack(spacing: 9) {
+                Label(store.selectedModelName, systemImage: "cube")
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(theme.group, in: Capsule())
+
+                Label(
+                    connectionLabel,
+                    systemImage: store.selectedNodes.count > 1
+                        ? "point.3.connected.trianglepath.dotted"
+                        : "desktopcomputer"
+                )
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 5)
+                .background(theme.group, in: Capsule())
+                .accessibilityLabel(connectionLabel)
+
+                if store.isAutoChatSelection {
+                    Label(store.autoRouterHealthText, systemImage: "arrow.triangle.branch")
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                Spacer(minLength: 0)
             }
-            .buttonStyle(.borderless)
-            .disabled(store.isChatRunning)
-            .keyboardShortcut("n", modifiers: [.command])
-            .help(store.isChatRunning ? "Stop generation before starting a new conversation" : "New conversation")
-            Button {
-                showsHistory.toggle()
-            } label: {
-                Image(systemName: "sidebar.trailing")
-            }
-            .buttonStyle(.borderless)
-            .help(showsHistory ? "Hide conversation history" : "Show conversation history")
-            .accessibilityLabel(showsHistory ? "Hide conversation history" : "Show conversation history")
+            .font(.tokenityText(11))
+            .foregroundStyle(theme.secondaryText)
         }
         .padding(.horizontal, 20)
-        .padding(.vertical, 13)
-        .background(theme.window)
+        .padding(.vertical, 12)
+        .background(.ultraThinMaterial)
     }
 
     private var currentTitle: String {
@@ -89,6 +126,12 @@ private struct ChatWorkspaceHeader: View {
     }
 
     private var generationLabel: String {
+        if case .selecting = store.chatRoutingState { return "Routing" }
+        if case .routed(let route) = store.chatRoutingState,
+           !store.isChatRunning,
+           let model = route.routedModelID {
+            return model
+        }
         if store.isChatRunning { return "Generating" }
         if store.isChatReady { return "Ready" }
         if store.phase == .running { return "Load a model" }
@@ -134,9 +177,9 @@ struct ChatTranscriptView: View {
                             .id(bottomID)
                         }
                         .id(store.activeChatSessionID)
-                        .frame(maxWidth: 860, alignment: .leading)
-                        .padding(.horizontal, 28)
-                        .padding(.vertical, 26)
+                        .frame(maxWidth: 900, alignment: .leading)
+                        .padding(.horizontal, 30)
+                        .padding(.vertical, 30)
                         .frame(maxWidth: .infinity)
                         .background {
                             TranscriptScrollActivityObserver {
@@ -146,7 +189,7 @@ struct ChatTranscriptView: View {
                     }
                     .coordinateSpace(name: coordinateSpace)
                     .scrollIndicators(.visible)
-                    .background(theme.window)
+                    .background(Color.clear)
                     .onPreferenceChange(TranscriptBottomPreferenceKey.self) { bottom in
                         followState.update(bottomDistance: bottom - viewport.size.height)
                     }
@@ -331,6 +374,7 @@ struct ChatMessageView: View {
     @Environment(\.tokenityTheme) private var theme
     @State private var isHovered = false
     @State private var didCopy = false
+    @State private var showsRouteDetails = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -343,11 +387,19 @@ struct ChatMessageView: View {
                     Text(message.role == .user ? "You" : "Assistant")
                         .font(.tokenityText(11, weight: .semibold))
                         .foregroundStyle(theme.secondaryText)
-                    if message.role == .assistant, let modelName = message.modelName {
+                    if message.role == .assistant,
+                       let modelName = message.routedModelID ?? message.modelName {
                         Text(modelName)
                             .font(.tokenityText(10))
                             .foregroundStyle(theme.tertiaryText)
                             .lineLimit(1)
+                    }
+                    if message.role == .assistant, let instanceID = message.instanceID {
+                        Text("· \(instanceID)")
+                            .font(.tokenityText(10))
+                            .foregroundStyle(theme.tertiaryText)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
                     }
                 }
 
@@ -441,6 +493,17 @@ struct ChatMessageView: View {
                 metric("Speed", metrics.outputTokensPerSecond.map { String(format: "%.1f tok/s", $0) })
             }
 
+            if message.role == .assistant, message.routeReason != nil {
+                Button("Why selected") {
+                    showsRouteDetails.toggle()
+                }
+                .buttonStyle(.borderless)
+                .font(.tokenityText(10, weight: .medium))
+                .popover(isPresented: $showsRouteDetails, arrowEdge: .bottom) {
+                    routeDetails
+                }
+            }
+
             Spacer(minLength: 4)
             messageActions
         }
@@ -490,6 +553,14 @@ struct ChatMessageView: View {
                 .disabled(!store.isChatReady || store.isChatRunning)
                 .help("Regenerate answer")
                 .accessibilityLabel("Regenerate answer")
+                Button {
+                    store.regenerateAssistantMessageWithAnotherModel(message.id)
+                } label: {
+                    Image(systemName: "arrow.triangle.branch")
+                }
+                .disabled(!store.isChatReady || store.isChatRunning)
+                .help("Regenerate with another model")
+                .accessibilityLabel("Regenerate with another model")
             } else if message.role == .user {
                 Button {
                     store.editChatMessage(message.id)
@@ -504,6 +575,43 @@ struct ChatMessageView: View {
         .buttonStyle(.borderless)
         .foregroundStyle(theme.secondaryText)
         .opacity(isHovered ? 1 : 0.34)
+    }
+
+    private var routeDetails: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Routing decision")
+                .font(.tokenityText(13, weight: .semibold))
+            if let model = message.routedModelID {
+                Text(model).font(.tokenityText(12, weight: .medium))
+            }
+            if let instanceID = message.instanceID {
+                Text("Instance \(instanceID)")
+                    .font(.tokenityText(10))
+                    .foregroundStyle(theme.tertiaryText)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            if let reason = message.routeReason {
+                Text(reason)
+                    .font(.tokenityText(11))
+                    .foregroundStyle(theme.secondaryText)
+            }
+            HStack(spacing: 10) {
+                if let confidence = message.routeConfidence {
+                    Text("Confidence \(Int((confidence * 100).rounded()))%")
+                }
+                if let latency = message.routingLatencyMilliseconds {
+                    Text(String(format: "Route %.1f ms", latency))
+                }
+                if let wait = message.queueWaitMilliseconds {
+                    Text(String(format: "Queue %.1f ms", wait))
+                }
+            }
+            .font(.tokenityText(10))
+            .foregroundStyle(theme.tertiaryText)
+        }
+        .padding(14)
+        .frame(width: 280, alignment: .leading)
     }
 
     private var statusSymbol: String {
@@ -603,49 +711,96 @@ struct ChatComposerView: View {
     @State private var editorHeight: CGFloat = 46
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .bottom, spacing: 10) {
-                ChatComposerTextView(
-                    text: $store.chatInput,
-                    height: $editorHeight,
-                    isEnabled: !store.isChatRunning && store.isChatReady,
-                    focusRevision: store.chatComposerFocusRevision,
-                    onSend: send
-                )
-                .frame(height: editorHeight)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(theme.group, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(theme.border, lineWidth: 0.5))
-                .accessibilityLabel("Message")
-                .accessibilityHint("Press Return to send or Shift Return for a new line")
+        VStack(alignment: .leading, spacing: 7) {
+            VStack(spacing: 0) {
+                ZStack(alignment: .topLeading) {
+                    ChatComposerTextView(
+                        text: $store.chatInput,
+                        height: $editorHeight,
+                        isEnabled: !store.isChatRunning && store.isChatReady,
+                        focusRevision: store.chatComposerFocusRevision,
+                        onSend: send
+                    )
+                    .frame(height: editorHeight)
+                    .accessibilityLabel("Message")
+                    .accessibilityHint("Press Return to send or Shift Return for a new line")
 
-                Button(action: sendOrStop) {
-                    Image(systemName: store.isChatRunning ? "stop.fill" : "arrow.up")
-                        .font(.system(size: 13, weight: .bold))
-                        .frame(width: 30, height: 30)
-                        .foregroundStyle(Color.white)
-                        .background(sendButtonColor, in: Circle())
+                    if store.chatInput.isEmpty {
+                        Text(composerPlaceholder)
+                            .font(.tokenityText(14))
+                            .foregroundStyle(theme.tertiaryText)
+                            .padding(.leading, 4)
+                            .padding(.top, 10)
+                            .allowsHitTesting(false)
+                    }
                 }
-                .buttonStyle(.plain)
-                .disabled(!store.isChatRunning && !canSend)
-                .help(sendHelp)
-                .accessibilityLabel(store.isChatRunning ? "Stop generation" : "Send message")
+                .padding(.horizontal, 14)
+                .padding(.top, 8)
+                .padding(.bottom, 5)
+
+                Rectangle()
+                    .fill(theme.border.opacity(0.48))
+                    .frame(height: 0.5)
+
+                HStack(spacing: 10) {
+                    ChatModelSelectionMenu()
+
+                    if store.isAutoChatSelection {
+                        Rectangle()
+                            .fill(theme.border.opacity(0.55))
+                            .frame(width: 0.5, height: 30)
+                        ChatRoutePolicySlider()
+                        ChatModelLockButton()
+                    } else {
+                        Label(thinkingModeTitle, systemImage: "brain.head.profile")
+                            .font(.tokenityText(10, weight: .medium))
+                            .foregroundStyle(theme.secondaryText)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 6)
+                            .background(theme.group, in: Capsule())
+                    }
+
+                    Spacer(minLength: 4)
+
+                    Button(action: sendOrStop) {
+                        Image(systemName: store.isChatRunning ? "stop.fill" : "arrow.up")
+                            .font(.system(size: 14, weight: .bold))
+                            .frame(width: 36, height: 36)
+                            .foregroundStyle(Color.white)
+                            .background(sendButtonColor, in: Circle())
+                            .shadow(
+                                color: sendButtonColor.opacity(canSend || store.isChatRunning ? 0.28 : 0),
+                                radius: 7,
+                                y: 2
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!store.isChatRunning && !canSend)
+                    .help(sendHelp)
+                    .accessibilityLabel(store.isChatRunning ? "Stop generation" : "Send message")
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
             }
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 17, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 17, style: .continuous)
+                    .stroke(theme.border.opacity(0.78), lineWidth: 0.6)
+            )
+            .shadow(color: .black.opacity(0.08), radius: 13, y: 4)
 
             HStack(spacing: 7) {
                 Text(composerHint)
                 Spacer()
-                Text("Thinking: \(thinkingModeTitle)")
-                Text("·")
                 Text("Return to send · Shift-Return for a new line")
             }
             .font(.tokenityText(10))
             .foregroundStyle(theme.tertiaryText)
         }
         .padding(.horizontal, 20)
-        .padding(.vertical, 13)
-        .background(.regularMaterial)
+        .padding(.top, 9)
+        .padding(.bottom, 11)
+        .background(theme.window.opacity(0.92))
     }
 
     private var canSend: Bool {
@@ -683,9 +838,158 @@ struct ChatComposerView: View {
         return store.selectedModelName
     }
 
+    private var composerPlaceholder: String {
+        if store.isChatRunning { return "Generating a response…" }
+        if !store.isChatReady { return "Load a model to start chatting" }
+        return "Message Tokenity…"
+    }
+
     private var thinkingModeTitle: String {
-        guard let model = store.loadedModelName else { return "Auto" }
+        guard !store.isAutoChatSelection else { return "Router default" }
+        let model = store.chatSelectedModelID
         return store.modelConfiguration(for: model).thinkingMode.title
+    }
+}
+
+private struct ChatModelSelectionMenu: View {
+    @EnvironmentObject private var store: TokenityStore
+    @Environment(\.tokenityTheme) private var theme
+
+    var body: some View {
+        Menu {
+            Button {
+                store.selectChatModel("tokenity-auto")
+            } label: {
+                Label(
+                    "Auto route",
+                    systemImage: store.isAutoChatSelection ? "checkmark.circle.fill" : "sparkles"
+                )
+            }
+
+            if !store.availableChatModelIDs.isEmpty {
+                Divider()
+            }
+            ForEach(store.availableChatModelIDs, id: \.self) { modelID in
+                Button {
+                    store.selectChatModel(modelID)
+                } label: {
+                    Label(
+                        modelID,
+                        systemImage: store.chatSelectedModelID == modelID
+                            ? "checkmark.circle.fill"
+                            : "cube"
+                    )
+                }
+            }
+        } label: {
+            HStack(spacing: 7) {
+                Image(systemName: store.isAutoChatSelection ? "sparkles" : "cube")
+                    .foregroundStyle(store.isAutoChatSelection ? theme.accent : theme.secondaryText)
+                Text(selectionTitle)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(theme.tertiaryText)
+            }
+            .font(.tokenityText(11, weight: .medium))
+            .foregroundStyle(theme.text)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .frame(minWidth: 94, maxWidth: 176, alignment: .leading)
+            .background(theme.group, in: Capsule())
+            .overlay(Capsule().stroke(theme.border.opacity(0.65), lineWidth: 0.5))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize(horizontal: true, vertical: false)
+        .disabled(store.isChatRunning)
+        .help("Choose automatic routing or a specific resident model")
+        .accessibilityLabel("Model selection: \(selectionTitle)")
+    }
+
+    private var selectionTitle: String {
+        store.isAutoChatSelection ? "Auto" : store.chatSelectedModelID
+    }
+}
+
+private struct ChatRoutePolicySlider: View {
+    @EnvironmentObject private var store: TokenityStore
+    @Environment(\.tokenityTheme) private var theme
+
+    var body: some View {
+        VStack(spacing: 2) {
+            HStack(spacing: 4) {
+                Text("Faster")
+                Spacer(minLength: 4)
+                Text(store.chatRoutePolicy.title)
+                    .foregroundStyle(theme.accent)
+                Spacer(minLength: 4)
+                Text("Smarter")
+            }
+            .font(.tokenityText(9, weight: .medium))
+            .foregroundStyle(theme.tertiaryText)
+
+            Slider(value: policyValue, in: 0...2, step: 1)
+                .controlSize(.mini)
+                .tint(theme.accent)
+                .accessibilityLabel("Routing policy")
+                .accessibilityValue(store.chatRoutePolicy.title)
+        }
+        .frame(width: 188)
+        .disabled(store.isChatRunning)
+        .help("Move toward Faster for latency or Smarter for model quality")
+    }
+
+    private var policyValue: Binding<Double> {
+        Binding(
+            get: {
+                switch store.chatRoutePolicy {
+                case .fast: return 0
+                case .balanced: return 1
+                case .quality: return 2
+                }
+            },
+            set: { value in
+                let policy: ChatRoutePolicy
+                switch Int(value.rounded()) {
+                case 0: policy = .fast
+                case 2: policy = .quality
+                default: policy = .balanced
+                }
+                store.setChatRoutePolicy(policy)
+            }
+        )
+    }
+}
+
+private struct ChatModelLockButton: View {
+    @EnvironmentObject private var store: TokenityStore
+    @Environment(\.tokenityTheme) private var theme
+
+    var body: some View {
+        Toggle(isOn: lockBinding) {
+            Image(systemName: store.locksChatModel ? "lock.fill" : "lock.open")
+                .frame(width: 28, height: 28)
+        }
+        .toggleStyle(.button)
+        .buttonStyle(.plain)
+        .foregroundStyle(store.locksChatModel ? theme.accent : theme.secondaryText)
+        .background(
+            store.locksChatModel ? theme.accent.opacity(0.13) : theme.group,
+            in: Circle()
+        )
+        .overlay(Circle().stroke(theme.border.opacity(0.6), lineWidth: 0.5))
+        .disabled(store.isChatRunning)
+        .help("Keep this conversation on the same routed model")
+        .accessibilityLabel("Lock routed model for this conversation")
+    }
+
+    private var lockBinding: Binding<Bool> {
+        Binding(
+            get: { store.locksChatModel },
+            set: { store.setChatModelLocked($0) }
+        )
     }
 }
 

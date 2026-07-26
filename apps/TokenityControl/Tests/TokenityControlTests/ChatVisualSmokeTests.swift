@@ -38,7 +38,15 @@ final class ChatVisualSmokeTests: XCTestCase {
                     metrics: ChatMetrics(firstTokenSeconds: 0.42, totalSeconds: 2.8, outputTokensPerSecond: 31.5),
                     reasoningDurationSeconds: 1.1,
                     reasoningTokenCount: 18,
-                    modelName: "Preview Model"
+                    modelName: "Preview Model",
+                    routedModelID: "Qwen3.5-122B-A10B-4bit",
+                    modelRevision: "visual-rev",
+                    instanceID: "visual-instance",
+                    routeReason: "Balanced policy matched this general coding request.",
+                    routeConfidence: 0.91,
+                    routingLatencyMilliseconds: 3.4,
+                    queueWaitMilliseconds: 0.8,
+                    requestID: "visual-request"
                 )
             ]
 
@@ -56,6 +64,84 @@ final class ChatVisualSmokeTests: XCTestCase {
             let name = scheme == .light ? "light" : "dark"
             try data.write(to: URL(fileURLWithPath: "/tmp/tokenity-chat-\(name).png"))
             XCTAssertGreaterThan(data.count, 10_000)
+        }
+    }
+
+    func testResidentModelPoolRendersInLightAndDarkAppearances() async throws {
+        let store = TokenityStore(
+            dataTransport: { request in
+                let path = request.url?.path ?? ""
+                let payload: String
+                if path == "/v1/node/info" {
+                    payload = Self.residentNodeInfoPayload(for: request)
+                } else if path == "/v1/gateway/routes" {
+                    payload = """
+                    {"data":[{"model":"Qwen3.5-122B-A10B-4bit","instance_id":"visual-instance","model_revision":"visual-rev","execution_mode":"single","state":"busy","active_request_count":1,"queue_depth":2,"api_base_url":"http://127.0.0.1:18000/v1","capabilities":{"tools":true,"json":true,"thinking":true,"modalities":["text"],"task_tags":["general","code"]},"warm_ttft_p50_ms":180.0,"warm_ttft_p95_ms":420.0}]}
+                    """
+                } else if path.hasSuffix("/quorum") {
+                    payload = #"{"instance_id":"visual-instance","ready":true,"issues":[],"rank_quorum":"1/1","ranks":[]}"#
+                } else {
+                    payload = #"{}"#
+                }
+                let response = HTTPURLResponse(
+                    url: request.url ?? URL(string: "http://127.0.0.1")!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!
+                return (Data(payload.utf8), response)
+            },
+            userDefaults: UserDefaults(suiteName: "ChatVisualSmokeTests.pool.\(UUID().uuidString)")!
+        )
+        store.connectionMode = .ring
+        await store.refreshSelectedNodeStatus()
+        XCTAssertEqual(store.residentModelInstances.count, 1)
+        let instance = try XCTUnwrap(store.residentModelInstances.first)
+        XCTAssertEqual(instance.modelRevision, "visual-rev")
+        XCTAssertEqual(
+            Set(instance.capabilities),
+            Set(["JSON", "Task: code", "Task: general", "Text", "Thinking", "Tools"])
+        )
+        XCTAssertEqual(instance.warmTTFTP50Milliseconds, 180)
+        XCTAssertEqual(instance.warmTTFTP95Milliseconds, 420)
+
+        for scheme in [ColorScheme.light, .dark] {
+            let root = ModelsPage()
+                .environmentObject(store)
+                .tokenityThemed()
+                .environment(\.colorScheme, scheme)
+            let hostingView = NSHostingView(rootView: root)
+            hostingView.frame = NSRect(x: 0, y: 0, width: 1_200, height: 800)
+            hostingView.layoutSubtreeIfNeeded()
+            let representation = try XCTUnwrap(hostingView.bitmapImageRepForCachingDisplay(in: hostingView.bounds))
+            hostingView.cacheDisplay(in: hostingView.bounds, to: representation)
+            let data = try XCTUnwrap(representation.representation(using: .png, properties: [:]))
+            let name = scheme == .light ? "light" : "dark"
+            try data.write(to: URL(fileURLWithPath: "/tmp/tokenity-resident-pool-\(name).png"))
+            XCTAssertGreaterThan(data.count, 10_000)
+        }
+    }
+
+    func testMenuBarBrandMarkRendersInLightAndDarkAppearances() throws {
+        for scheme in [ColorScheme.light, .dark] {
+            let root = TokenityMenuBarMark(level: .warning)
+                .padding(8)
+                .background(scheme == .light ? Color.white : Color.black)
+                .environment(\.colorScheme, scheme)
+            let hostingView = NSHostingView(rootView: root)
+            hostingView.frame = NSRect(x: 0, y: 0, width: 40, height: 40)
+            hostingView.layoutSubtreeIfNeeded()
+
+            let representation = try XCTUnwrap(
+                hostingView.bitmapImageRepForCachingDisplay(in: hostingView.bounds)
+            )
+            hostingView.cacheDisplay(in: hostingView.bounds, to: representation)
+            let data = try XCTUnwrap(
+                representation.representation(using: .png, properties: [:])
+            )
+            let name = scheme == .light ? "light" : "dark"
+            try data.write(to: URL(fileURLWithPath: "/tmp/tokenity-menubar-logo-\(name).png"))
+            XCTAssertGreaterThan(data.count, 500)
         }
     }
 
@@ -134,5 +220,14 @@ final class ChatVisualSmokeTests: XCTestCase {
             headerFields: nil
         )!
         return (Data(payload.utf8), response)
+    }
+
+    private static func residentNodeInfoPayload(for request: URLRequest) -> String {
+        let base = TokenityTestFixtures.basicNodeInfoPayload(for: request)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return String(base.dropLast()) + """
+        ,"agent_contract":{"version":1,"capabilities":["managed_instances","instance_runtimes","instance_quorum","cluster_runtime"]}
+        ,"instances":[{"instance_id":"visual-instance","operation_id":"visual-operation","requested_model_id":"Qwen3.5-122B-A10B-4bit","resolved_path":"/Users/Shared/TokenityModels/Qwen3.5-122B-A10B-4bit","model_revision":"visual-rev","execution_mode":"single","selected_nodes":["mac-a"],"world_size":1,"connection_mode":"ring","coordinator":"mac-a","http_port":18000,"memory_reservation_bytes":17179869184,"actual_memory_bytes":15032385536,"state":"busy","active_request_count":1,"queued_request_count":2,"health_ready":true,"health_issues":[]}]}
+        """
     }
 }

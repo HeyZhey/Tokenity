@@ -4,15 +4,19 @@ import argparse
 import asyncio
 import ctypes
 import gc
+import hashlib
+import inspect
 import json
 import logging
 import os
+import pickle
 import queue
 import signal
 import subprocess
 import sys
 import threading
 import time
+import textwrap
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import nullcontext
@@ -223,6 +227,7 @@ class _MLXServerSymbols:
         if native_mtp is not None:
             attach_controller(server, native_mtp)
         _install_chunked_sharded_load(server)
+        _install_jaccl_server_control_collectives(server)
         from mlx_lm.server import (  # type: ignore
             CompletionRequest,
             GenerationArguments,
@@ -244,6 +249,91 @@ class _MLXServerSymbols:
             ResponseGenerator=ResponseGenerator,
             SamplingArguments=SamplingArguments,
         )
+
+
+def _install_jaccl_server_control_collectives(server: Any) -> None:
+    """Avoid mlx-lm's one-element JACCL control messages.
+
+    mlx-lm's distributed request loop broadcasts an idle/request-size scalar
+    every 100 ms.  A one-element JACCL collective can leave receive work
+    requests outstanding; after enough idle polls the next model collective
+    fails with ``ibv_post_recv(...)=ENOMEM``.  Use the same ten-element CPU
+    collective required by MLX's JACCL initialization guidance for the
+    control frame while leaving model collectives untouched.
+    """
+
+    if os.environ.get("TOKENITY_CONNECTION_MODE", "").lower() not in {"jaccl", "jaccl-ring"}:
+        return
+    if getattr(server, "_tokenity_jaccl_server_control_collectives", False):
+        return
+
+    import mlx.core as mx  # type: ignore
+
+    response_generator = server.ResponseGenerator
+    original_generate = response_generator._generate
+    generate_source = textwrap.dedent(inspect.getsource(original_generate))
+    seed_material = os.environ.get("TOKENITY_INSTANCE_ID", "tokenity").encode("utf-8")
+    synchronized_seed = int.from_bytes(hashlib.sha256(seed_material).digest()[:4], "little")
+    patched_namespace: dict[str, Any] = {}
+    exec(
+        compile(
+            _replace_jaccl_seed_collective(generate_source, synchronized_seed),
+            inspect.getsourcefile(original_generate) or "<mlx_lm.server>",
+            "exec",
+        ),
+        original_generate.__globals__,
+        patched_namespace,
+    )
+    response_generator._generate = patched_namespace["_generate"]
+
+    def tokenity_share_object(self: Any, obj: Any) -> Any:
+        if not self._is_distributed:
+            return obj
+
+        if self._rank == 0:
+            if obj is None:
+                control = mx.zeros((10,), dtype=mx.uint32)
+                mx.eval(mx.distributed.all_sum(control, stream=mx.cpu))
+                return None
+            data = mx.array(pickle.dumps(obj))
+            control = mx.full((10,), int(data.size), dtype=mx.uint32)
+            mx.eval(mx.distributed.all_sum(control, stream=mx.cpu))
+            mx.eval(mx.distributed.all_sum(data, stream=mx.cpu))
+            return obj
+
+        control = mx.zeros((10,), dtype=mx.uint32)
+        control = mx.distributed.all_sum(control, stream=mx.cpu)
+        size = int(control[0].item())
+        if size == 0:
+            return None
+        data = mx.zeros((size,), dtype=mx.uint8)
+        data = mx.distributed.all_sum(data, stream=mx.cpu)
+        return pickle.loads(bytes(data.tolist()))
+
+    response_generator._share_object = tokenity_share_object
+    server._tokenity_jaccl_server_control_collectives = True
+    logging.warning(
+        "Tokenity installed a deterministic per-instance JACCL seed and multi-element "
+        "CPU control collectives for the mlx-lm request loop."
+    )
+
+
+def _replace_jaccl_seed_collective(source: str, synchronized_seed: int) -> str:
+    needle = """\
+    if self._is_distributed:
+        seed = mx.distributed.all_sum(mx.random.state[0]).view(mx.uint64).item()
+        mx.random.seed(seed)
+"""
+    replacement = f"""\
+    if self._is_distributed:
+        mx.random.seed({synchronized_seed})
+"""
+    if source.count(needle) != 1:
+        raise RuntimeError(
+            "The installed mlx-lm ResponseGenerator seed synchronization does not "
+            "match Tokenity's pinned JACCL compatibility contract."
+        )
+    return source.replace(needle, replacement)
 
 
 def _install_chunked_sharded_load(server: Any) -> None:
@@ -333,10 +423,30 @@ def _install_chunked_sharded_load(server: Any) -> None:
         _eval_parameters_in_chunks(mx, tree_flatten(model.parameters()))
         if controller is not None:
             controller.validate_loaded_model(model)
-        if _bool_env("TOKENITY_MLX_LOAD_POST_BARRIER", False):
+        if _should_run_post_load_barrier(repo):
             logging.warning("Tokenity chunked sharded_load running post-load distributed all_sum barrier.")
-            mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
+            barrier_group = tensor_group if tensor_group is not None else pipeline_group
+            mx.eval(
+                mx.distributed.all_sum(
+                    mx.ones(10),
+                    group=barrier_group,
+                    stream=mx.cpu,
+                )
+            )
             logging.warning("Tokenity chunked sharded_load finished post-load distributed all_sum barrier.")
+        elif (
+            _bool_env("TOKENITY_MLX_LOAD_POST_BARRIER", False)
+            and _requires_process_isolated_shutdown(repo)
+        ):
+            # GLM-5.2 has already evaluated every local shard above. An
+            # additional standalone JACCL all_sum can remain pending even
+            # after both ranks reach it; the immediately following one-token
+            # readiness warmup is itself a bounded cross-rank synchronization
+            # point and safely waits for every generation loop to be ready.
+            logging.warning(
+                "Tokenity skipped the redundant GLM-5.2 post-load JACCL barrier; "
+                "the readiness warmup will synchronize all ranks."
+            )
         else:
             logging.warning("Tokenity chunked sharded_load skipped post-load distributed all_sum barrier.")
         if return_config:
@@ -503,6 +613,12 @@ def _requires_process_isolated_shutdown(model: str) -> bool:
     return "glm" in identity and ("moe" in identity or "5.2" in identity)
 
 
+def _should_run_post_load_barrier(model: str) -> bool:
+    return _bool_env("TOKENITY_MLX_LOAD_POST_BARRIER", False) and not (
+        _requires_process_isolated_shutdown(model)
+    )
+
+
 def _describe_eval_chunk(chunk: list[tuple[str, Any]]) -> str:
     descriptions = []
     for name, value in chunk:
@@ -575,6 +691,7 @@ class TokenityDistributedRuntime:
         self._provider: Any = None
         self._generator: Any = None
         self._group: Any = None
+        self._distributed_prompt_cache_size = prompt_cache_size
         self._load_monitor: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._single_model: Any = None
@@ -676,7 +793,10 @@ class TokenityDistributedRuntime:
                 message="Compiling and running an isolated one-token readiness warmup.",
             )
             self.state.progress = 0.96
-            self._run_warmup_with_timeout(self._warmup_single)
+            # The first MLX eval must remain on the thread that loaded and
+            # materialized the model. Moving it into the timeout worker can
+            # leave MLX's stream scheduler waiting on a different thread.
+            self._warmup_single()
             evidence = {
                 "all_ranks_healthy": True,
                 "rank_quorum": "1/1",
@@ -1211,6 +1331,38 @@ class TokenityDistributedRuntime:
             ReadinessPhase.GENERATING,
         }
 
+    def _configure_distributed_generation_mode(self) -> None:
+        if (
+            self._provider is not None
+            and self.process_isolated_shutdown
+            and (self.state.connection_mode or "").lower() in {"jaccl", "jaccl-ring"}
+        ):
+            # MLX-LM 0.31.x keeps BatchGenerator collectives alive between
+            # requests. GLM-5.2's distributed MoE/DSA graph leaves JACCL
+            # receive work requests attached to that persistent batch and the
+            # following prefill can fail with ibv_post_recv(ENOMEM). The
+            # configured concurrency for this compatibility path is one, so
+            # the sequential engine preserves throughput semantics without
+            # carrying cross-request collective state.
+            if getattr(self._provider, "is_batchable", False):
+                self._provider.is_batchable = False
+
+            # ResponseGenerator also keeps an LRU prompt/KV cache on each
+            # process. Only rank 0 owns the HTTP readiness warmup, so workers
+            # can otherwise retain that warmup entry while rank 0 replaces
+            # its cache. Reusing the same prompt on the next request then
+            # gives the ranks different sequence lengths and mismatched JACCL
+            # collectives. A zero-sized LRU immediately evicts every entry and
+            # keeps all ranks on identical request-local state.
+            self._distributed_prompt_cache_size = 0
+            if self._generator is not None and self._symbols is not None:
+                self._generator.prompt_cache = self._symbols.LRUPromptCache(0)
+            logging.warning(
+                "Tokenity selected sequential generation for GLM-5.2 over JACCL "
+                "and disabled distributed prompt caching to isolate collective "
+                "state between requests."
+            )
+
     def _monitor_model_load(self) -> None:
         assert self._generator is not None
         assert self._provider is not None
@@ -1219,6 +1371,7 @@ class TokenityDistributedRuntime:
             if getattr(self._provider, "model", None) is not None:
                 if self.state.phase == ReadinessPhase.LOADING_MODEL:
                     try:
+                        self._configure_distributed_generation_mode()
                         tokenizer = getattr(self._provider, "tokenizer", None)
                         self.state.tokenizer_identity = (
                             type(tokenizer).__name__ if tokenizer is not None else None
@@ -1276,13 +1429,19 @@ class TokenityDistributedRuntime:
         )
         ctx, responses = self._begin_distributed_generation(request)
         try:
-            next(responses, None)
+            # max_tokens=1 keeps this bounded. Drain the iterator so the
+            # distributed engine observes the terminal response and retires
+            # every JACCL work request before READY is published.
+            for _ in responses:
+                pass
         finally:
             ctx.stop()
             if self._generator is not None and self._symbols is not None:
                 # The warmup uses the production engine but replaces its cache
                 # before READY so no warmup KV/prompt entry is user-visible.
-                self._generator.prompt_cache = self._symbols.LRUPromptCache(self.prompt_cache_size)
+                self._generator.prompt_cache = self._symbols.LRUPromptCache(
+                    self._distributed_prompt_cache_size
+                )
 
     def memory_metrics(self) -> dict[str, object]:
         sampled_at = time.time()

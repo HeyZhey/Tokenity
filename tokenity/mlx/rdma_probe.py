@@ -50,10 +50,25 @@ class RDMAProbeResult:
 
 def probe_rdma(runner: CommandRunner | None = None) -> RDMAProbeResult:
     run = runner or default_runner
+    rdma_ctl = run(("rdma_ctl", "status"))
+    ibv_devices = run(("ibv_devices",))
+    rdma_ctl_devices, rdma_ctl_states = parse_rdma_ctl_status(rdma_ctl.stdout)
+    # Apple's ibv_devinfo can remain in an uninterruptible kernel wait after a
+    # JACCL runtime exits. rdma_ctl is authoritative when it already reports
+    # port state, so avoid the redundant probe in the normal macOS path.
+    has_authoritative_port_state = bool(rdma_ctl_devices) and all(
+        rdma_ctl_states.get(device) in {"active", "down"}
+        for device in rdma_ctl_devices
+    )
+    ibv_devinfo = (
+        CommandResult(("ibv_devinfo",), 0)
+        if has_authoritative_port_state
+        else run(("ibv_devinfo",))
+    )
     results = {
-        "rdma_ctl": run(("rdma_ctl", "status")),
-        "ibv_devices": run(("ibv_devices",)),
-        "ibv_devinfo": run(("ibv_devinfo",)),
+        "rdma_ctl": rdma_ctl,
+        "ibv_devices": ibv_devices,
+        "ibv_devinfo": ibv_devinfo,
         "ifconfig": run(("ifconfig",)),
     }
 
@@ -68,7 +83,6 @@ def probe_rdma(runner: CommandRunner | None = None) -> RDMAProbeResult:
     devices: set[str] = set()
     states: dict[str, str] = {}
 
-    rdma_ctl_devices, rdma_ctl_states = parse_rdma_ctl_status(results["rdma_ctl"].stdout)
     devices.update(rdma_ctl_devices)
     states.update(rdma_ctl_states)
 

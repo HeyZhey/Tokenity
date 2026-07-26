@@ -594,6 +594,35 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertEqual(store.modelLoadProgress, 1)
     }
 
+    func testModelProbeAcceptsCompletionUsageWithoutVisibleText() async throws {
+        let store = TokenityStore(dataTransport: { request in
+            if request.url?.path == "/v1/chat/completions" {
+                let payload = """
+                data: {"choices":[{"delta":{},"finish_reason":"length"}],"usage":{"prompt_tokens":8,"completion_tokens":16,"total_tokens":24}}
+
+                data: [DONE]
+
+                """
+                let response = HTTPURLResponse(
+                    url: request.url ?? URL(string: "http://127.0.0.1")!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!
+                return (Data(payload.utf8), response)
+            }
+            return try await Self.successfulModelTransport(request)
+        })
+        store.connectionMode = .ring
+        store.createCluster()
+        let model = try XCTUnwrap(store.modelLibraryRows.first)
+
+        await store.loadModel(model)
+
+        XCTAssertEqual(store.modelLoadStates[model.id], .loaded)
+        XCTAssertEqual(store.loadedModelName, model.id)
+    }
+
     func testModelLoadStopsWhenBackendExits() async {
         let store = TokenityStore(dataTransport: { request in
             let path = request.url?.path ?? ""
@@ -955,7 +984,7 @@ final class TokenityStoreTests: XCTestCase {
     func testFirstChatRetriesStreamingBeforeUsingNonStreamingFallback() async throws {
         var streamingAttempts = 0
         var nonStreamingRequests = 0
-        var retryContinuation: AsyncThrowingStream<String, Error>.Continuation?
+        var retryContinuation: AsyncThrowingStream<ChatStreamEvent, Error>.Continuation?
         let suiteName = "TokenityStoreTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -1054,6 +1083,13 @@ final class TokenityStoreTests: XCTestCase {
         let store = TokenityStore(
             dataTransport: { request in
                 let path = request.url?.path ?? ""
+                if path == "/v1/node/info" {
+                    let base = TokenityTestFixtures.basicNodeInfoPayload(for: request)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    let payload = String(base.dropLast())
+                        + #","agent_contract":{"version":1,"capabilities":["cluster_runtime","instance_quorum","instance_runtimes","managed_instances"]},"instances":[]}"#
+                    return Self.response(for: request, payload: payload)
+                }
                 if path == "/v1/node/start-distributed-openai" {
                     let body = try XCTUnwrap(request.httpBody)
                     let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
@@ -1254,7 +1290,7 @@ final class TokenityStoreTests: XCTestCase {
     }
 
     func testModelUnloadCancelsActiveChatAndIgnoresLateStreamChunks() async {
-        var streamContinuation: AsyncThrowingStream<String, Error>.Continuation?
+        var streamContinuation: AsyncThrowingStream<ChatStreamEvent, Error>.Continuation?
         var fallbackChatRequests = 0
         let suiteName = "TokenityStoreTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -1528,6 +1564,7 @@ final class TokenityStoreTests: XCTestCase {
         store.connectionMode = .ring
         store.createCluster()
         await store.loadModel(model)
+        store.selectChatModel(model.id)
         store.chatInput = "Answer directly."
 
         await store.sendChatMessage()
@@ -1585,7 +1622,7 @@ final class TokenityStoreTests: XCTestCase {
                 AsyncThrowingStream { continuation in
                     for _ in 0..<3 {
                         let escaped = phrase.replacingOccurrences(of: "\"", with: "\\\"")
-                        continuation.yield("data: {\"choices\":[{\"delta\":{\"content\":\"\(escaped)\"},\"finish_reason\":null}]}")
+                        continuation.yield(.line("data: {\"choices\":[{\"delta\":{\"content\":\"\(escaped)\"},\"finish_reason\":null}]}"))
                     }
                     continuation.finish()
                 }
@@ -1612,7 +1649,7 @@ final class TokenityStoreTests: XCTestCase {
             lineStreamTransport: { _ in
                 AsyncThrowingStream { continuation in
                     for index in 0..<100 {
-                        continuation.yield("data: {\"choices\":[{\"delta\":{\"content\":\"token\(index) \"},\"finish_reason\":null}]}")
+                        continuation.yield(.line("data: {\"choices\":[{\"delta\":{\"content\":\"token\(index) \"},\"finish_reason\":null}]}"))
                     }
                     continuation.yield("data: [DONE]")
                     continuation.finish()

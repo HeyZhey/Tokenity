@@ -15,6 +15,7 @@ enum TokenityTransportError: LocalizedError {
     case noChatContent
     case rdmaNotReady(String)
     case nativeMTPAgentUpgradeRequired
+    case multiInstanceAgentUpgradeRequired
     case repetitiveOutput
 
     var errorDescription: String? {
@@ -45,6 +46,8 @@ enum TokenityTransportError: LocalizedError {
             return message
         case .nativeMTPAgentUpgradeRequired:
             return "Native MTP Required needs the current Node Agent. Restart the installed Tokenity Node Agent on every selected Mac, then try again."
+        case .multiInstanceAgentUpgradeRequired:
+            return "Loading an additional resident model requires current Node Agents on every selected Mac. Upgrade or restart all selected Node Agents, then try again."
         case .repetitiveOutput:
             return "Generation stopped because repeated output was detected."
         }
@@ -177,12 +180,33 @@ private struct ManagedModelInstance {
     var instanceID: String
     var apiBaseURL: String?
     var backendRole: String
+    var lifecycleState: String = "ready"
+    var quorumReady: Bool = true
+    var routeAvailable: Bool = true
+    var healthIssue: String? = nil
+    var modelRevision: String? = nil
+    var selectedNodes: [String] = []
+    var executionMode: String? = nil
+    var connectionMode: String? = nil
+    var reservedMemoryBytes: Int64? = nil
+    var actualMemoryBytes: Int64? = nil
+    var activeRequestCount: Int = 0
+    var queueDepth: Int = 0
+    var routeCapabilities: GatewayRouteCapabilities? = nil
+    var warmTTFTP50Milliseconds: Double? = nil
+    var warmTTFTP95Milliseconds: Double? = nil
+
+    var isRoutable: Bool {
+        routeAvailable
+            && quorumReady
+            && ["ready", "busy"].contains(lifecycleState.lowercased())
+    }
 }
 
 @MainActor
 final class TokenityStore: ObservableObject {
     typealias DataTransport = (URLRequest) async throws -> (Data, HTTPURLResponse)
-    typealias LineStreamTransport = (URLRequest) -> AsyncThrowingStream<String, Error>
+    typealias LineStreamTransport = (URLRequest) -> AsyncThrowingStream<ChatStreamEvent, Error>
 
     @Published var selectedSection: AppSection? = .overview
     @Published var nodes: [TokenityNode] = TokenityNode.samples
@@ -224,6 +248,10 @@ final class TokenityStore: ObservableObject {
     @Published var chatMessages: [ChatMessage] = TokenityStore.initialChatSession.messages
     @Published var chatMetrics = TokenityStore.initialChatSession.metrics
     @Published var isChatRunning = false
+    @Published private(set) var chatRoutingState: ChatRoutingState = .idle
+    @Published private(set) var chatSelectedModelID = "tokenity-auto"
+    @Published private(set) var chatRoutePolicy: ChatRoutePolicy = .balanced
+    @Published private(set) var locksChatModel = false
     @Published private(set) var chatSessions: [ChatSession] = [TokenityStore.initialChatSession]
     @Published private(set) var activeChatSessionID: UUID = TokenityStore.initialChatSession.id
     @Published private(set) var chatScrollRevision = 0
@@ -240,6 +268,7 @@ final class TokenityStore: ObservableObject {
     private let lineStreamTransport: LineStreamTransport
     private let userDefaults: UserDefaults
     private let modelConfigurationsKey = "TokenityModelRuntimeConfigurations.v1"
+    private let residentAutoPreferencesKey = "TokenityResidentAutoPreferences.v1"
     private let chatSessionsKey = "TokenityChatSessions.v1"
     private let chatHistoryQueue = DispatchQueue(label: "ai.tokenity.chat-history", qos: .utility)
     private let writesChatHistorySynchronously: Bool
@@ -249,6 +278,8 @@ final class TokenityStore: ObservableObject {
     private var loadedBackendRole: String?
     private var loadedServiceModelName: String?
     private var activeLoadedModelID: String?
+    // Managed instances are keyed by their stable instance identity. A model ID
+    // is only a routing alias and may legitimately have multiple ready replicas.
     private var managedModelInstances: [String: ManagedModelInstance] = [:]
     private(set) var activeModelInstanceID: String?
     private var activeModelServiceBaseURL: String?
@@ -260,6 +291,10 @@ final class TokenityStore: ObservableObject {
     private var activeChatAssistantIndex: Int?
     private var chatTask: Task<Void, Never>?
     private var chatTaskID: UUID?
+    private var activeChatRoutedInstanceID: String?
+    private var nextChatRouteConstraints: [String: JSONValue]?
+    private var residentAutoPreferences: [String: Bool] = [:]
+    private var leaseRenewalFailureKeys: Set<String> = []
     private var statusMonitoringTask: Task<Void, Never>?
     private var statusRefreshInFlight = false
     private(set) var statusMonitoringStartCount = 0
@@ -278,6 +313,10 @@ final class TokenityStore: ObservableObject {
            let decoded = try? JSONDecoder().decode([String: ModelRuntimeConfiguration].self, from: data) {
             modelConfigurations = decoded
         }
+        if let data = userDefaults.data(forKey: residentAutoPreferencesKey),
+           let decoded = try? JSONDecoder().decode([String: Bool].self, from: data) {
+            residentAutoPreferences = decoded
+        }
         if loadsChatHistorySynchronously {
             if let sessions = Self.loadChatSessions(from: userDefaults, key: chatSessionsKey),
                let latest = sessions.first {
@@ -285,6 +324,9 @@ final class TokenityStore: ObservableObject {
                 activeChatSessionID = latest.id
                 chatMessages = latest.messages
                 chatMetrics = latest.metrics
+                chatSelectedModelID = latest.selectedModelID ?? "tokenity-auto"
+                chatRoutePolicy = latest.routePolicy ?? .balanced
+                locksChatModel = latest.locksModel ?? false
             }
         } else {
             isChatHistoryLoading = true
@@ -302,6 +344,9 @@ final class TokenityStore: ObservableObject {
                     self.activeChatSessionID = latest.id
                     self.chatMessages = latest.messages
                     self.chatMetrics = latest.metrics
+                    self.chatSelectedModelID = latest.selectedModelID ?? "tokenity-auto"
+                    self.chatRoutePolicy = latest.routePolicy ?? .balanced
+                    self.locksChatModel = latest.locksModel ?? false
                     self.chatScrollRevision += 1
                 }
                 self.isChatHistoryLoading = false
@@ -365,7 +410,92 @@ final class TokenityStore: ObservableObject {
     }
 
     var isChatReady: Bool {
-        phase == .running && loadedModelName != nil
+        phase == .running && (
+            residentModelInstances.contains { $0.allowsAuto && ($0.isReady || $0.isBusy) }
+                || loadedModelName != nil
+        )
+    }
+
+    func managedModelInstanceIDs(for modelID: String) -> Set<String> {
+        Set(
+            managedModelInstances.values
+                .filter { $0.modelID == modelID && $0.isRoutable }
+                .map(\.instanceID)
+        )
+    }
+
+    var residentModelInstances: [ResidentModelInstanceSummary] {
+        managedModelInstances.values
+            .map { managed in
+                return ResidentModelInstanceSummary(
+                    id: managed.instanceID,
+                    modelID: managed.modelID,
+                    modelRevision: managed.modelRevision,
+                    state: managed.lifecycleState,
+                    activeRequestCount: managed.activeRequestCount,
+                    queueDepth: managed.queueDepth,
+                    selectedNodes: managed.selectedNodes,
+                    executionMode: managed.executionMode,
+                    connectionMode: managed.connectionMode,
+                    reservedMemoryBytes: managed.reservedMemoryBytes,
+                    actualMemoryBytes: managed.actualMemoryBytes,
+                    capabilities: managed.routeCapabilities?.displayLabels ?? [],
+                    warmTTFTP50Milliseconds: managed.warmTTFTP50Milliseconds,
+                    warmTTFTP95Milliseconds: managed.warmTTFTP95Milliseconds,
+                    allowsAuto: residentAutoPreferences[managed.instanceID] ?? true,
+                    keepsResident: true,
+                    healthIssue: managed.healthIssue,
+                    isRoutable: managed.isRoutable
+                )
+            }
+            .sorted {
+                if $0.modelID != $1.modelID {
+                    return $0.modelID.localizedCaseInsensitiveCompare($1.modelID) == .orderedAscending
+                }
+                return $0.id.localizedCaseInsensitiveCompare($1.id) == .orderedAscending
+            }
+    }
+
+    var residentReadyModelCount: Int {
+        Set(residentModelInstances.filter(\.isReady).map(\.modelID)).count
+    }
+
+    var residentBusyModelCount: Int {
+        residentModelInstances.filter(\.isBusy).count
+    }
+
+    var residentPoolSummary: String {
+        "\(residentReadyModelCount) models ready · \(residentBusyModelCount) busy"
+    }
+
+    var autoRouterHealthText: String {
+        guard selectedAgentsSupportResidentModels else {
+            return "Auto routing unavailable · update legacy Node Agent"
+        }
+        let allowed = residentModelInstances.filter { $0.allowsAuto && ($0.isReady || $0.isBusy) }
+        guard !allowed.isEmpty else {
+            return residentModelInstances.isEmpty
+                ? "Auto routing waiting for resident models"
+                : "Auto routing disabled for all resident models"
+        }
+        return "Auto routing healthy"
+    }
+
+    var residentRoutingSummary: String {
+        "\(residentPoolSummary) · \(autoRouterHealthText)"
+    }
+
+    var availableChatModelIDs: [String] {
+        var modelIDs = Set(residentModelInstances.filter { $0.isReady || $0.isBusy }.map(\.modelID))
+        if let loadedModelName {
+            modelIDs.insert(loadedModelName)
+        }
+        return Array(modelIDs)
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    var isAutoChatSelection: Bool {
+        chatSelectedModelID == "tokenity-auto"
     }
 
     var isModelLoading: Bool {
@@ -416,6 +546,81 @@ final class TokenityStore: ObservableObject {
         appendLog("Updated runtime configuration for \(modelID).")
     }
 
+    func selectChatModel(_ modelID: String) {
+        guard !isChatRunning else { return }
+        let normalized = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalized == "tokenity-auto" || availableChatModelIDs.contains(normalized) else { return }
+        chatSelectedModelID = normalized
+        syncActiveChatSession()
+    }
+
+    func setChatRoutePolicy(_ policy: ChatRoutePolicy) {
+        guard !isChatRunning else { return }
+        chatRoutePolicy = policy
+        syncActiveChatSession()
+    }
+
+    func setChatModelLocked(_ locked: Bool) {
+        guard !isChatRunning else { return }
+        locksChatModel = locked
+        syncActiveChatSession()
+    }
+
+    func setResidentInstanceAllowsAuto(_ instanceID: String, allowed: Bool) {
+        guard let managed = managedModelInstances[instanceID] else { return }
+        // Preferences used to be keyed by model ID, which coupled every
+        // replica's switch. Seed each sibling from that legacy value once,
+        // then keep all subsequent choices instance-local.
+        if let legacyPreference = residentAutoPreferences.removeValue(forKey: managed.modelID) {
+            for sibling in managedModelInstances.values where sibling.modelID == managed.modelID {
+                if residentAutoPreferences[sibling.instanceID] == nil {
+                    residentAutoPreferences[sibling.instanceID] = legacyPreference
+                }
+            }
+        }
+        residentAutoPreferences[instanceID] = allowed
+        persistResidentAutoPreferences()
+        objectWillChange.send()
+    }
+
+    func useResidentModelInChat(_ instanceID: String) {
+        guard let managed = managedModelInstances[instanceID], managed.isRoutable else { return }
+        selectChatModel(managed.modelID)
+        selectedSection = .chat
+    }
+
+    func stopResidentModelInstance(_ instanceID: String) async {
+        guard let managed = managedModelInstances[instanceID] else { return }
+        if activeChatRoutedInstanceID == instanceID {
+            let cancelled = cancelActiveChat(
+                message: "Generation stopped because its model instance was stopped.",
+                logReason: "resident instance stop"
+            )
+            if let cancelled { await cancelled.value }
+        }
+        do {
+            try await cleanupInstanceOrLegacy(instanceID: instanceID, allowsGlobalFallback: false)
+            managedModelInstances.removeValue(forKey: instanceID)
+            residentAutoPreferences.removeValue(forKey: instanceID)
+            persistResidentAutoPreferences()
+            if !managedModelInstances.values.contains(where: { $0.modelID == managed.modelID }) {
+                modelLoadStates[managed.modelID] = .notLoaded
+            }
+            recomputeManagedModelLoadStates()
+            if activeModelInstanceID == instanceID {
+                restoreActiveManagedInstance()
+            }
+            appendLog("Stopped resident model instance \(managed.modelID) (\(instanceID)).")
+        } catch {
+            appendLog("Could not stop resident model instance \(instanceID): \(userFacingMessage(for: error))")
+        }
+    }
+
+    func setResidentInstanceKeepsResident(_ instanceID: String, keepsResident: Bool) {
+        guard !keepsResident else { return }
+        Task { await stopResidentModelInstance(instanceID) }
+    }
+
     func newChatSession() {
         guard !isChatRunning else { return }
         syncActiveChatSession()
@@ -424,6 +629,9 @@ final class TokenityStore: ObservableObject {
         activeChatSessionID = session.id
         chatMessages = session.messages
         chatMetrics = session.metrics
+        chatSelectedModelID = session.selectedModelID ?? "tokenity-auto"
+        chatRoutePolicy = session.routePolicy ?? .balanced
+        locksChatModel = session.locksModel ?? false
         chatInput = ""
         chatScrollRevision += 1
         chatComposerFocusRevision += 1
@@ -437,6 +645,9 @@ final class TokenityStore: ObservableObject {
         activeChatSessionID = session.id
         chatMessages = session.messages
         chatMetrics = session.metrics
+        chatSelectedModelID = session.selectedModelID ?? "tokenity-auto"
+        chatRoutePolicy = session.routePolicy ?? .balanced
+        locksChatModel = session.locksModel ?? false
         chatInput = ""
         chatScrollRevision += 1
         chatComposerFocusRevision += 1
@@ -457,6 +668,9 @@ final class TokenityStore: ObservableObject {
             activeChatSessionID = next.id
             chatMessages = next.messages
             chatMetrics = next.metrics
+            chatSelectedModelID = next.selectedModelID ?? "tokenity-auto"
+            chatRoutePolicy = next.routePolicy ?? .balanced
+            locksChatModel = next.locksModel ?? false
             chatInput = ""
             chatScrollRevision += 1
             chatComposerFocusRevision += 1
@@ -495,6 +709,39 @@ final class TokenityStore: ObservableObject {
               chatMessages[assistantIndex].role == .assistant,
               let userIndex = chatMessages[..<assistantIndex].lastIndex(where: { $0.role == .user })
         else { return }
+        let prompt = chatMessages[userIndex].content
+        chatMessages.removeSubrange(userIndex...)
+        chatInput = prompt
+        syncActiveChatSession()
+        beginSendingChatMessage()
+    }
+
+    func regenerateAssistantMessageWithAnotherModel(_ messageID: UUID) {
+        guard !isChatRunning,
+              let assistantIndex = chatMessages.firstIndex(where: { $0.id == messageID }),
+              chatMessages[assistantIndex].role == .assistant,
+              let userIndex = chatMessages[..<assistantIndex].lastIndex(where: { $0.role == .user })
+        else { return }
+        let currentModelID = chatMessages[assistantIndex].routedModelID
+            ?? chatMessages[assistantIndex].modelName
+        let alternatives = Array(
+            Set(
+                residentModelInstances
+                    .filter { $0.allowsAuto && ($0.isReady || $0.isBusy) }
+                    .map(\.modelID)
+                    .filter { $0 != currentModelID }
+            )
+        ).sorted()
+        guard !alternatives.isEmpty else {
+            appendLog("No alternative resident model is currently available.")
+            return
+        }
+        nextChatRouteConstraints = [
+            "topic_changed": .bool(true),
+            "allowed_model_ids": .strings(alternatives),
+        ]
+        chatSelectedModelID = "tokenity-auto"
+        locksChatModel = false
         let prompt = chatMessages[userIndex].content
         chatMessages.removeSubrange(userIndex...)
         chatInput = prompt
@@ -662,9 +909,12 @@ final class TokenityStore: ObservableObject {
         }
 
         await renewModelLeasesIfNeeded()
-        // Streaming already proves the model service is alive. Continue renewing
-        // its lease, but do not let polling telemetry compete with token updates.
-        if !showsActivity, isChatRunning { return }
+        // A single active stream already proves its only model service is alive.
+        // Once siblings exist, continue polling so a non-active instance cannot
+        // remain falsely loaded while another model is generating.
+        if !showsActivity, isChatRunning, managedModelInstances.count <= 1 {
+            return
+        }
 
         var updatedNodes = nodes
         for node in selectedNodes {
@@ -699,6 +949,7 @@ final class TokenityStore: ObservableObject {
                 updatedNodes[index].rdma = info.rdma
                 updatedNodes[index].clusterRuntime = info.clusterRuntime
                 updatedNodes[index].clusterRuntimes = info.clusterRuntimes ?? []
+                updatedNodes[index].modelInstances = info.instances ?? updatedNodes[index].modelInstances
                 updatedNodes[index].isOnline = true
                 updatedNodes[index].consecutiveAgentFailures = 0
                 if capturesVolatileTelemetry {
@@ -717,6 +968,7 @@ final class TokenityStore: ObservableObject {
                 }
                 updatedNodes[index].clusterRuntime = status.clusterRuntime
                 updatedNodes[index].clusterRuntimes = status.clusterRuntimes ?? []
+                updatedNodes[index].modelInstances = status.instances ?? updatedNodes[index].modelInstances
                 updatedNodes[index].isOnline = true
                 updatedNodes[index].consecutiveAgentFailures = 0
                 if capturesVolatileTelemetry {
@@ -743,8 +995,14 @@ final class TokenityStore: ObservableObject {
         if nodes != updatedNodes {
             nodes = updatedNodes
         }
-        adoptExternallyRunningServiceIfNeeded()
-        if loadedServiceModelName != nil || loadedModelName != nil {
+        await recoverManagedModelInstancesFromAgent()
+        if !managedModelInstances.isEmpty {
+            await refreshManagedModelInstanceHealth()
+        } else {
+            adoptExternallyRunningServiceIfNeeded()
+        }
+        if managedModelInstances.isEmpty,
+           loadedServiceModelName != nil || loadedModelName != nil {
             do {
                 if let readiness = try await fetchModelReadiness() {
                     let quorum = readiness.phase == "ready"
@@ -781,7 +1039,7 @@ final class TokenityStore: ObservableObject {
                         modelLoadStates = states
                         activeLoadedModelID = identifier
                         if let instanceID = activeModelInstanceID {
-                            managedModelInstances[identifier] = ManagedModelInstance(
+                            managedModelInstances[instanceID] = ManagedModelInstance(
                                 modelID: identifier,
                                 serviceModelName: identifier,
                                 instanceID: instanceID,
@@ -999,12 +1257,14 @@ final class TokenityStore: ObservableObject {
             appendLog("Model load blocked. \(message)")
             return
         }
-
-        let cancelledChatTask = cancelActiveChat(
-            message: "Generation stopped because another model started loading.",
-            logReason: "model load"
-        )
-        if let cancelledChatTask { await cancelledChatTask.value }
+        if !managedModelInstances.isEmpty,
+           !selectedAgentsSupportResidentModels {
+            let message = TokenityTransportError.multiInstanceAgentUpgradeRequired.errorDescription
+                ?? "The selected Node Agents do not support resident model instances."
+            modelLoadMessage = message
+            appendLog("Additional resident model load blocked: \(message)")
+            return
+        }
 
         var states = modelLoadStates
         states[row.id] = .loading
@@ -1074,7 +1334,7 @@ final class TokenityStore: ObservableObject {
             loadedServiceModelName = serviceModelName
             activeLoadedModelID = row.id
             if let instanceID = startResponse?.instanceID {
-                managedModelInstances[row.id] = ManagedModelInstance(
+                managedModelInstances[instanceID] = ManagedModelInstance(
                     modelID: row.id,
                     serviceModelName: serviceModelName,
                     instanceID: instanceID,
@@ -1150,18 +1410,37 @@ final class TokenityStore: ObservableObject {
             )
             : nil
         if let cancelledChatTask { await cancelledChatTask.value }
-        let managed = managedModelInstances[row.id]
-        let targetInstanceID = managed?.instanceID
-            ?? (activeLoadedModelID == row.id ? activeModelInstanceID : nil)
-        do {
-            try await cleanupInstanceOrLegacy(
-                instanceID: targetInstanceID,
-                allowsGlobalFallback: managedModelInstances.count <= 1
-            )
-        } catch {
-            appendLog("Some model stop requests could not reach a selected Mac: \(userFacingMessage(for: error))")
+        let targetInstanceIDs = managedModelInstances.values
+            .filter { $0.modelID == row.id }
+            .map(\.instanceID)
+            .sorted()
+        let fallbackInstanceIDs = targetInstanceIDs.isEmpty
+            ? [activeLoadedModelID == row.id ? activeModelInstanceID : nil].compactMap { $0 }
+            : targetInstanceIDs
+        if fallbackInstanceIDs.isEmpty {
+            do {
+                try await cleanupInstanceOrLegacy(
+                    instanceID: nil,
+                    allowsGlobalFallback: managedModelInstances.isEmpty
+                )
+            } catch {
+                appendLog("Some model stop requests could not reach a selected Mac: \(userFacingMessage(for: error))")
+            }
+        } else {
+            for instanceID in fallbackInstanceIDs {
+                do {
+                    try await cleanupInstanceOrLegacy(
+                        instanceID: instanceID,
+                        allowsGlobalFallback: managedModelInstances.count <= fallbackInstanceIDs.count
+                    )
+                } catch {
+                    appendLog("Some model stop requests could not reach a selected Mac: \(userFacingMessage(for: error))")
+                }
+            }
         }
-        managedModelInstances.removeValue(forKey: row.id)
+        for instanceID in targetInstanceIDs {
+            managedModelInstances.removeValue(forKey: instanceID)
+        }
         states = modelLoadStates
         states[row.id] = .notLoaded
         modelLoadStates = states
@@ -1202,12 +1481,49 @@ final class TokenityStore: ObservableObject {
     func sendChatMessage() async {
         let prompt = chatInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty, !isChatRunning else { return }
-        guard let modelName = loadedModelName, phase == .running else {
+        guard phase == .running else {
             appendLog("Chat is waiting for a running cluster and loaded model.")
             return
         }
-        let serviceModelName = loadedServiceModelName ?? modelName
-        let configuration = modelConfiguration(for: modelName)
+        let requestedAuto = isAutoChatSelection
+        let selectedInstance = managedModelInstances.values
+            .filter { $0.modelID == chatSelectedModelID && $0.isRoutable }
+            .sorted { $0.instanceID < $1.instanceID }
+            .first
+        let allowedAutoInstances = residentModelInstances
+            .filter { $0.allowsAuto && ($0.isReady || $0.isBusy) }
+        let allowedAutoModels = Array(Set(allowedAutoInstances.map(\.modelID))).sorted()
+        let allowedAutoInstanceIDs = allowedAutoInstances.map(\.id).sorted()
+        let usesAutoRouting = requestedAuto && !allowedAutoModels.isEmpty
+        let fallbackModelID: String?
+        if requestedAuto || (selectedInstance == nil && managedModelInstances.isEmpty) {
+            // A legacy Agent has one active service and no instance routing
+            // contract. After a model switch, that verified active model is the
+            // only valid manual target.
+            fallbackModelID = loadedModelName
+        } else {
+            fallbackModelID = chatSelectedModelID
+        }
+        let hasLegacyManualFallback = fallbackModelID != nil && fallbackModelID == loadedModelName
+        guard usesAutoRouting || selectedInstance != nil || hasLegacyManualFallback else {
+            appendLog(requestedAuto
+                ? "Auto routing is waiting for an eligible resident model."
+                : "The selected model is not currently resident and routable.")
+            return
+        }
+        let resolvedManualModelID = selectedInstance?.modelID ?? fallbackModelID ?? chatSelectedModelID
+        let serviceModelName = usesAutoRouting
+            ? "tokenity-auto"
+            : (selectedInstance?.serviceModelName ?? loadedServiceModelName ?? resolvedManualModelID)
+        let configuration = usesAutoRouting ? nil : modelConfiguration(for: resolvedManualModelID)
+        var routeConstraints = nextChatRouteConstraints ?? [:]
+        nextChatRouteConstraints = nil
+        if usesAutoRouting {
+            if routeConstraints["allowed_model_ids"] == nil {
+                routeConstraints["allowed_model_ids"] = .strings(allowedAutoModels)
+            }
+            routeConstraints["allowed_instance_ids"] = .strings(allowedAutoInstanceIDs)
+        }
 
         chatInput = ""
         chatMessages.append(ChatMessage(role: .user, content: prompt))
@@ -1217,7 +1533,7 @@ final class TokenityStore: ObservableObject {
                 role: .assistant,
                 content: "",
                 generationState: .waiting,
-                modelName: modelName
+                modelName: usesAutoRouting ? "Auto" : resolvedManualModelID
             )
         )
         let assistantIndex = chatMessages.count - 1
@@ -1225,7 +1541,9 @@ final class TokenityStore: ObservableObject {
         activeChatRequestID = requestID
         activeChatUserIndex = userIndex
         activeChatAssistantIndex = assistantIndex
+        activeChatRoutedInstanceID = nil
         isChatRunning = true
+        chatRoutingState = .selecting
         chatMetrics = .empty
         chatScrollRevision += 1
         defer {
@@ -1233,9 +1551,13 @@ final class TokenityStore: ObservableObject {
                 activeChatRequestID = nil
                 activeChatUserIndex = nil
                 activeChatAssistantIndex = nil
+                activeChatRoutedInstanceID = nil
                 chatTask = nil
                 chatTaskID = nil
                 isChatRunning = false
+                if chatRoutingState == .selecting {
+                    chatRoutingState = .idle
+                }
             }
             syncActiveChatSession()
         }
@@ -1252,6 +1574,7 @@ final class TokenityStore: ObservableObject {
                         serviceModelName: serviceModelName,
                         prompt: prompt,
                         configuration: configuration,
+                        routeConstraints: routeConstraints.isEmpty ? nil : routeConstraints,
                         userIndex: userIndex,
                         assistantIndex: assistantIndex,
                         requestID: requestID,
@@ -1320,6 +1643,7 @@ final class TokenityStore: ObservableObject {
                     try await completeClusterChat(
                         serviceModelName: serviceModelName,
                         configuration: configuration,
+                        routeConstraints: routeConstraints.isEmpty ? nil : routeConstraints,
                         assistantIndex: assistantIndex,
                         requestID: requestID,
                         firstTokenAt: &firstTokenAt,
@@ -1527,6 +1851,243 @@ final class TokenityStore: ObservableObject {
         }
     }
 
+    private static let residentModelAgentCapabilities: Set<String> = [
+        "managed_instances",
+        "instance_runtimes",
+        "instance_quorum",
+        "cluster_runtime",
+    ]
+
+    private var selectedAgentsSupportResidentModels: Bool {
+        !selectedNodes.isEmpty && selectedNodes.allSatisfy { node in
+            guard let contract = node.agentContract else { return false }
+            return Self.residentModelAgentCapabilities.isSubset(of: contract.capabilities)
+        }
+    }
+
+    private func fetchGatewayRoutes() async -> [GatewayModelRoute]? {
+        guard let baseURL = clusterControlBaseURL() else { return nil }
+        var request = URLRequest(url: baseURL.appendingPathComponent("/v1/gateway/routes"))
+        request.timeoutInterval = 5
+        do {
+            let (data, response) = try await dataTransport(request)
+            try validate(response, data: data)
+            return try JSONDecoder().decode(GatewayRoutesResponse.self, from: data).data
+        } catch {
+            return nil
+        }
+    }
+
+    private func recoverManagedModelInstancesFromAgent() async {
+        guard selectedAgentsSupportResidentModels,
+              let controller = coordinator,
+              let routes = await fetchGatewayRoutes()
+        else { return }
+
+        let snapshots = controller.modelInstances
+        let snapshotsByID = Dictionary(
+            snapshots.map { ($0.instanceID, $0) },
+            uniquingKeysWith: { _, latest in latest }
+        )
+        let routesByID = Dictionary(
+            routes.map { ($0.instanceID, $0) },
+            uniquingKeysWith: { _, latest in latest }
+        )
+        let previouslyKnownIDs = Set(managedModelInstances.keys)
+        var removedInstanceIDs: Set<String> = []
+        var removedModelIDs: Set<String> = []
+
+        for instanceID in previouslyKnownIDs where snapshotsByID[instanceID] == nil {
+            if let removed = managedModelInstances[instanceID] {
+                removedModelIDs.insert(removed.modelID)
+            }
+            managedModelInstances.removeValue(forKey: instanceID)
+            residentAutoPreferences.removeValue(forKey: instanceID)
+            removedInstanceIDs.insert(instanceID)
+        }
+
+        for snapshot in snapshots {
+            let route = routesByID[snapshot.instanceID]
+            let state = snapshot.state.lowercased()
+            if state == "stopped" {
+                if let removed = managedModelInstances.removeValue(forKey: snapshot.instanceID) {
+                    removedModelIDs.insert(removed.modelID)
+                    removedInstanceIDs.insert(snapshot.instanceID)
+                }
+                residentAutoPreferences.removeValue(forKey: snapshot.instanceID)
+                continue
+            }
+            let routeIsRoutable = route.map {
+                ["ready", "busy"].contains($0.state.lowercased())
+            } ?? false
+            guard ["ready", "busy"].contains(state)
+                    || managedModelInstances[snapshot.instanceID] != nil
+            else { continue }
+
+            let processRole = controller.roles.first {
+                $0.instanceID == snapshot.instanceID
+                    && Self.inferenceRoleNames.contains($0.role)
+            }?.role
+            var managed = managedModelInstances[snapshot.instanceID] ?? ManagedModelInstance(
+                modelID: snapshot.requestedModelID,
+                serviceModelName: route?.model ?? snapshot.requestedModelID,
+                instanceID: snapshot.instanceID,
+                // Gateway routes intentionally advertise a coordinator-local
+                // 127.0.0.1 URL. Control keeps chat on the stable :9100 gateway.
+                apiBaseURL: nil,
+                backendRole: processRole ?? "distributed-openai",
+                lifecycleState: state,
+                quorumReady: false,
+                routeAvailable: routeIsRoutable
+            )
+            managed.modelID = snapshot.requestedModelID
+            managed.serviceModelName = route?.model ?? snapshot.requestedModelID
+            managed.backendRole = processRole ?? managed.backendRole
+            managed.lifecycleState = state
+            managed.routeAvailable = routeIsRoutable
+            managed.modelRevision = route?.modelRevision ?? snapshot.modelRevision
+            managed.selectedNodes = snapshot.selectedNodes ?? []
+            managed.executionMode = snapshot.executionMode ?? route?.executionMode
+            managed.connectionMode = snapshot.connectionMode
+            managed.reservedMemoryBytes = snapshot.memoryReservationBytes
+            managed.actualMemoryBytes = snapshot.actualMemoryBytes
+            managed.activeRequestCount = route?.activeRequestCount
+                ?? snapshot.activeRequestCount
+                ?? 0
+            managed.queueDepth = route?.queueDepth
+                ?? snapshot.queuedRequestCount
+                ?? 0
+            managed.routeCapabilities = route?.capabilities
+            managed.warmTTFTP50Milliseconds = route?.warmTTFTP50Milliseconds
+            managed.warmTTFTP95Milliseconds = route?.warmTTFTP95Milliseconds
+            if snapshot.healthReady == false {
+                managed.quorumReady = false
+                managed.healthIssue = snapshot.healthIssues?.joined(separator: " ")
+            }
+            if !routeIsRoutable {
+                managed.quorumReady = false
+                managed.healthIssue = "The stable gateway does not advertise this instance as routable."
+            }
+            managedModelInstances[snapshot.instanceID] = managed
+        }
+
+        for modelID in removedModelIDs
+        where !managedModelInstances.values.contains(where: { $0.modelID == modelID }) {
+            modelLoadStates[modelID] = .notLoaded
+        }
+        migrateLegacyResidentAutoPreferences()
+        persistResidentAutoPreferences()
+        if !removedInstanceIDs.isEmpty {
+            appendLog(
+                "Removed \(removedInstanceIDs.count) stale resident model "
+                    + "instance record\(removedInstanceIDs.count == 1 ? "" : "s")."
+            )
+        }
+        let newlyDiscoveredIDs = Set(managedModelInstances.keys).subtracting(previouslyKnownIDs)
+        recomputeManagedModelLoadStates()
+        if let activeModelInstanceID {
+            let activeSnapshotState = snapshotsByID[activeModelInstanceID]?.state.lowercased()
+            let preservesLoadingIdentity = activeModelLoadID != nil
+                && activeSnapshotState.map {
+                    !["stopped", "failed", "orphaned"].contains($0)
+                } == true
+            if !preservesLoadingIdentity,
+               managedModelInstances[activeModelInstanceID]?.isRoutable != true {
+                restoreActiveManagedInstance()
+            }
+        } else {
+            restoreActiveManagedInstance()
+        }
+        if !newlyDiscoveredIDs.isEmpty {
+            await renewModelLeases(instanceIDs: newlyDiscoveredIDs)
+        }
+    }
+
+    private func migrateLegacyResidentAutoPreferences() {
+        let modelIDs = Set(managedModelInstances.values.map(\.modelID))
+        for modelID in modelIDs {
+            guard let legacyPreference = residentAutoPreferences.removeValue(forKey: modelID) else {
+                continue
+            }
+            for managed in managedModelInstances.values where managed.modelID == modelID {
+                if residentAutoPreferences[managed.instanceID] == nil {
+                    residentAutoPreferences[managed.instanceID] = legacyPreference
+                }
+            }
+        }
+    }
+
+    private func persistResidentAutoPreferences() {
+        if let encoded = try? JSONEncoder().encode(residentAutoPreferences) {
+            userDefaults.set(encoded, forKey: residentAutoPreferencesKey)
+        }
+    }
+
+    private func refreshManagedModelInstanceHealth() async {
+        let instanceIDs = managedModelInstances.values
+            .filter {
+                $0.routeAvailable
+                    && ["ready", "busy"].contains($0.lifecycleState.lowercased())
+            }
+            .map(\.instanceID)
+            .sorted()
+
+        for instanceID in instanceIDs {
+            do {
+                let quorum = try await fetchInstanceQuorum(instanceID: instanceID)
+                guard var managed = managedModelInstances[instanceID] else { continue }
+                managed.quorumReady = quorum.ready
+                let issue = quorum.issues.joined(separator: " ")
+                managed.healthIssue = quorum.ready
+                    ? nil
+                    : (issue.isEmpty ? "The instance rank quorum is not ready." : issue)
+                managedModelInstances[instanceID] = managed
+                if quorum.ready, instanceID == activeModelInstanceID {
+                    applyRuntimeMemory(from: quorum)
+                }
+            } catch {
+                guard var managed = managedModelInstances[instanceID] else { continue }
+                managed.quorumReady = false
+                managed.healthIssue = userFacingMessage(for: error)
+                managedModelInstances[instanceID] = managed
+            }
+        }
+
+        let previousActiveInstanceID = activeModelInstanceID
+        recomputeManagedModelLoadStates()
+        if let previousActiveInstanceID,
+           managedModelInstances[previousActiveInstanceID]?.isRoutable != true {
+            cancelActiveChat(
+                message: "Generation stopped because the active model instance is no longer ready.",
+                logReason: "managed instance health"
+            )
+            restoreActiveManagedInstance()
+        } else if activeModelInstanceID == nil {
+            restoreActiveManagedInstance()
+        }
+
+        if let activeModelInstanceID,
+           managedModelInstances[activeModelInstanceID]?.isRoutable == true {
+            phase = .running
+            serverHealth = .ready
+        } else if !managedModelInstances.isEmpty {
+            let issue = managedModelInstances.values
+                .compactMap(\.healthIssue)
+                .first
+                ?? "No managed model instance has a ready rank quorum."
+            serverHealth = .error(issue)
+        }
+    }
+
+    private func recomputeManagedModelLoadStates() {
+        var states = modelLoadStates
+        let grouped = Dictionary(grouping: managedModelInstances.values, by: \.modelID)
+        for (modelID, instances) in grouped {
+            states[modelID] = instances.contains(where: \.isRoutable) ? .loaded : .failed
+        }
+        modelLoadStates = states
+    }
+
     private func upsert(_ node: TokenityNode) {
         if let index = nodes.firstIndex(where: { $0.id == node.id || $0.agentURL == node.agentURL }) {
             var merged = node
@@ -1631,9 +2192,9 @@ final class TokenityStore: ObservableObject {
     private func failActiveManagedInstanceAndRestoreSibling(message: String) -> Bool {
         guard let failedModelID = activeLoadedModelID,
               let failedInstanceID = activeModelInstanceID,
-              managedModelInstances[failedModelID]?.instanceID == failedInstanceID,
-              managedModelInstances.keys.contains(where: {
-                  $0 != failedModelID && modelLoadStates[$0] == .loaded
+              managedModelInstances[failedInstanceID]?.modelID == failedModelID,
+              managedModelInstances.values.contains(where: {
+                  $0.instanceID != failedInstanceID && $0.isRoutable
               })
         else { return false }
 
@@ -1644,7 +2205,8 @@ final class TokenityStore: ObservableObject {
         var states = modelLoadStates
         states[failedModelID] = .failed
         modelLoadStates = states
-        managedModelInstances.removeValue(forKey: failedModelID)
+        managedModelInstances.removeValue(forKey: failedInstanceID)
+        recomputeManagedModelLoadStates()
         restoreActiveManagedInstance()
 
         guard let replacement = loadedModelName else { return false }
@@ -1855,6 +2417,9 @@ final class TokenityStore: ObservableObject {
 
                 if includesInstanceMetadata,
                    rejectsInstanceMetadata || (!rejectsNativeMTP && !rejectsInstanceMetadata) {
+                    guard managedModelInstances.isEmpty else {
+                        throw TokenityTransportError.multiInstanceAgentUpgradeRequired
+                    }
                     includesInstanceMetadata = false
                     appendLog("The running Node Agent predates managed model instances. Retrying with the legacy model start contract.")
                     continue
@@ -1948,22 +2513,24 @@ final class TokenityStore: ObservableObject {
         } catch TokenityTransportError.httpStatus(let status, _) where status == 404 {
             if allowsGlobalFallback {
                 try await cleanupAllModelRoles()
-            } else {
-                throw TokenityTransportError.httpStatus(
-                    status,
-                    "The requested model instance is no longer registered; sibling instances were left untouched."
-                )
             }
+            // A missing instance is already stopped from the caller's point of
+            // view. Treat the precise stop as idempotent and never widen it to
+            // a global cleanup that could terminate sibling instances.
         }
     }
 
     private func restoreActiveManagedInstance() {
-        let nextModelID = managedModelInstances.keys
-            .filter { modelLoadStates[$0] == .loaded }
-            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        let next = managedModelInstances.values
+            .filter(\.isRoutable)
+            .sorted {
+                if $0.modelID == $1.modelID {
+                    return $0.instanceID.localizedCaseInsensitiveCompare($1.instanceID) == .orderedAscending
+                }
+                return $0.modelID.localizedCaseInsensitiveCompare($1.modelID) == .orderedAscending
+            }
             .first
-        guard let nextModelID,
-              let next = managedModelInstances[nextModelID] else {
+        guard let next else {
             activeLoadedModelID = nil
             loadedBackendRole = nil
             loadedServiceModelName = nil
@@ -2023,6 +2590,17 @@ final class TokenityStore: ObservableObject {
             managedModelInstances.values.map(\.instanceID)
                 + [activeModelInstanceID].compactMap { $0 }
         )
+        // A current managed Agent requires instance-scoped heartbeats. During
+        // the short interval before a start request returns its identity there
+        // is nothing valid to renew, so never fall back to the rejected legacy
+        // global heartbeat.
+        if instanceIDs.isEmpty, selectedAgentsSupportResidentModels {
+            return
+        }
+        await renewModelLeases(instanceIDs: instanceIDs)
+    }
+
+    private func renewModelLeases(instanceIDs: Set<String>) async {
         let heartbeatInstanceIDs: [String?] = instanceIDs.isEmpty
             ? [nil]
             : instanceIDs.sorted().map(Optional.some)
@@ -2038,7 +2616,19 @@ final class TokenityStore: ObservableObject {
                       ) else { continue }
                 var heartbeat = request
                 heartbeat.timeoutInterval = 3
-                _ = try? await dataTransport(heartbeat)
+                let failureKey = "\(node.id):\(instanceID ?? "legacy")"
+                do {
+                    let (data, response) = try await dataTransport(heartbeat)
+                    try validate(response, data: data)
+                    leaseRenewalFailureKeys.remove(failureKey)
+                } catch {
+                    if leaseRenewalFailureKeys.insert(failureKey).inserted {
+                        appendLog(
+                            "Model lease renewal failed for \(instanceID ?? "legacy service") "
+                                + "on \(node.displayName): \(userFacingMessage(for: error))"
+                        )
+                    }
+                }
             }
         }
     }
@@ -2158,6 +2748,7 @@ final class TokenityStore: ObservableObject {
             throw TokenityTransportError.invalidResponse
         }
         var receivedToken = false
+        var receivedCompletionUsage = false
         var receivedDone = false
         for line in eventStream.components(separatedBy: .newlines) {
             guard line.hasPrefix("data:") else { continue }
@@ -2175,8 +2766,11 @@ final class TokenityStore: ObservableObject {
                 ?? delta?.reasoning?.trimmingCharacters(in: .whitespacesAndNewlines)
                 ?? ""
             receivedToken = receivedToken || !content.isEmpty || !reasoning.isEmpty
+            if let completionTokens = chunk.usage?.completionTokens, completionTokens > 0 {
+                receivedCompletionUsage = true
+            }
         }
-        if !receivedToken || !receivedDone {
+        if (!receivedToken && !receivedCompletionUsage) || !receivedDone {
             throw TokenityTransportError.noChatContent
         }
     }
@@ -2212,6 +2806,10 @@ final class TokenityStore: ObservableObject {
 
     private func fetchInstanceQuorum() async throws -> InstanceQuorumResponse? {
         guard let instanceID = activeModelInstanceID else { return nil }
+        return try await fetchInstanceQuorum(instanceID: instanceID)
+    }
+
+    private func fetchInstanceQuorum(instanceID: String) async throws -> InstanceQuorumResponse {
         guard let baseURL = clusterControlBaseURL() else {
             throw TokenityTransportError.missingClusterControl
         }
@@ -2392,7 +2990,8 @@ final class TokenityStore: ObservableObject {
     private func streamClusterChat(
         serviceModelName: String,
         prompt: String,
-        configuration: ModelRuntimeConfiguration,
+        configuration: ModelRuntimeConfiguration?,
+        routeConstraints: [String: JSONValue]?,
         userIndex: Int,
         assistantIndex: Int,
         requestID: UUID,
@@ -2412,7 +3011,8 @@ final class TokenityStore: ObservableObject {
             chatCompletionRequest(
                 model: serviceModelName,
                 stream: true,
-                configuration: configuration
+                configuration: configuration,
+                routeConstraints: routeConstraints
             )
         )
 
@@ -2480,8 +3080,17 @@ final class TokenityStore: ObservableObject {
         }
         defer { flushPendingTokens() }
 
-        for try await line in lineStreamTransport(request) {
+        for try await event in lineStreamTransport(request) {
             try ensureActiveChatRequest(requestID)
+            if case .response(let responseMetadata) = event {
+                applyRouteMetadata(
+                    responseMetadata.route,
+                    assistantIndex: assistantIndex,
+                    localRequestID: requestID
+                )
+                continue
+            }
+            guard case .line(let line) = event else { continue }
             guard line.hasPrefix("data:") else { continue }
             let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
             if payload == "[DONE]" { break }
@@ -2571,7 +3180,8 @@ final class TokenityStore: ObservableObject {
 
     private func completeClusterChat(
         serviceModelName: String,
-        configuration: ModelRuntimeConfiguration,
+        configuration: ModelRuntimeConfiguration?,
+        routeConstraints: [String: JSONValue]?,
         assistantIndex: Int,
         requestID: UUID,
         firstTokenAt: inout Date?,
@@ -2586,13 +3196,19 @@ final class TokenityStore: ObservableObject {
             body: chatCompletionRequest(
                 model: serviceModelName,
                 stream: false,
-                configuration: configuration
+                configuration: configuration,
+                routeConstraints: routeConstraints
             )
         )
         request.timeoutInterval = 600
         let (data, response) = try await dataTransport(request)
         try ensureActiveChatRequest(requestID)
         try validate(response, data: data)
+        applyRouteMetadata(
+            Self.routeMetadata(from: response),
+            assistantIndex: assistantIndex,
+            localRequestID: requestID
+        )
         let decoded = try JSONDecoder().decode(OpenAIChatResponse.self, from: data)
         guard let message = decoded.choices.first?.message else {
             throw TokenityTransportError.noChatContent
@@ -2649,38 +3265,68 @@ final class TokenityStore: ObservableObject {
     private func chatCompletionRequest(
         model: String,
         stream: Bool,
-        configuration: ModelRuntimeConfiguration
+        configuration: ModelRuntimeConfiguration?,
+        routeConstraints: [String: JSONValue]? = nil
     ) -> OpenAIChatRequest {
-        let modelID = loadedModelName ?? model
+        let isAuto = configuration == nil
+        let modelID = isAuto ? model : chatSelectedModelID
         let row = modelLibraryRows.first { $0.id == modelID }
         let normalizedID = modelID.lowercased()
             .replacingOccurrences(of: "_", with: "")
             .replacingOccurrences(of: ".", with: "")
             .replacingOccurrences(of: "-", with: "")
         let isQwen35 = row?.isQwen35 ?? normalizedID.contains("qwen35")
-        let sampling = configuration.resolvedSampling(forQwen35: isQwen35)
+        let sampling = configuration?.resolvedSampling(forQwen35: isQwen35)
         let templateArguments: [String: Bool]?
-        switch configuration.thinkingMode {
+        switch configuration?.thinkingMode {
         case .automatic:
             templateArguments = nil
         case .enabled:
             templateArguments = ["enable_thinking": true]
         case .disabled:
             templateArguments = ["enable_thinking": false]
+        case nil:
+            templateArguments = nil
         }
         return OpenAIChatRequest(
             model: model,
             messages: chatRequestMessages(),
             stream: stream,
-            maxTokens: configuration.maximumOutputTokens,
-            temperature: sampling.temperature,
-            topP: sampling.topP,
-            topK: sampling.topK,
-            minP: sampling.minP,
-            presencePenalty: sampling.presencePenalty,
-            repetitionPenalty: sampling.repetitionPenalty,
-            chatTemplateKwargs: templateArguments
+            maxTokens: configuration?.maximumOutputTokens,
+            temperature: sampling?.temperature,
+            topP: sampling?.topP,
+            topK: sampling?.topK,
+            minP: sampling?.minP,
+            presencePenalty: sampling?.presencePenalty,
+            repetitionPenalty: sampling?.repetitionPenalty,
+            chatTemplateKwargs: templateArguments,
+            tokenityRoutePolicy: isAuto ? chatRoutePolicy.rawValue : nil,
+            tokenitySessionID: isAuto ? activeChatSessionID.uuidString : nil,
+            tokenityLockModel: isAuto ? locksChatModel : nil,
+            tokenityConstraints: isAuto ? routeConstraints : nil
         )
+    }
+
+    private func applyRouteMetadata(
+        _ metadata: ChatRouteMetadata,
+        assistantIndex: Int,
+        localRequestID: UUID
+    ) {
+        guard chatMessages.indices.contains(assistantIndex) else { return }
+        chatMessages[assistantIndex].routedModelID = metadata.routedModelID
+        chatMessages[assistantIndex].modelRevision = metadata.modelRevision
+        chatMessages[assistantIndex].instanceID = metadata.instanceID
+        chatMessages[assistantIndex].routeReason = metadata.routeReason
+        chatMessages[assistantIndex].routeConfidence = metadata.confidence
+        chatMessages[assistantIndex].routingLatencyMilliseconds = metadata.routingLatencyMilliseconds
+        chatMessages[assistantIndex].queueWaitMilliseconds = metadata.queueWaitMilliseconds
+        chatMessages[assistantIndex].requestID = metadata.requestID ?? localRequestID.uuidString
+        if let routedModelID = metadata.routedModelID, !routedModelID.isEmpty {
+            chatMessages[assistantIndex].modelName = routedModelID
+        }
+        activeChatRoutedInstanceID = metadata.instanceID
+        chatRoutingState = .routed(metadata)
+        chatScrollRevision += 1
     }
 
     private func assistantMessageHasVisibleOutput(at index: Int) -> Bool {
@@ -2723,9 +3369,11 @@ final class TokenityStore: ObservableObject {
         activeChatRequestID = nil
         activeChatUserIndex = nil
         activeChatAssistantIndex = nil
+        activeChatRoutedInstanceID = nil
         chatTask = nil
         chatTaskID = nil
         isChatRunning = false
+        chatRoutingState = .idle
         chatScrollRevision += 1
         syncActiveChatSession()
         appendLog("Chat generation cancelled for \(logReason).")
@@ -2761,9 +3409,21 @@ final class TokenityStore: ObservableObject {
                 session.title = String(clean.prefix(48))
             }
         }
+        if session.selectedModelID != nil || chatSelectedModelID != "tokenity-auto" {
+            session.selectedModelID = chatSelectedModelID
+        }
+        if session.routePolicy != nil || chatRoutePolicy != .balanced {
+            session.routePolicy = chatRoutePolicy
+        }
+        if session.locksModel != nil || locksChatModel {
+            session.locksModel = locksChatModel
+        }
         guard session.messages != chatMessages
                 || session.metrics != chatMetrics
-                || session.title != chatSessions[index].title else { return }
+                || session.title != chatSessions[index].title
+                || session.selectedModelID != chatSessions[index].selectedModelID
+                || session.routePolicy != chatSessions[index].routePolicy
+                || session.locksModel != chatSessions[index].locksModel else { return }
         session.messages = chatMessages
         session.metrics = chatMetrics
         session.updatedAt = Date()
@@ -2837,7 +3497,30 @@ final class TokenityStore: ObservableObject {
         return (data, httpResponse)
     }
 
-    private nonisolated static func liveLineStream(for request: URLRequest) -> AsyncThrowingStream<String, Error> {
+    private nonisolated static func routeMetadata(from response: HTTPURLResponse) -> ChatRouteMetadata {
+        func header(_ name: String) -> String? {
+            guard let value = response.value(forHTTPHeaderField: name)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                !value.isEmpty
+            else { return nil }
+            return value
+        }
+        func number(_ name: String) -> Double? {
+            header(name).flatMap(Double.init)
+        }
+        return ChatRouteMetadata(
+            routedModelID: header("X-Tokenity-Routed-Model") ?? header("X-Tokenity-Model"),
+            modelRevision: header("X-Tokenity-Model-Revision"),
+            instanceID: header("X-Tokenity-Instance-ID"),
+            routeReason: header("X-Tokenity-Route-Reason"),
+            confidence: number("X-Tokenity-Route-Confidence"),
+            routingLatencyMilliseconds: number("X-Tokenity-Routing-Latency-Ms"),
+            queueWaitMilliseconds: number("X-Tokenity-Queue-Wait-Ms"),
+            requestID: header("X-Tokenity-Request-ID")
+        )
+    }
+
+    private nonisolated static func liveLineStream(for request: URLRequest) -> AsyncThrowingStream<ChatStreamEvent, Error> {
         AsyncThrowingStream(bufferingPolicy: .bufferingOldest(16)) { continuation in
             let task = Task {
                 do {
@@ -2853,9 +3536,18 @@ final class TokenityStore: ObservableObject {
                         .hasPrefix("text/event-stream") == true else {
                         throw TokenityTransportError.invalidResponse
                     }
+                    _ = continuation.yield(
+                        .response(
+                            ChatStreamResponseMetadata(
+                                statusCode: httpResponse.statusCode,
+                                contentType: httpResponse.value(forHTTPHeaderField: "Content-Type"),
+                                route: routeMetadata(from: httpResponse)
+                            )
+                        )
+                    )
                     for try await line in bytes.lines {
                         retry: while !Task.isCancelled {
-                            switch continuation.yield(line) {
+                            switch continuation.yield(.line(line)) {
                             case .enqueued:
                                 break retry
                             case .dropped:

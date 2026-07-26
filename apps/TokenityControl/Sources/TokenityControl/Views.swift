@@ -101,6 +101,18 @@ struct OverviewPage: View {
                 }
             }
 
+            InfoGroup(title: "Resident Models") {
+                InfoRow(label: "Pool") {
+                    Text(store.residentRoutingSummary)
+                }
+                InfoRow(label: "Router") {
+                    StatusPill(
+                        text: store.autoRouterHealthText,
+                        tone: store.autoRouterHealthText == "Auto routing healthy" ? .good : .warning
+                    )
+                }
+            }
+
             InfoGroup(title: "Selected Macs") {
                 ForEach(store.selectedNodes) { node in
                     InfoRow(label: node.displayName) {
@@ -623,6 +635,23 @@ struct ModelsPage: View {
                 }
             }
 
+            InfoGroup(title: "Resident Model Pool") {
+                if store.residentModelInstances.isEmpty {
+                    InfoRow(label: "Status") {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("No resident model instances")
+                            Text(store.autoRouterHealthText)
+                                .font(.tokenityText(11))
+                                .foregroundStyle(theme.secondaryText)
+                        }
+                    }
+                } else {
+                    ForEach(store.residentModelInstances) { instance in
+                        ResidentModelInstanceRow(instance: instance)
+                    }
+                }
+            }
+
             InfoGroup(title: "Available Models") {
                 if store.modelLibraryRows.isEmpty {
                     InfoRow(label: "Status") {
@@ -657,6 +686,149 @@ struct ModelsPage: View {
             if store.modelScanSummary == "Not scanned" {
                 await store.scanModels()
             }
+        }
+    }
+}
+
+private struct ResidentModelInstanceRow: View {
+    let instance: ResidentModelInstanceSummary
+
+    @EnvironmentObject private var store: TokenityStore
+    @Environment(\.tokenityTheme) private var theme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 9) {
+                Circle()
+                    .fill(instance.isBusy ? theme.warning : (instance.isReady ? theme.success : theme.danger))
+                    .frame(width: 9, height: 9)
+                Text(instance.modelID)
+                    .font(.tokenityText(13, weight: .semibold))
+                    .lineLimit(1)
+                StatusPill(text: instance.displayState, tone: stateTone)
+                if instance.activeRequestCount > 0 {
+                    StatusPill(text: "\(instance.activeRequestCount) active", tone: .accent)
+                }
+                if instance.queueDepth > 0 {
+                    StatusPill(text: "\(instance.queueDepth) queued", tone: .warning)
+                }
+                Spacer(minLength: 0)
+                Toggle("Allow Auto", isOn: allowsAutoBinding)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                Toggle("Keep Resident", isOn: keepsResidentBinding)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                Button("Use in Chat") {
+                    store.useResidentModelInChat(instance.id)
+                }
+                .disabled(!instance.isReady && !instance.isBusy)
+                Button(role: .destructive) {
+                    Task { await store.stopResidentModelInstance(instance.id) }
+                } label: {
+                    Label("Stop", systemImage: "stop.fill")
+                }
+            }
+
+            HStack(spacing: 8) {
+                Text("Instance \(instance.id)")
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if let revision = instance.modelRevision {
+                    Text("· \(revision)").lineLimit(1)
+                }
+                if !instance.selectedNodes.isEmpty {
+                    Text("· \(instance.selectedNodes.joined(separator: " → "))")
+                        .lineLimit(1)
+                }
+            }
+            .font(.tokenityText(10))
+            .foregroundStyle(theme.tertiaryText)
+
+            HStack(spacing: 8) {
+                if let executionMode = instance.executionMode {
+                    StatusPill(text: executionMode, tone: .neutral)
+                }
+                if let connectionMode = instance.connectionMode {
+                    StatusPill(text: connectionMode, tone: .neutral)
+                }
+                ForEach(instance.capabilities, id: \.self) { capability in
+                    StatusPill(text: capability, tone: .accent)
+                }
+                if instance.capabilities.isEmpty {
+                    Text("Capabilities unavailable")
+                        .foregroundStyle(theme.tertiaryText)
+                }
+            }
+            .font(.tokenityText(10))
+            .foregroundStyle(theme.secondaryText)
+
+            HStack {
+                Text(warmTTFTSummary)
+                Spacer()
+                Text("Reserved \(formatBytes(instance.reservedMemoryBytes)) · Actual \(formatBytes(instance.actualMemoryBytes))")
+            }
+            .font(.tokenityText(10))
+            .foregroundStyle(theme.secondaryText)
+
+            if let issue = instance.healthIssue, !issue.isEmpty {
+                Label(issue, systemImage: "exclamationmark.triangle")
+                    .font(.tokenityText(11))
+                    .foregroundStyle(theme.warning)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 11)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(theme.rowSeparator)
+                .frame(height: 0.5)
+                .padding(.leading, 12)
+        }
+    }
+
+    private var allowsAutoBinding: Binding<Bool> {
+        Binding(
+            get: { instance.allowsAuto },
+            set: { store.setResidentInstanceAllowsAuto(instance.id, allowed: $0) }
+        )
+    }
+
+    private var keepsResidentBinding: Binding<Bool> {
+        Binding(
+            get: { instance.keepsResident },
+            set: { store.setResidentInstanceKeepsResident(instance.id, keepsResident: $0) }
+        )
+    }
+
+    private var stateTone: StatusPill.Tone {
+        if instance.isReady { return .good }
+        if instance.isBusy { return .warning }
+        return .danger
+    }
+
+    private func formatBytes(_ bytes: Int64?) -> String {
+        guard let bytes else { return "—" }
+        return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .memory)
+    }
+
+    private func formatLatency(_ milliseconds: Double) -> String {
+        if milliseconds >= 1_000 {
+            return String(format: "%.2f s", milliseconds / 1_000)
+        }
+        return String(format: "%.0f ms", milliseconds)
+    }
+
+    private var warmTTFTSummary: String {
+        switch (instance.warmTTFTP50Milliseconds, instance.warmTTFTP95Milliseconds) {
+        case let (p50?, p95?):
+            return "Profile warm TTFT p50 \(formatLatency(p50)) · p95 \(formatLatency(p95))"
+        case let (p50?, nil):
+            return "Profile warm TTFT p50 \(formatLatency(p50))"
+        case let (nil, p95?):
+            return "Profile warm TTFT p95 \(formatLatency(p95))"
+        case (nil, nil):
+            return "Profile warm TTFT unavailable"
         }
     }
 }

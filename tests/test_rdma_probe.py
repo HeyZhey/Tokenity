@@ -34,7 +34,10 @@ en0: flags=8863<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> mtu 1500
 
 
 def test_probe_rdma_merges_tools_and_thunderbolt_ip():
+    calls = []
+
     def runner(command):
+        calls.append(command[0])
         name = command[0]
         outputs = {
             "rdma_ctl": RDMA_CTL,
@@ -51,6 +54,27 @@ def test_probe_rdma_merges_tools_and_thunderbolt_ip():
     assert result.rdma_port_state == {"rdma_en4": "active"}
     assert result.thunderbolt_ip == "192.168.0.1"
     assert result.rdma_errors == []
+    assert calls == ["rdma_ctl", "ibv_devices", "ifconfig"]
+
+
+def test_probe_rdma_uses_devinfo_when_rdma_ctl_has_no_port_state():
+    calls = []
+
+    def runner(command):
+        calls.append(command[0])
+        outputs = {
+            "rdma_ctl": "RDMA enabled\n",
+            "ibv_devices": IBV_DEVICES,
+            "ibv_devinfo": IBV_DEVINFO,
+            "ifconfig": IFCONFIG,
+        }
+        return CommandResult(tuple(command), 0, stdout=outputs[command[0]])
+
+    result = probe_rdma(runner)
+
+    assert result.rdma_enabled is True
+    assert result.rdma_port_state == {"rdma_en4": "active"}
+    assert calls == ["rdma_ctl", "ibv_devices", "ibv_devinfo", "ifconfig"]
 
 
 def test_parse_ifconfig_groups_interfaces():

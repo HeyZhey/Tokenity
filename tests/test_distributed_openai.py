@@ -7,6 +7,7 @@ import time
 import json
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
 from tokenity.serving.distributed_openai import (
@@ -15,11 +16,15 @@ from tokenity.serving.distributed_openai import (
     _RepetitionDetector,
     TokenityDistributedRuntime,
     _eval_parameters_in_chunks,
+    _install_chunked_sharded_load,
+    _install_jaccl_server_control_collectives,
     _load_eval_policy,
     _parameter_eval_chunks,
     _requires_process_isolated_shutdown,
     _report_load_progress,
+    _replace_jaccl_seed_collective,
     _set_active_load_state,
+    _should_run_post_load_barrier,
     _stream_payload,
     create_app,
 )
@@ -244,6 +249,8 @@ def test_single_runtime_source_contains_no_distributed_initialization():
 
     assert "distributed.init" not in source
     assert "mlx_lm import load" in source
+    assert "self._warmup_single()" in source
+    assert "_run_warmup_with_timeout(self._warmup_single)" not in source
 
 
 def test_ready_is_published_only_after_materialization_and_warmup():
@@ -265,6 +272,144 @@ def test_ready_is_published_only_after_materialization_and_warmup():
     assert state.phase == ReadinessPhase.READY
     assert state.ready_evidence["weights_materialized"] is True
     assert state.ready_evidence["one_token_probe"] is True
+
+
+def test_distributed_warmup_drains_response_before_stopping_context():
+    events = []
+    cache_sizes = []
+    runtime = TokenityDistributedRuntime(
+        model="/models/qwen",
+        state=ReadinessState(model="/models/qwen"),
+    )
+    runtime._generator = SimpleNamespace(prompt_cache=object())  # noqa: SLF001
+    runtime._symbols = SimpleNamespace(  # noqa: SLF001
+        LRUPromptCache=lambda size: cache_sizes.append(size) or object(),
+    )
+    context = SimpleNamespace(stop=lambda: events.append("stopped"))
+
+    def responses():
+        yield SimpleNamespace(text="OK")
+        events.append("drained")
+
+    runtime._begin_distributed_generation = (  # type: ignore[method-assign]  # noqa: SLF001
+        lambda _request: (context, responses())
+    )
+
+    runtime._warmup_distributed()  # noqa: SLF001
+
+    assert events == ["drained", "stopped"]
+    assert cache_sizes == [runtime.prompt_cache_size]
+
+
+def test_glm_jaccl_uses_sequential_generation_engine(tmp_path):
+    model = tmp_path / "GLM-5.2-mxfp4"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps({"model_type": "glm_moe_dsa"}),
+        encoding="utf-8",
+    )
+    state = ReadinessState(model=str(model), connection_mode="jaccl")
+    runtime = TokenityDistributedRuntime(model=str(model), state=state)
+    runtime._provider = SimpleNamespace(is_batchable=True)  # noqa: SLF001
+    runtime._generator = SimpleNamespace(prompt_cache=object())  # noqa: SLF001
+    cache_sizes = []
+    runtime._symbols = SimpleNamespace(  # noqa: SLF001
+        LRUPromptCache=lambda size: cache_sizes.append(size) or object(),
+    )
+
+    runtime._configure_distributed_generation_mode()  # noqa: SLF001
+
+    assert runtime._provider.is_batchable is False  # noqa: SLF001
+    assert runtime._distributed_prompt_cache_size == 0  # noqa: SLF001
+    assert cache_sizes == [0]
+
+
+def test_glm_jaccl_warmup_does_not_reenable_prompt_cache(tmp_path):
+    model = tmp_path / "GLM-5.2-mxfp4"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps({"model_type": "glm_moe_dsa"}),
+        encoding="utf-8",
+    )
+    runtime = TokenityDistributedRuntime(
+        model=str(model),
+        state=ReadinessState(model=str(model), connection_mode="jaccl"),
+    )
+    runtime._provider = SimpleNamespace(is_batchable=True)  # noqa: SLF001
+    runtime._generator = SimpleNamespace(prompt_cache=object())  # noqa: SLF001
+    cache_sizes = []
+    runtime._symbols = SimpleNamespace(  # noqa: SLF001
+        LRUPromptCache=lambda size: cache_sizes.append(size) or object(),
+    )
+    runtime._configure_distributed_generation_mode()  # noqa: SLF001
+    context = SimpleNamespace(stop=lambda: None)
+    runtime._begin_distributed_generation = (  # type: ignore[method-assign]  # noqa: SLF001
+        lambda _request: (context, iter([SimpleNamespace(text="OK")]))
+    )
+
+    runtime._warmup_distributed()  # noqa: SLF001
+
+    assert cache_sizes == [0, 0]
+
+
+def test_jaccl_post_load_barrier_uses_multi_element_cpu_collective():
+    source = inspect.getsource(_install_chunked_sharded_load)
+
+    assert "mx.ones(10)" in source
+    assert "stream=mx.cpu" in source
+    assert "_should_run_post_load_barrier(repo)" in source
+
+
+def test_glm_skips_redundant_jaccl_post_load_barrier(tmp_path, monkeypatch):
+    glm = tmp_path / "GLM-5.2-mxfp4"
+    qwen = tmp_path / "Qwen3.5-122B"
+    glm.mkdir()
+    qwen.mkdir()
+    (glm / "config.json").write_text(
+        json.dumps({"model_type": "glm_moe_dsa"}),
+        encoding="utf-8",
+    )
+    (qwen / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5_moe"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TOKENITY_MLX_LOAD_POST_BARRIER", "1")
+
+    assert _should_run_post_load_barrier(str(glm)) is False
+    assert _should_run_post_load_barrier(str(qwen)) is True
+
+    monkeypatch.setenv("TOKENITY_MLX_LOAD_POST_BARRIER", "0")
+    assert _should_run_post_load_barrier(str(qwen)) is False
+
+
+def test_jaccl_request_control_avoids_one_element_collectives():
+    source = inspect.getsource(_install_jaccl_server_control_collectives)
+
+    assert "mx.zeros((10,)" in source
+    assert "mx.full((10,)" in source
+    assert "stream=mx.cpu" in source
+    assert "all_sum(0)" not in source
+
+
+def test_jaccl_generation_worker_uses_local_synchronized_seed():
+    source = """\
+def _generate(self):
+    if self._is_distributed:
+        seed = mx.distributed.all_sum(mx.random.state[0]).view(mx.uint64).item()
+        mx.random.seed(seed)
+    while not self._stop:
+        pass
+"""
+
+    patched = _replace_jaccl_seed_collective(source, 12345)
+
+    assert "mx.random.seed(12345)" in patched
+    assert "mx.distributed.all_sum(mx.random.state[0])" not in patched
+
+
+def test_jaccl_seed_patch_rejects_unexpected_mlx_lm_source():
+    with pytest.raises(RuntimeError, match="pinned JACCL compatibility contract"):
+        _replace_jaccl_seed_collective("def _generate(self): pass", 12345)
 
 
 def test_runtime_rejects_qwen35_mtp_draft_checkpoint_before_mlx_init(tmp_path):

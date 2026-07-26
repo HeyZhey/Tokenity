@@ -153,7 +153,7 @@ final class MenuBarTests: XCTestCase {
     }
 
     func testStoppingServerCancelsStreamingGeneration() async throws {
-        var streamContinuation: AsyncThrowingStream<String, Error>.Continuation?
+        var streamContinuation: AsyncThrowingStream<ChatStreamEvent, Error>.Continuation?
         let store = TokenityStore(
             dataTransport: Self.successfulTransport,
             lineStreamTransport: { _ in

@@ -283,14 +283,122 @@ struct ProcessRole: Codable, Hashable, Identifiable {
     }
 }
 
+struct AgentModelInstanceSnapshot: Codable, Hashable, Identifiable {
+    var instanceID: String
+    var operationID: String?
+    var requestedModelID: String
+    var resolvedPath: String?
+    var modelRevision: String?
+    var executionMode: String?
+    var selectedNodes: [String]?
+    var worldSize: Int?
+    var connectionMode: String?
+    var coordinator: String?
+    var httpPort: Int?
+    var memoryReservationBytes: Int64?
+    var actualMemoryBytes: Int64?
+    var state: String
+    var activeRequestCount: Int?
+    var queuedRequestCount: Int?
+    var healthReady: Bool?
+    var healthIssues: [String]?
+    var healthSampledAt: Double?
+    var updatedAt: Double?
+    var deadline: Double?
+
+    var id: String { instanceID }
+
+    enum CodingKeys: String, CodingKey {
+        case state
+        case instanceID = "instance_id"
+        case operationID = "operation_id"
+        case requestedModelID = "requested_model_id"
+        case resolvedPath = "resolved_path"
+        case modelRevision = "model_revision"
+        case executionMode = "execution_mode"
+        case selectedNodes = "selected_nodes"
+        case worldSize = "world_size"
+        case connectionMode = "connection_mode"
+        case coordinator
+        case httpPort = "http_port"
+        case memoryReservationBytes = "memory_reservation_bytes"
+        case actualMemoryBytes = "actual_memory_bytes"
+        case activeRequestCount = "active_request_count"
+        case queuedRequestCount = "queued_request_count"
+        case healthReady = "health_ready"
+        case healthIssues = "health_issues"
+        case healthSampledAt = "health_sampled_at"
+        case updatedAt = "updated_at"
+        case deadline
+    }
+}
+
+struct GatewayModelRoute: Codable, Hashable, Identifiable {
+    var model: String
+    var instanceID: String
+    var modelRevision: String?
+    var executionMode: String?
+    var state: String
+    var activeRequestCount: Int?
+    var queueDepth: Int?
+    var apiBaseURL: String?
+    var capabilities: GatewayRouteCapabilities?
+    var warmTTFTP50Milliseconds: Double?
+    var warmTTFTP95Milliseconds: Double?
+
+    var id: String { instanceID }
+
+    enum CodingKeys: String, CodingKey {
+        case model, state
+        case instanceID = "instance_id"
+        case modelRevision = "model_revision"
+        case executionMode = "execution_mode"
+        case activeRequestCount = "active_request_count"
+        case queueDepth = "queue_depth"
+        case apiBaseURL = "api_base_url"
+        case capabilities
+        case warmTTFTP50Milliseconds = "warm_ttft_p50_ms"
+        case warmTTFTP95Milliseconds = "warm_ttft_p95_ms"
+    }
+}
+
+struct GatewayRouteCapabilities: Codable, Hashable {
+    var tools: Bool
+    var json: Bool
+    var thinking: Bool
+    var modalities: [String]
+    var taskTags: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case tools, json, thinking, modalities
+        case taskTags = "task_tags"
+    }
+
+    var displayLabels: [String] {
+        var labels = modalities.map { $0.capitalized }
+        if tools { labels.append("Tools") }
+        if json { labels.append("JSON") }
+        if thinking { labels.append("Thinking") }
+        labels.append(contentsOf: taskTags.map { "Task: \($0)" })
+        return Array(Set(labels)).sorted {
+            $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
+        }
+    }
+}
+
+struct GatewayRoutesResponse: Codable {
+    var data: [GatewayModelRoute]
+}
+
 struct NodeStatusResponse: Codable {
     var roles: [ProcessRole]
     var memory: MemoryStats?
     var clusterRuntime: ClusterRuntimeStatus?
     var clusterRuntimes: [ClusterRuntimeStatus]?
+    var instances: [AgentModelInstanceSnapshot]?
 
     enum CodingKeys: String, CodingKey {
-        case roles, memory
+        case roles, memory, instances
         case clusterRuntime = "cluster_runtime"
         case clusterRuntimes = "cluster_runtimes"
     }
@@ -376,6 +484,7 @@ struct NodeInfoResponse: Codable {
     var rdma: RDMAStatus
     var clusterRuntime: ClusterRuntimeStatus?
     var clusterRuntimes: [ClusterRuntimeStatus]?
+    var instances: [AgentModelInstanceSnapshot]?
 
     enum CodingKeys: String, CodingKey {
         case nodeID = "node_id"
@@ -390,7 +499,7 @@ struct NodeInfoResponse: Codable {
         case processRoles = "process_roles"
         case clusterRuntime = "cluster_runtime"
         case clusterRuntimes = "cluster_runtimes"
-        case memory
+        case memory, instances
     }
 }
 
@@ -500,6 +609,7 @@ struct TokenityNode: Identifiable, Hashable {
     var agentError: String? = nil
     var consecutiveAgentFailures: Int = 0
     var runtimeMemory: RuntimeMemoryStats? = nil
+    var modelInstances: [AgentModelInstanceSnapshot] = []
 
     var displayName: String {
         if agentURL.contains("192.168.5.23") || (user == "apple" && hostname.localizedCaseInsensitiveContains("Mac")) {
@@ -857,6 +967,56 @@ enum ChatGenerationState: String, Codable, Hashable {
     }
 }
 
+enum ChatRoutePolicy: String, CaseIterable, Codable, Hashable, Identifiable {
+    case fast
+    case balanced
+    case quality
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .fast: return "Speed"
+        case .balanced: return "Balanced"
+        case .quality: return "Quality"
+        }
+    }
+}
+
+struct ChatRouteMetadata: Codable, Hashable {
+    var routedModelID: String?
+    var modelRevision: String?
+    var instanceID: String?
+    var routeReason: String?
+    var confidence: Double?
+    var routingLatencyMilliseconds: Double?
+    var queueWaitMilliseconds: Double?
+    var requestID: String?
+
+    static let empty = ChatRouteMetadata()
+}
+
+struct ChatStreamResponseMetadata: Hashable {
+    var statusCode: Int
+    var contentType: String?
+    var route: ChatRouteMetadata
+}
+
+enum ChatStreamEvent: ExpressibleByStringLiteral {
+    case response(ChatStreamResponseMetadata)
+    case line(String)
+
+    init(stringLiteral value: String) {
+        self = .line(value)
+    }
+}
+
+enum ChatRoutingState: Equatable {
+    case idle
+    case selecting
+    case routed(ChatRouteMetadata)
+}
+
 struct ChatMessage: Identifiable, Codable, Hashable {
     let id: UUID
     var role: ChatRole
@@ -870,6 +1030,14 @@ struct ChatMessage: Identifiable, Codable, Hashable {
     var reasoningDurationSeconds: Double?
     var reasoningTokenCount: Int?
     var modelName: String?
+    var routedModelID: String?
+    var modelRevision: String?
+    var instanceID: String?
+    var routeReason: String?
+    var routeConfidence: Double?
+    var routingLatencyMilliseconds: Double?
+    var queueWaitMilliseconds: Double?
+    var requestID: String?
 
     init(
         id: UUID = UUID(),
@@ -883,7 +1051,15 @@ struct ChatMessage: Identifiable, Codable, Hashable {
         metrics: ChatMetrics? = nil,
         reasoningDurationSeconds: Double? = nil,
         reasoningTokenCount: Int? = nil,
-        modelName: String? = nil
+        modelName: String? = nil,
+        routedModelID: String? = nil,
+        modelRevision: String? = nil,
+        instanceID: String? = nil,
+        routeReason: String? = nil,
+        routeConfidence: Double? = nil,
+        routingLatencyMilliseconds: Double? = nil,
+        queueWaitMilliseconds: Double? = nil,
+        requestID: String? = nil
     ) {
         self.id = id
         self.role = role
@@ -897,6 +1073,14 @@ struct ChatMessage: Identifiable, Codable, Hashable {
         self.reasoningDurationSeconds = reasoningDurationSeconds
         self.reasoningTokenCount = reasoningTokenCount
         self.modelName = modelName
+        self.routedModelID = routedModelID
+        self.modelRevision = modelRevision
+        self.instanceID = instanceID
+        self.routeReason = routeReason
+        self.routeConfidence = routeConfidence
+        self.routingLatencyMilliseconds = routingLatencyMilliseconds
+        self.queueWaitMilliseconds = queueWaitMilliseconds
+        self.requestID = requestID
     }
 }
 
@@ -917,6 +1101,9 @@ struct ChatSession: Identifiable, Codable, Hashable {
     var messages: [ChatMessage]
     var metrics: ChatMetrics
     var titleWasEdited: Bool?
+    var selectedModelID: String?
+    var routePolicy: ChatRoutePolicy?
+    var locksModel: Bool?
 
     static func fresh(id: UUID = UUID(), now: Date = Date()) -> ChatSession {
         ChatSession(
@@ -926,7 +1113,10 @@ struct ChatSession: Identifiable, Codable, Hashable {
             updatedAt: now,
             messages: [],
             metrics: .empty,
-            titleWasEdited: false
+            titleWasEdited: false,
+            selectedModelID: "tokenity-auto",
+            routePolicy: .balanced,
+            locksModel: false
         )
     }
 
@@ -965,6 +1155,10 @@ struct OpenAIChatRequest: Encodable {
     var presencePenalty: Double? = nil
     var repetitionPenalty: Double? = nil
     var chatTemplateKwargs: [String: Bool]? = nil
+    var tokenityRoutePolicy: String? = nil
+    var tokenitySessionID: String? = nil
+    var tokenityLockModel: Bool? = nil
+    var tokenityConstraints: [String: JSONValue]? = nil
 
     enum CodingKeys: String, CodingKey {
         case model, messages, stream, temperature
@@ -975,6 +1169,54 @@ struct OpenAIChatRequest: Encodable {
         case presencePenalty = "presence_penalty"
         case repetitionPenalty = "repetition_penalty"
         case chatTemplateKwargs = "chat_template_kwargs"
+        case tokenityRoutePolicy = "tokenity_route_policy"
+        case tokenitySessionID = "tokenity_session_id"
+        case tokenityLockModel = "tokenity_lock_model"
+        case tokenityConstraints = "tokenity_constraints"
+    }
+}
+
+enum JSONValue: Encodable, Hashable {
+    case string(String)
+    case bool(Bool)
+    case integer(Int)
+    case strings([String])
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .string(let value): try container.encode(value)
+        case .bool(let value): try container.encode(value)
+        case .integer(let value): try container.encode(value)
+        case .strings(let value): try container.encode(value)
+        }
+    }
+}
+
+struct ResidentModelInstanceSummary: Identifiable, Hashable {
+    var id: String
+    var modelID: String
+    var modelRevision: String?
+    var state: String
+    var activeRequestCount: Int
+    var queueDepth: Int
+    var selectedNodes: [String]
+    var executionMode: String?
+    var connectionMode: String?
+    var reservedMemoryBytes: Int64?
+    var actualMemoryBytes: Int64?
+    var capabilities: [String]
+    var warmTTFTP50Milliseconds: Double?
+    var warmTTFTP95Milliseconds: Double?
+    var allowsAuto: Bool
+    var keepsResident: Bool
+    var healthIssue: String?
+    var isRoutable: Bool
+
+    var isReady: Bool { isRoutable && state.lowercased() == "ready" }
+    var isBusy: Bool { isRoutable && state.lowercased() == "busy" }
+    var displayState: String {
+        isRoutable ? state.capitalized : "Unavailable"
     }
 }
 

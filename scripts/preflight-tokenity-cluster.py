@@ -71,8 +71,8 @@ def evaluate_node(
     issues: list[str] = []
     if info.get("python_path") != python_path:
         issues.append(f"Runtime Python mismatch: {info.get('python_path') or 'unknown'}")
-    if info.get("mlx_version") != "0.31.2":
-        issues.append(f"mlx 0.31.2 required: {info.get('mlx_version') or 'unknown'}")
+    if info.get("mlx_version") != "0.32.0":
+        issues.append(f"mlx 0.32.0 required: {info.get('mlx_version') or 'unknown'}")
     if version_release(info.get("mlx_lm_version")) < (0, 31, 3):
         issues.append(f"mlx-lm >= 0.31.3 required: {info.get('mlx_lm_version') or 'unknown'}")
     if info.get("architecture") not in {"arm64", "arm64e"}:

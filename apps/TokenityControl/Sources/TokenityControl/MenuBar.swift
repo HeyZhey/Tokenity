@@ -59,6 +59,7 @@ struct TokenityMenuBarSnapshot: Equatable {
     var serverDetail: String?
     var listenAddress: String
     var modelName: String
+    var routingHealth: String
     var inferenceMode: String
     var nativeMTP: String
     var isGenerating: Bool
@@ -139,7 +140,8 @@ extension TokenityStore {
             serverStatus: serverStatus,
             serverDetail: firstIssue ?? serverHealth.detailForMenu ?? compatibilityNotice,
             listenAddress: openAIAPIBaseURL.replacingOccurrences(of: "/v1", with: ""),
-            modelName: selectedModelName,
+            modelName: residentRoutingSummary,
+            routingHealth: autoRouterHealthText,
             inferenceMode: menuBarInferenceMode,
             nativeMTP: menuBarNativeMTPName,
             isGenerating: isChatRunning,
@@ -390,11 +392,54 @@ struct TokenityMenuBarLabel: View, Equatable {
     let snapshot: TokenityMenuBarSnapshot
 
     var body: some View {
-        Image(systemName: snapshot.iconSymbol)
-            .symbolRenderingMode(.palette)
-            .foregroundStyle(snapshot.level.color)
+        TokenityMenuBarMark(level: snapshot.level)
             .help(snapshot.tooltip)
             .accessibilityLabel(snapshot.tooltip)
+    }
+}
+
+struct TokenityMenuBarMark: View {
+    let level: TokenityMenuBarLevel
+
+    private static let spokeCount = 10
+
+    var body: some View {
+        ZStack {
+            ZStack {
+                ForEach(0..<Self.spokeCount, id: \.self) { index in
+                    Capsule(style: .continuous)
+                        .frame(
+                            width: index.isMultiple(of: 2) ? 2.7 : 2.1,
+                            height: index.isMultiple(of: 2) ? 5.8 : 4.8
+                        )
+                        .offset(y: -5.8)
+                        .rotationEffect(
+                            .degrees(Double(index) * (360 / Double(Self.spokeCount)))
+                        )
+                }
+
+                RoundedRectangle(cornerRadius: 1.7, style: .continuous)
+                    .stroke(lineWidth: 1.25)
+                    .frame(width: 5.2, height: 5.2)
+
+                Circle()
+                    .frame(width: 1.7, height: 1.7)
+            }
+            .foregroundStyle(.primary)
+            .frame(width: 18, height: 18)
+            .accessibilityHidden(true)
+
+            Circle()
+                .fill(level.color)
+                .frame(width: 4.8, height: 4.8)
+                .overlay {
+                    Circle()
+                        .stroke(.background.opacity(0.9), lineWidth: 1)
+                }
+                .offset(x: 6.2, y: 6.0)
+                .accessibilityHidden(true)
+        }
+        .frame(width: 20, height: 19)
     }
 }
 
@@ -442,7 +487,7 @@ struct TokenityMenuBarContent: View, Equatable {
                 Text(detail)
             }
             Text("Listen: \(snapshot.listenAddress)")
-            Text("Model: \(snapshot.modelName)")
+            Text("Models: \(snapshot.modelName)")
             Text("Mode: \(snapshot.inferenceMode)")
             Text("Native MTP: \(snapshot.nativeMTP)")
             Text("Generation: \(snapshot.isGenerating ? "Generating" : "Idle")")

@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "base_url": "http://127.0.0.1:9100/v1",
+  "repeats": 5,
+  "timeout": 600,
+  "prompt_profiles": {
+    "short": {
+      "prompt": "Summarize unified memory in one sentence.",
+      "max_tokens": 64
+    },
+    "medium": {
+      "prompt": "Explain how unified memory affects model loading, prompt prefill, and token decoding on Apple Silicon. Include the main performance tradeoffs and keep the answer under six paragraphs.",
+      "max_tokens": 256
+    },
+    "long": {
+      "prompt": "You are reviewing a local Apple Silicon inference service. Analyze a design with two resident MLX language models, a deterministic capability-aware router, per-session stickiness, shared generation slots for overlapping nodes, and fallback only before response headers. Discuss correctness invariants, memory pressure, queueing, TTFT, prefill, decode throughput, cancellation, observability, and a practical validation plan. Be precise about which conclusions require real hardware measurements.",
+      "max_tokens": 512
+    }
+  },
+  "scenarios": [
+    {
+      "name": "strongest",
+      "mode": "strongest",
+      "model": "REPLACE_WITH_STRONGEST_MODEL_ID",
+      "concurrency": 1
+    },
+    {
+      "name": "fastest",
+      "mode": "fastest",
+      "model": "REPLACE_WITH_FASTEST_MODEL_ID",
+      "concurrency": 1
+    },
+    {
+      "name": "auto-balanced",
+      "mode": "auto",
+      "model": "tokenity-auto",
+      "route_policy": "balanced",
+      "concurrency": 1
+    },
+    {
+      "name": "resident-serial",
+      "mode": "resident-serial",
+      "models": [
+        "REPLACE_WITH_STRONGEST_MODEL_ID",
+        "REPLACE_WITH_FASTEST_MODEL_ID"
+      ],
+      "concurrency": 1
+    },
+    {
+      "name": "resident-concurrent",
+      "mode": "resident-concurrent",
+      "models": [
+        "REPLACE_WITH_STRONGEST_MODEL_ID",
+        "REPLACE_WITH_FASTEST_MODEL_ID"
+      ],
+      "concurrency": 2
+    }
+  ]
+}

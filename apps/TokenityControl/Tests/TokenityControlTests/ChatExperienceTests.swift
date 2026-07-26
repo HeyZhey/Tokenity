@@ -224,12 +224,12 @@ final class ChatExperienceStoreTests: XCTestCase {
     }
 
     func testUserStopMarksMessageAndRejectsLateTokens() async throws {
-        var streamContinuation: AsyncThrowingStream<String, Error>.Continuation?
+        var streamContinuation: AsyncThrowingStream<ChatStreamEvent, Error>.Continuation?
         let defaults = UserDefaults(suiteName: "ChatExperienceTests.\(UUID().uuidString)")!
         let store = TokenityStore(
             dataTransport: Self.successfulModelTransport,
             lineStreamTransport: { _ in
-                AsyncThrowingStream<String, Error> { continuation in
+                AsyncThrowingStream<ChatStreamEvent, Error> { continuation in
                     streamContinuation = continuation
                 }
             },
@@ -242,12 +242,12 @@ final class ChatExperienceStoreTests: XCTestCase {
         store.chatInput = "Stop this"
         store.beginSendingChatMessage()
         for _ in 0..<100 where streamContinuation == nil { await Task.yield() }
-        streamContinuation?.yield(Self.contentLine("partial"))
+        streamContinuation?.yield(.line(Self.contentLine("partial")))
         for _ in 0..<100 where !(store.chatMessages.last?.content.contains("partial") ?? false) { await Task.yield() }
 
         store.cancelChatGeneration()
         let stoppedContent = store.chatMessages.last?.content
-        streamContinuation?.yield(Self.contentLine("late"))
+        streamContinuation?.yield(.line(Self.contentLine("late")))
         streamContinuation?.finish()
         for _ in 0..<10 { await Task.yield() }
 
@@ -258,12 +258,12 @@ final class ChatExperienceStoreTests: XCTestCase {
     }
 
     func testMetricsRemainHiddenUntilStreamingAnswerFinishes() async throws {
-        var streamContinuation: AsyncThrowingStream<String, Error>.Continuation?
+        var streamContinuation: AsyncThrowingStream<ChatStreamEvent, Error>.Continuation?
         let defaults = UserDefaults(suiteName: "ChatExperienceTests.\(UUID().uuidString)")!
         let store = TokenityStore(
             dataTransport: Self.successfulModelTransport,
             lineStreamTransport: { _ in
-                AsyncThrowingStream<String, Error> { continuation in
+                AsyncThrowingStream<ChatStreamEvent, Error> { continuation in
                     streamContinuation = continuation
                 }
             },
@@ -277,7 +277,7 @@ final class ChatExperienceStoreTests: XCTestCase {
         store.beginSendingChatMessage()
         for _ in 0..<100 where streamContinuation == nil { await Task.yield() }
 
-        streamContinuation?.yield(Self.contentLine("first token"))
+        streamContinuation?.yield(.line(Self.contentLine("first token")))
         for _ in 0..<100 where store.chatMessages.last?.content != "first token" { await Task.yield() }
         XCTAssertNil(store.chatMessages.last?.metrics)
         XCTAssertEqual(store.chatMetrics, .empty)
@@ -365,9 +365,9 @@ final class ChatExperienceStoreTests: XCTestCase {
         let store = TokenityStore(
             dataTransport: Self.successfulModelTransport,
             lineStreamTransport: { _ in
-                AsyncThrowingStream<String, Error> { continuation in
+                AsyncThrowingStream<ChatStreamEvent, Error> { continuation in
                     for line in lines {
-                        continuation.yield(line)
+                        continuation.yield(.line(line))
                     }
                     continuation.finish()
                 }
