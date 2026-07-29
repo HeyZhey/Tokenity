@@ -240,6 +240,118 @@ final class ResidentModelRecoveryTests: XCTestCase {
         XCTAssertEqual(store.activeModelInstanceID, instanceID)
     }
 
+    func testSecondResidentLoadPreservesNewServiceWhileRefreshSnapshotStillOmitsIt() async throws {
+        let existingModelID = "Qwen3.5-122B-A10B-4bit"
+        let existingInstance = Self.instanceJSON(
+            id: "instance-existing",
+            model: existingModelID,
+            state: "ready",
+            port: 18_000
+        )
+        var loadingInstanceID = ""
+        var loadingModelID = ""
+        var started = false
+        var stoppedInstanceIDs: [String] = []
+        let store = TokenityStore(
+            dataTransport: { request in
+                let path = request.url?.path ?? ""
+                if path == "/v1/node/info" {
+                    // A real background poll can race the coordinator start
+                    // response and still contain only the already-ready GLM
+                    // snapshot. It must not switch the active service back to
+                    // the old model while the new Qwen load is being probed.
+                    return Self.response(
+                        for: request,
+                        payload: Self.nodeInfoPayload(
+                            for: request,
+                            instances: [existingInstance]
+                        )
+                    )
+                }
+                if path == "/v1/gateway/routes" {
+                    return Self.response(
+                        for: request,
+                        payload: Self.routesPayload(instances: [existingInstance])
+                    )
+                }
+                if path == "/v1/node/start-distributed-openai" {
+                    let body = try XCTUnwrap(request.httpBody)
+                    let object = try XCTUnwrap(
+                        JSONSerialization.jsonObject(with: body) as? [String: Any]
+                    )
+                    loadingModelID = URL(
+                        fileURLWithPath: try XCTUnwrap(object["model"] as? String)
+                    ).lastPathComponent
+                    loadingInstanceID = try XCTUnwrap(object["instance_id"] as? String)
+                    started = true
+                    return Self.response(
+                        for: request,
+                        payload: """
+                        {"instance_id":"\(loadingInstanceID)","operation_id":"operation-second","api_base_url":"http://192.168.5.23:18001/v1"}
+                        """
+                    )
+                }
+                if path == "/v1/models", request.url?.port == 18_001 {
+                    return Self.response(
+                        for: request,
+                        payload: #"{"detail":"Loading model across MLX ranks."}"#,
+                        statusCode: 503
+                    )
+                }
+                if path == "/v1/readiness", request.url?.port == 18_001 {
+                    return Self.response(
+                        for: request,
+                        payload: #"{"phase":"loading_model","progress":0.4}"#
+                    )
+                }
+                if path.hasPrefix("/v1/node/instances/"), path.hasSuffix("/stop") {
+                    stoppedInstanceIDs.append(Self.instanceID(from: path))
+                    return Self.response(for: request, payload: #"{"status":"stopped"}"#)
+                }
+                if path.hasSuffix("/quorum") {
+                    return Self.response(
+                        for: request,
+                        payload: Self.quorumPayload(
+                            instanceID: Self.instanceID(from: path),
+                            ready: true
+                        )
+                    )
+                }
+                if path == "/v1/node/heartbeat" {
+                    return Self.response(for: request, payload: #"{"status":"ok"}"#)
+                }
+                return Self.response(for: request, payload: #"{}"#)
+            },
+            userDefaults: Self.freshDefaults()
+        )
+        store.connectionMode = .ring
+        Self.addSecondModel(to: store)
+
+        await store.refreshSelectedNodeStatus()
+        XCTAssertEqual(store.activeModelInstanceID, "instance-existing")
+        let second = try XCTUnwrap(
+            store.modelLibraryRows.first { $0.id == "SecondModel" }
+        )
+
+        let loadTask = Task { await store.loadModel(second) }
+        for _ in 0..<100 where !started || store.activeModelInstanceID != loadingInstanceID {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(loadingModelID, second.id)
+        XCTAssertEqual(store.activeModelInstanceID, loadingInstanceID)
+
+        await store.refreshSelectedNodeStatus(showsActivity: false)
+
+        XCTAssertEqual(
+            store.activeModelInstanceID,
+            loadingInstanceID,
+            "A stale resident snapshot must not redirect the new model probe to the existing model service."
+        )
+        loadTask.cancel()
+        await loadTask.value
+        XCTAssertEqual(stoppedInstanceIDs, [loadingInstanceID])
+    }
+
     func testSecondResidentLoadIsBlockedWhenAnySelectedAgentLacksCapability() async throws {
         var startedInstances: [(id: String, model: String, port: Int)] = []
         var startCount = 0

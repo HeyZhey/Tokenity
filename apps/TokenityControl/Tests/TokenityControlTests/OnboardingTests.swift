@@ -5,6 +5,18 @@ import XCTest
 
 @MainActor
 final class OnboardingTests: XCTestCase {
+    func testAppDelegatePreparesGuideBeforeTheFirstWindowIsBuilt() {
+        let suiteName = "OnboardingTests.delegate.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = TokenityStore(userDefaults: defaults)
+
+        XCTAssertFalse(store.isOnboardingPresented)
+        _ = TokenityAppDelegate(store: store)
+
+        XCTAssertTrue(store.isOnboardingPresented)
+    }
+
     func testFirstLaunchPresentsGuideAndCompletionPersists() {
         let suiteName = "OnboardingTests.persistence.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -36,6 +48,47 @@ final class OnboardingTests: XCTestCase {
         store.presentOnboarding()
 
         XCTAssertTrue(store.isOnboardingPresented)
+    }
+
+    func testMainWindowDismissesAndReopensGuideWhenStorePresentationChanges() {
+        let suiteName = "OnboardingTests.window-presentation.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = TokenityStore(userDefaults: defaults)
+        store.prepareForAppLaunch()
+
+        let hostingController = NSHostingController(
+            rootView: TokenityMainWindowView(store: store)
+        )
+        let window = NSWindow(contentViewController: hostingController)
+        window.isReleasedWhenClosed = false
+        window.setContentSize(NSSize(width: 1_280, height: 820))
+        window.makeKeyAndOrderFront(nil)
+        defer {
+            store.completeOnboarding()
+            _ = waitUntil { window.attachedSheet == nil }
+            window.close()
+        }
+
+        XCTAssertTrue(
+            waitUntil { window.attachedSheet != nil },
+            "The first-launch guide should be attached to the observed main window."
+        )
+
+        store.completeOnboarding(opening: .cluster)
+
+        XCTAssertTrue(
+            waitUntil { window.attachedSheet == nil },
+            "Completing the guide should dismiss its real SwiftUI sheet."
+        )
+        XCTAssertEqual(store.selectedSection, .cluster)
+
+        store.presentOnboarding()
+
+        XCTAssertTrue(
+            waitUntil { window.attachedSheet != nil },
+            "Settings and Help should be able to present the guide again."
+        )
     }
 
     func testEveryGuidePageRendersInLightAndDarkAppearances() throws {
@@ -70,5 +123,22 @@ final class OnboardingTests: XCTestCase {
                 XCTAssertGreaterThan(data.count, 10_000)
             }
         }
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 2,
+        condition: () -> Bool
+    ) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() {
+                return true
+            }
+            _ = RunLoop.main.run(
+                mode: .default,
+                before: Date().addingTimeInterval(0.01)
+            )
+        }
+        return condition()
     }
 }

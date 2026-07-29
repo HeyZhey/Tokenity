@@ -1,136 +1,220 @@
-# Tokenity Drag-Install DMG
+# Tokenity Installer and Runtime Distribution
 
-Build from the Stable source of truth:
+Tokenity ships two components:
+
+- `TokenityControl.app`, installed by dragging it to Applications.
+- A privileged Node Agent and MLX Runtime package, installed locally with
+  Installer.app on every Mac that will execute model ranks.
+
+The application never uses SSH to install software on another Mac. A new Mac
+does not yet have a trusted Node Agent, so its first privileged installation
+must be approved locally by an administrator.
+
+## Runtime identity
+
+The release lock is:
+
+```text
+packaging/runtime/runtime-lock.json
+```
+
+Runtime `2026.07.26.1` pins:
+
+| Component | Value |
+| --- | --- |
+| Platform | macOS / arm64 |
+| Minimum macOS | 26.2 |
+| CPython | 3.12.13 |
+| MLX | 0.32.0 |
+| MLX-LM | 0.31.3 |
+| FastAPI | 0.139.0 |
+| Uvicorn | 0.50.2 |
+
+The macOS requirement is not an arbitrary app setting. The validated
+`mlx/core`, `libmlx.dylib`, and `libjaccl.dylib` binaries report `minos 26.2`.
+Supporting macOS 14 requires rebuilding those binaries with a lower deployment
+target and validating them on that OS.
+
+## Importing the validated Runtime
+
+The importer accepts local paths or rsync-style SSH sources. It copies both
+sources into isolated staging directories, removes machine-specific editable
+installs and caches, normalizes symlinks and entry-point shebangs, validates
+the pinned versions and arm64 Mach-O files, and compares deterministic tree
+identities.
+
+For the validated Mango/Kiwi cluster:
 
 ```bash
 cd /Users/zxc/Documents/Tokenity-Stable
+./scripts/import-tokenity-runtime.sh \
+  apple@192.168.5.23:/Users/Shared/TokenityRuntime \
+  probriefing@192.168.5.75:/Users/Shared/TokenityRuntime
+```
+
+Only one canonical copy is retained at:
+
+```text
+dist/runtime-cache/TokenityRuntime
+```
+
+Mac A and Mac B are verification peers; their directories are never merged.
+The normalized Runtime contains `runtime-manifest.json`, including its
+deterministic tree SHA-256. The manifest excludes itself from the tree digest.
+
+## Building the full offline DMG
+
+After importing the Runtime:
+
+```bash
 ./scripts/package-tokenity-dmg.sh
 ```
 
-The build always produces:
+The default mode is `required`. A release build fails instead of silently
+producing a controller-only image when the Runtime is absent or invalid.
+
+Outputs:
 
 ```text
 dist/Tokenity-0.1.0.dmg
 dist/Tokenity-0.1.0.dmg.sha256
+dist/Tokenity-NodeAgent-Runtime-2026.07.26.1-macos-arm64.pkg
+dist/Tokenity-NodeAgent-Runtime-2026.07.26.1-macos-arm64.pkg.sha256
+dist/Tokenity-RuntimeCatalog-2026.07.26.1.json
 ```
 
-The mounted DMG uses the conventional macOS layout:
+Mounted layout:
 
 ```text
 TokenityControl.app
 Applications -> /Applications
+Install Tokenity Node Agent.pkg
+Runtime Catalog.json
+Runtime Installer.sha256
 README.txt
 ```
 
-Users install the control app by dragging `TokenityControl.app` onto
-`Applications`.
+The visible pkg is a relative symlink to the exact same pkg embedded under the
+app's `Contents/Resources`. This avoids duplicate payload bytes and means the
+installer is still available after the app is copied to Applications.
 
-## Control App And Node Agent
+## First installation
 
-Tokenity separates the unprivileged control app from the privileged inference
-service:
+On every Mac that will execute models:
 
-- `TokenityControl.app` is always present and is installed by dragging.
-- When a runtime source is available, the DMG also contains
-  `Install Tokenity Node Agent.pkg`.
-- The Node Agent package should be run on every Mac that will execute model
-  ranks. It installs `/Users/Shared/TokenityCode`,
-  `/Users/Shared/TokenityRuntime`, `/Users/Shared/TokenityModels`, and
-  `/Library/LaunchDaemons/ai.tokenity.node-agent.plist`.
+1. Open the full DMG.
+2. Drag `TokenityControl.app` to Applications on the controller Mac.
+3. Open `Install Tokenity Node Agent.pkg`.
+4. Approve the installation in Installer.app.
+5. Place compatible MLX model folders under
+   `/Users/Shared/TokenityModels`.
+6. Open Tokenity and confirm each Node Agent is reachable on port `9100`.
 
-The package starts Node Agent on port `9100` as a launchd-managed service for
-the current console user. The app and Agents coordinate ranks over typed HTTP;
-product startup does not use SSH.
+The first-launch guide locates and verifies the embedded package. It never
+invokes `sudo` or bypasses Installer.app.
 
-For the current known Mac A and Mac B LAN addresses, the postinstall script also installs and starts Thunderbolt keepalive:
+## Online Runtime fallback
 
-- Mac A LAN address detected: configures `en4`, `192.168.0.1`, peer `192.168.0.2`
-- Mac B LAN address detected: configures `en5`, `192.168.0.2`, peer `192.168.0.1`
+The packaged app contains a fixed `RuntimeCatalog.json`. It records the exact:
 
-Other Macs still get the backend code, runtime, and Node Agent. They do not get
-a Thunderbolt keepalive configuration unless the installer script is extended
-for their LAN/RDMA layout.
+- Runtime ID and compatibility requirements
+- package filename and package identifier
+- byte size
+- SHA-256
+- HTTPS release URL
 
-## Node Agent Package Modes
+If the package is not embedded, Tokenity downloads that exact artifact to its
+user cache, verifies size and SHA-256, and only then opens Installer.app.
+Tokenity does not use a mutable `latest` URL.
+
+The catalog currently points to:
+
+```text
+https://github.com/HeyZhey/Tokenity/releases/download/runtime-2026.07.26.1/
+```
+
+Before distributing a thin/controller-only build, publish the pkg at the URL
+recorded in the catalog. The offline DMG does not depend on that URL.
+
+`TOKENITY_RUNTIME_DOWNLOAD_BASE_URL` can select another immutable HTTPS
+location when packaging:
+
+```bash
+TOKENITY_RUNTIME_DOWNLOAD_BASE_URL=https://downloads.example.com/tokenity/runtime-2026.07.26.1 \
+./scripts/package-tokenity-dmg.sh
+```
+
+The online and offline paths must use the same pkg bytes and SHA-256.
+
+## Package modes
 
 `TOKENITY_NODE_AGENT_PACKAGE` accepts:
 
-- `auto` (default): include the package when a runtime source/cache exists;
-  otherwise build a controller-only DMG.
-- `required`: fail unless the Node Agent runtime can be included.
-- `skip`: intentionally build a controller-only DMG.
+- `required` (default): build a full release DMG or fail.
+- `auto`: include the package when a valid Runtime exists.
+- `skip`: intentionally build a thin controller-only DMG.
 
-To require a complete cluster DMG:
+Use `skip` only when the immutable catalog artifact has already been published.
 
-```bash
-TOKENITY_NODE_AGENT_PACKAGE=required \
-TOKENITY_RUNTIME_SOURCE=/path/to/TokenityRuntime \
-./scripts/package-tokenity-dmg.sh
-```
-
-When included, the additional standalone output is:
+## What the Node Agent package installs
 
 ```text
-dist/Tokenity-NodeAgent-Runtime-0.1.0.pkg
-```
-
-Runtime cache and temporary build outputs are under `dist/`, which is
-git-ignored.
-
-## Model Weights
-
-The default DMG does not include model weights. Compatible MLX model folders
-belong under:
-
-```text
+/Users/Shared/TokenityCode
+/Users/Shared/TokenityRuntime
 /Users/Shared/TokenityModels
+/Library/LaunchDaemons/ai.tokenity.node-agent.plist
 ```
 
-To build a very large offline installer that includes model weights:
+The preinstall script:
+
+- rejects Intel Macs
+- rejects macOS older than the Runtime minimum
+- checks free disk space
+- asks an existing Agent to stop model ranks
+- refuses to overwrite a still-running inference process
+
+The postinstall script:
+
+- makes the model directory writable by the console user
+- imports MLX, MLX-LM and Tokenity
+- initializes a small MLX array
+- starts the launchd-managed Node Agent on port `9100`
+
+## Model weights
+
+Model weights are not included by default. To build a very large offline image:
 
 ```bash
-TOKENITY_NODE_AGENT_PACKAGE=required \
 TOKENITY_INCLUDE_MODEL=1 \
+TOKENITY_MODEL_SOURCE=/path/to/model \
 ./scripts/package-tokenity-dmg.sh
 ```
 
-Set `TOKENITY_MODEL_SOURCE` when the weights are in another local directory.
+## Signing status
 
-## Signing Note
+The current app is ad-hoc signed and the pkg is unsigned. This is suitable for
+internal validation only. Public distribution still requires:
 
-The app bundle is ad-hoc signed so its resources are sealed locally. The
-current build machine has no Developer ID identities configured.
+- Developer ID Application signing
+- Developer ID Installer signing
+- notarization and stapling of the final DMG
 
-The optional Node Agent package is not Developer ID signed because no Developer
-ID Installer certificate is configured on this machine. It is suitable as a
-local/internal installer, but Gatekeeper signature verification reports:
+SHA-256 detects corruption; it does not replace publisher identity signing.
 
-```text
-Status: no signature
-```
-
-For public distribution, sign the app and package with the relevant Developer
-ID certificates and notarize the final DMG.
-
-## Verification Commands
-
-Mount-check the DMG and verify the drag-install layout:
+## Verification
 
 ```bash
-hdiutil attach -readonly -nobrowse \
-  /Users/zxc/Documents/Tokenity-Stable/dist/Tokenity-0.1.0.dmg
-ls -la "/Volumes/Tokenity 0.1.0"
-```
-
-When the Node Agent package is present, check its payload:
-
-```bash
+hdiutil verify dist/Tokenity-0.1.0.dmg
+./scripts/tokenity-runtime-manifest.py verify-artifact \
+  --catalog dist/Tokenity-RuntimeCatalog-2026.07.26.1.json \
+  --artifact dist/Tokenity-NodeAgent-Runtime-2026.07.26.1-macos-arm64.pkg
+pkgutil --check-signature \
+  dist/Tokenity-NodeAgent-Runtime-2026.07.26.1-macos-arm64.pkg
 pkgutil --payload-files \
-  /Users/zxc/Documents/Tokenity-Stable/dist/Tokenity-NodeAgent-Runtime-0.1.0.pkg \
-  | egrep 'TokenityCode/tokenity|TokenityRuntime/current|ai.tokenity.node-agent.plist'
+  dist/Tokenity-NodeAgent-Runtime-2026.07.26.1-macos-arm64.pkg
 ```
 
-After installing on a Mac:
+After installing on a compatible test Mac:
 
 ```bash
 curl --noproxy "*" -sS http://127.0.0.1:9100/v1/node/info

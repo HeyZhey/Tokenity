@@ -31,6 +31,7 @@ struct TokenityOnboardingView: View {
     @EnvironmentObject private var store: TokenityStore
     @Environment(\.tokenityTheme) private var theme
     @State private var page: TokenityOnboardingPage = .welcome
+    @StateObject private var runtimeBootstrap = TokenityRuntimeBootstrapModel()
 
     init(initialPage: TokenityOnboardingPage = .welcome) {
         _page = State(initialValue: initialPage)
@@ -54,6 +55,9 @@ struct TokenityOnboardingView: View {
         .background(theme.window)
         .interactiveDismissDisabled()
         .accessibilityIdentifier("tokenity.onboarding")
+        .task {
+            await runtimeBootstrap.refresh()
+        }
     }
 
     private var header: some View {
@@ -167,7 +171,7 @@ struct TokenityOnboardingView: View {
             OnboardingInstruction(
                 number: 2,
                 title: "Install the Node Agent on every inference Mac",
-                detail: "Run “Install Tokenity Node Agent.pkg” when it is included in the DMG. It installs the shared runtime and starts the local service on port 9100.",
+                detail: "Open the verified Runtime installer included with Tokenity. Installer.app requests administrator approval, installs the Node Agent, and starts its local service on port 9100.",
                 symbol: "shippingbox"
             )
             OnboardingInstruction(
@@ -177,8 +181,52 @@ struct TokenityOnboardingView: View {
                 symbol: "externaldrive"
             )
 
+            HStack(spacing: 14) {
+                Image(
+                    systemName: runtimeBootstrap.hasFailed
+                        ? "exclamationmark.triangle.fill"
+                        : "shippingbox.fill"
+                )
+                .font(.system(size: 21, weight: .medium))
+                .foregroundStyle(
+                    runtimeBootstrap.hasFailed || runtimeBootstrap.state == .downloadAvailable
+                        ? theme.warning
+                        : theme.accent
+                )
+                .frame(width: 28)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(runtimeBootstrap.title)
+                        .font(.tokenityText(13, weight: .semibold))
+                        .foregroundStyle(theme.text)
+                    Text(runtimeBootstrap.detail)
+                        .font(.tokenityText(11))
+                        .foregroundStyle(theme.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer()
+
+                if runtimeBootstrap.isBusy {
+                    ProgressView()
+                        .controlSize(.small)
+                } else if let actionTitle = runtimeBootstrap.actionTitle {
+                    Button(actionTitle) {
+                        runtimeBootstrap.performPrimaryAction()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+            }
+            .padding(13)
+            .background(theme.group, in: RoundedRectangle(cornerRadius: 10))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(theme.border.opacity(0.8), lineWidth: 0.5)
+            )
+
             Label(
-                "For multi-Mac inference, keep the Macs on the same trusted LAN. Thunderbolt RDMA is optional but recommended for the validated two-Mac setup.",
+                "The bundled Runtime is for Apple silicon and currently requires macOS 26.2 or newer. For multi-Mac inference, run the same installer locally on every participating Mac.",
                 systemImage: "info.circle"
             )
             .font(.tokenityText(12))
@@ -306,10 +354,12 @@ struct TokenityOnboardingView: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(theme.secondaryText)
+                .accessibilityIdentifier("tokenity.onboarding.skip")
             } else {
                 Button("Back") {
                     move(by: -1)
                 }
+                .accessibilityIdentifier("tokenity.onboarding.back")
             }
 
             if page == .ready {
@@ -318,12 +368,14 @@ struct TokenityOnboardingView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
+                .accessibilityIdentifier("tokenity.onboarding.open-cluster")
             } else {
                 Button("Continue") {
                     move(by: 1)
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
+                .accessibilityIdentifier("tokenity.onboarding.continue")
             }
         }
         .padding(.horizontal, 28)

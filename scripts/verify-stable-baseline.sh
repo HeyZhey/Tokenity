@@ -13,6 +13,8 @@ echo "Checking consolidated distributed backend..."
 
 echo "Checking installer scripts..."
 bash -n "$ROOT/scripts/package-tokenity-dmg.sh"
+bash -n "$ROOT/scripts/import-tokenity-runtime.sh"
+"${PYTHON_BIN:-python3}" -m py_compile "$ROOT/scripts/tokenity-runtime-manifest.py"
 
 echo "Running Python tests..."
 "$PYTHON" -m pytest -q "$ROOT/tests"

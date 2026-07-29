@@ -7,25 +7,7 @@ struct TokenityControlApp: App {
 
     var body: some Scene {
         Window("Tokenity", id: "main") {
-            TokenityRootView()
-                .environmentObject(appDelegate.store)
-                .tokenityThemed()
-                .sheet(
-                    isPresented: Binding(
-                        get: { appDelegate.store.isOnboardingPresented },
-                        set: { isPresented in
-                            if isPresented {
-                                appDelegate.store.presentOnboarding()
-                            } else {
-                                appDelegate.store.completeOnboarding()
-                            }
-                        }
-                    )
-                ) {
-                    TokenityOnboardingView()
-                        .environmentObject(appDelegate.store)
-                        .tokenityThemed()
-                }
+            TokenityMainWindowView(store: appDelegate.store)
         }
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentSize)
@@ -46,13 +28,50 @@ struct TokenityControlApp: App {
     }
 }
 
+struct TokenityMainWindowView: View {
+    @ObservedObject var store: TokenityStore
+
+    var body: some View {
+        TokenityRootView()
+            .environmentObject(store)
+            .tokenityThemed()
+            .sheet(isPresented: onboardingPresentation) {
+                TokenityOnboardingView()
+                    .environmentObject(store)
+                    .tokenityThemed()
+            }
+    }
+
+    private var onboardingPresentation: Binding<Bool> {
+        Binding(
+            get: { store.isOnboardingPresented },
+            set: { isPresented in
+                if isPresented {
+                    store.presentOnboarding()
+                } else {
+                    store.completeOnboarding()
+                }
+            }
+        )
+    }
+}
+
 @MainActor
 final class TokenityAppDelegate: NSObject, NSApplicationDelegate {
-    let store = TokenityStore(loadsChatHistorySynchronously: false)
+    let store: TokenityStore
     private var terminationInProgress = false
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
+    init(store: TokenityStore) {
+        self.store = store
         store.prepareForAppLaunch()
+        super.init()
+    }
+
+    override convenience init() {
+        self.init(store: TokenityStore(loadsChatHistorySynchronously: false))
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
         store.startStatusMonitoring()
     }
 

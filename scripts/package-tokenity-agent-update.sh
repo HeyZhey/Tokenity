@@ -11,6 +11,15 @@ SCRIPTS_DIR="$WORK_DIR/scripts"
 PKG_PATH="$DIST_DIR/Tokenity-NodeAgent-${VERSION}.pkg"
 INSTALLED_RUNTIME="/Users/Shared/TokenityRuntime/current/.venv/bin/python"
 LAUNCHD_LABEL="ai.tokenity.node-agent"
+RUNTIME_LOCK="$ROOT/packaging/runtime/runtime-lock.json"
+EXPECTED_MLX="$(
+  /usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["packages"]["mlx"])' \
+    "$RUNTIME_LOCK"
+)"
+EXPECTED_MLX_LM="$(
+  /usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["packages"]["mlx-lm"])' \
+    "$RUNTIME_LOCK"
+)"
 
 if [[ ! -f "$ROOT/tokenity/node_agent/agent.py" ]] ||
    [[ ! -f "$ROOT/tokenity/serving/distributed_openai.py" ]]; then
@@ -38,13 +47,28 @@ EXPECTED_REVISION="$(
   "$ROOT/tokenity/" \
   "$PAYLOAD_DIR/Users/Shared/TokenityCode/tokenity/"
 
-/bin/cat > "$SCRIPTS_DIR/preinstall" <<'SCRIPT'
-#!/bin/zsh
-set -eu
+{
+  /usr/bin/printf '#!/bin/zsh\nset -eu\n'
+  /usr/bin/printf 'EXPECTED_MLX="%s"\n' "$EXPECTED_MLX"
+  /usr/bin/printf 'EXPECTED_MLX_LM="%s"\n' "$EXPECTED_MLX_LM"
+  /bin/cat <<'SCRIPT'
 
 PYTHON="/Users/Shared/TokenityRuntime/current/.venv/bin/python"
 PLIST="/Library/LaunchDaemons/ai.tokenity.node-agent.plist"
 AGENT_URL="http://127.0.0.1:9100"
+
+remove_legacy_user_agents() {
+  local legacy_plist legacy_uid
+  for legacy_plist in /Users/*/Library/LaunchAgents/local.tokenity.node-agent.plist(N); do
+    legacy_uid="$(/usr/bin/stat -f '%u' "$legacy_plist" 2>/dev/null || true)"
+    if [[ -n "$legacy_uid" ]]; then
+      /bin/launchctl bootout \
+        "gui/$legacy_uid/local.tokenity.node-agent" 2>/dev/null || \
+        /bin/launchctl bootout "gui/$legacy_uid" "$legacy_plist" 2>/dev/null || true
+    fi
+    /bin/rm -f "$legacy_plist"
+  done
+}
 
 if [[ ! -x "$PYTHON" ]]; then
   echo "Tokenity Runtime is missing at $PYTHON; refusing a code-only Agent update." >&2
@@ -55,10 +79,16 @@ if [[ ! -f "$PLIST" ]]; then
   exit 1
 fi
 
+TOKENITY_EXPECTED_MLX="$EXPECTED_MLX" \
+TOKENITY_EXPECTED_MLX_LM="$EXPECTED_MLX_LM" \
 "$PYTHON" - <<'PY'
 from importlib.metadata import version
+import os
 
-required = {"mlx": "0.32.0", "mlx-lm": "0.31.3"}
+required = {
+    "mlx": os.environ["TOKENITY_EXPECTED_MLX"],
+    "mlx-lm": os.environ["TOKENITY_EXPECTED_MLX_LM"],
+}
 observed = {name: version(name) for name in required}
 if observed != required:
     raise SystemExit(f"Runtime package mismatch: expected {required}, found {observed}")
@@ -77,6 +107,8 @@ if /usr/bin/curl --noproxy '*' --silent --fail --max-time 3 \
     "$AGENT_URL/v1/node/stop-all" >/dev/null
 fi
 
+remove_legacy_user_agents
+
 for _ in {1..45}; do
   if ! /usr/bin/pgrep -f 'tokenity distributed-openai serve' >/dev/null 2>&1; then
     exit 0
@@ -87,6 +119,7 @@ done
 echo "A Tokenity model runtime is still active; refusing to orphan it during Agent upgrade." >&2
 exit 1
 SCRIPT
+} > "$SCRIPTS_DIR/preinstall"
 
 /bin/cat > "$SCRIPTS_DIR/postinstall" <<SCRIPT
 #!/bin/zsh

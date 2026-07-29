@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import platform
 import subprocess
 import sys
 import time
@@ -62,7 +63,7 @@ def test_glm_indexer_pattern_accepts_explicit_full_shared_schedule():
     ) == ["full", "shared", "full", "shared", "full", "shared"]
 
 
-def test_glm_direct_jaccl_is_upgraded_to_ring_fallback(tmp_path):
+def test_direct_jaccl_is_upgraded_to_ring_fallback_for_all_models(tmp_path):
     glm = tmp_path / "GLM-5.2-mxfp4"
     qwen = tmp_path / "Qwen3.5-122B"
     glm.mkdir()
@@ -83,7 +84,7 @@ def test_glm_direct_jaccl_is_upgraded_to_ring_fallback(tmp_path):
     assert agent_module._stable_connection_mode_for_model(  # noqa: SLF001
         str(qwen),
         agent_module.ConnectionMode.JACCL,
-    ) == agent_module.ConnectionMode.JACCL
+    ) == agent_module.ConnectionMode.JACCL_RING
     assert agent_module._stable_connection_mode_for_model(  # noqa: SLF001
         str(glm),
         agent_module.ConnectionMode.RING,
@@ -116,6 +117,32 @@ def test_node_info_advertises_stable_agent_contract():
             "native_mtp",
         ],
     }
+
+
+def test_node_info_reports_pinned_runtime_identity(tmp_path, monkeypatch):
+    manifest = {
+        "runtime_id": "runtime-test",
+        "architecture": "arm64",
+        "minimum_macos": "26.2",
+        "python_version": platform.python_version(),
+        "packages": {
+            "mlx": agent_module._package_version("mlx"),  # noqa: SLF001
+            "mlx-lm": agent_module._package_version("mlx-lm"),  # noqa: SLF001
+        },
+        "payload": {"tree_sha256": "a" * 64},
+    }
+    manifest_path = tmp_path / "runtime-manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setenv("TOKENITY_RUNTIME_MANIFEST", str(manifest_path))
+    monkeypatch.setattr(agent_module.platform, "machine", lambda: "arm64")
+
+    client = TestClient(create_app(rdma_probe_fn=fake_rdma_probe))
+    runtime = client.get("/v1/node/info").json()["runtime"]
+
+    assert runtime["runtime_id"] == "runtime-test"
+    assert runtime["payload_sha256"] == "a" * 64
+    assert runtime["install_state"] == "ready"
+    assert len(runtime["manifest_sha256"]) == 64
 
 
 def test_node_status_reports_memory():
@@ -183,6 +210,55 @@ def test_memory_stats_prefers_physical_vm_pages_over_pressure_percentage(monkeyp
     assert memory["reclaimable_bytes"] == 368 * gib
     assert memory["file_backed_bytes"] == 368 * gib
     assert memory["pressure_available_ratio"] == 0.99
+
+
+def test_start_rejects_model_when_live_wired_memory_exhausts_headroom(
+    monkeypatch,
+):
+    gib = 1_073_741_824
+    supervisor = _FakeSupervisor()
+    monkeypatch.setattr(agent_module, "_total_memory_bytes", lambda: 512 * gib)
+    monkeypatch.setattr(
+        agent_module,
+        "_memory_stats",
+        lambda: {
+            "total_bytes": 512 * gib,
+            "in_use_bytes": 443 * gib,
+            "pressure_available_ratio": 0.19,
+        },
+    )
+    monkeypatch.setattr(agent_module, "_tcp_port_available", lambda port: True)
+
+    client = TestClient(
+        create_app(
+            rdma_probe_fn=fake_rdma_probe,
+            supervisor=supervisor,
+            rank_ready_fn=lambda pid, port, timeout: True,
+            rank_stabilize_fn=lambda seconds: None,
+            rank_connected_fn=lambda pid, request, timeout: True,
+            runtime_preflight_fn=lambda *_: [],
+        )
+    )
+    response = client.post(
+        "/v1/node/start-distributed-openai",
+        json={
+            "model": "/models/qwen",
+            "connection_mode": "ring",
+            "dry_run": False,
+            "memory_reservation_bytes": 20 * gib,
+            "nodes": [
+                {
+                    "id": "local",
+                    "agent_url": "http://127.0.0.1:9100",
+                    "lan_ip": "127.0.0.1",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["stage"] == "resource_admission"
+    assert supervisor.starts == []
 
 
 def test_running_role_reports_failed_when_child_rank_crashes(tmp_path: Path):
@@ -291,6 +367,199 @@ def test_supervisor_can_request_then_wait_for_a_clean_distributed_exit(tmp_path:
 
     assert status.state == "stopped"
     assert status.return_code == 0
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_events"),
+    [
+        (
+            "/models/glm",
+            [("wait", "distributed-openai-rank", "coordinated-rank-stop")],
+        ),
+        (
+            "/models/qwen",
+            [("wait", "distributed-openai-rank", "coordinated-rank-stop")],
+        ),
+    ],
+)
+def test_worker_instance_stop_waits_for_validated_jaccl_stop_sentinel(
+    monkeypatch,
+    model,
+    expected_events,
+):
+    events = []
+
+    class CoordinatedExitSupervisor:
+        running = True
+
+        def start(
+            self,
+            role,
+            command,
+            env=None,
+            cwd=None,
+            start_new_session=True,
+            instance_id=None,
+            operation_id=None,
+        ):
+            self.running = True
+            return RoleStatus(
+                role=role,
+                state="running",
+                instance_id=instance_id,
+                operation_id=operation_id,
+                pid=123,
+                command=command,
+            )
+
+        def status(self, role=None, instance_id=None):
+            return RoleStatus(
+                role=role or "distributed-openai-rank",
+                state="running" if self.running else "stopped",
+                instance_id=instance_id,
+                pid=123 if self.running else None,
+                return_code=None if self.running else 0,
+            )
+
+        def wait(self, role, timeout=10, instance_id=None):
+            events.append(("wait", role, instance_id))
+            self.running = False
+            return self.status(role, instance_id=instance_id)
+
+        def request_stop(self, role, instance_id=None):
+            events.append(("request_stop", role, instance_id))
+            self.running = False
+            return self.status(role, instance_id=instance_id)
+
+        def stop(self, role, timeout=10, instance_id=None):
+            events.append(("stop", role, instance_id))
+            self.running = False
+            return self.status(role, instance_id=instance_id)
+
+    monkeypatch.setattr(agent_module, "_post_json", lambda *_: None)
+    supervisor = CoordinatedExitSupervisor()
+    client = TestClient(
+        create_app(
+            rdma_probe_fn=fake_rdma_probe,
+            supervisor=supervisor,
+            rank_connected_fn=lambda pid, request, timeout: True,
+            runtime_preflight_fn=lambda *_: [],
+        )
+    )
+    started = client.post(
+        "/v1/node/start-distributed-rank",
+        json={
+            "cluster_id": "coordinated-rank-stop",
+            "instance_id": "coordinated-rank-stop",
+            "operation_id": "coordinated-rank-stop-op",
+            "model": model,
+            "rank": 1,
+            "world_size": 2,
+            "connection_mode": "jaccl-ring",
+            "python": sys.executable,
+            "coordinator_ip": "127.0.0.1",
+            "starting_port": 30_200,
+            "ring_hosts": [
+                ["127.0.0.1:30200", "127.0.0.1:30201"],
+                ["127.0.0.1:30201", "127.0.0.1:30200"],
+            ],
+            "rdma_matrix": [
+                [None, "rdma_en4"],
+                ["rdma_en5", None],
+            ],
+        },
+    )
+    assert started.status_code == 200, started.text
+
+    stopped = client.post(
+        "/v1/node/instances/coordinated-rank-stop/stop",
+        json={"timeout": 5},
+    )
+
+    assert stopped.status_code == 200, stopped.text
+    assert events == expected_events
+
+
+def test_coordinator_instance_stop_waits_for_admin_requested_natural_exit(
+    monkeypatch,
+):
+    events = []
+
+    class NaturalExitSupervisor:
+        running = True
+
+        def start(
+            self,
+            role,
+            command,
+            env=None,
+            cwd=None,
+            start_new_session=True,
+            instance_id=None,
+            operation_id=None,
+        ):
+            self.running = True
+            return RoleStatus(
+                role=role,
+                state="running",
+                instance_id=instance_id,
+                operation_id=operation_id,
+                pid=123,
+                command=command,
+            )
+
+        def status(self, role=None, instance_id=None):
+            return RoleStatus(
+                role=role or "single-node-openai",
+                state="running" if self.running else "stopped",
+                instance_id=instance_id,
+                pid=123 if self.running else None,
+                return_code=None if self.running else 0,
+            )
+
+        def wait(self, role, timeout=10, instance_id=None):
+            events.append(("wait", role, instance_id))
+            self.running = False
+            return self.status(role, instance_id=instance_id)
+
+        def request_stop(self, role, instance_id=None):
+            events.append(("request_stop", role, instance_id))
+            self.running = False
+            return self.status(role, instance_id=instance_id)
+
+        def stop(self, role, timeout=10, instance_id=None):
+            events.append(("stop", role, instance_id))
+            self.running = False
+            return self.status(role, instance_id=instance_id)
+
+    monkeypatch.setattr(agent_module, "_post_json", lambda *_: {})
+    supervisor = NaturalExitSupervisor()
+    client = TestClient(
+        create_app(
+            rdma_probe_fn=fake_rdma_probe,
+            supervisor=supervisor,
+            rank_ready_fn=lambda pid, port, timeout: True,
+            rank_stabilize_fn=lambda seconds: None,
+            runtime_preflight_fn=lambda *_: [],
+        )
+    )
+    _start_ready_gateway_model(
+        client,
+        model_id="coordinator-natural-stop",
+        instance_id="coordinator-natural-stop",
+        operation_id="coordinator-natural-stop-op",
+        port=23_700,
+    )
+
+    stopped = client.post(
+        "/v1/node/instances/coordinator-natural-stop/stop",
+        json={"timeout": 5},
+    )
+
+    assert stopped.status_code == 200, stopped.text
+    assert events == [
+        ("wait", "single-node-openai", "coordinator-natural-stop")
+    ]
 
 
 def test_supervisor_keeps_child_stdin_open(tmp_path: Path):
@@ -580,6 +849,111 @@ class _FakeSupervisor:
         return RoleStatus(role=role, state="running", pid=123)
 
 
+def test_empty_agent_shutdown_never_probes_a_default_model_port(
+    tmp_path: Path,
+    monkeypatch,
+):
+    stop_requests = []
+    monkeypatch.setattr(
+        agent_module,
+        "_post_json",
+        lambda url, payload, timeout: stop_requests.append((url, payload, timeout)),
+    )
+
+    app = create_app(
+        rdma_probe_fn=fake_rdma_probe,
+        supervisor=RoleSupervisor(log_dir=tmp_path),
+    )
+    with TestClient(app):
+        pass
+
+    assert stop_requests == []
+
+
+def test_shutdown_requests_stop_only_for_a_running_owned_coordinator(
+    tmp_path: Path,
+    monkeypatch,
+):
+    stop_requests = []
+    monkeypatch.setattr(agent_module.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(agent_module, "_tcp_port_available", lambda port: True)
+    monkeypatch.setattr(
+        agent_module,
+        "_post_json",
+        lambda url, payload, timeout: stop_requests.append((url, payload, timeout)),
+    )
+
+    app = create_app(
+        rdma_probe_fn=fake_rdma_probe,
+        supervisor=_FakeSupervisor(),
+        rank_ready_fn=lambda pid, port, timeout: True,
+        rank_stabilize_fn=lambda seconds: None,
+        rank_connected_fn=lambda pid, request, timeout: True,
+        runtime_preflight_fn=lambda *_: [],
+    )
+    with TestClient(app) as client:
+        port = _start_ready_gateway_model(
+            client,
+            model_id="shutdown-owned-model",
+            instance_id="instance-shutdown-owned",
+            operation_id="operation-shutdown-owned",
+            port=23_500,
+        )
+
+    assert stop_requests == [
+        (f"http://127.0.0.1:{port}/v1/tokenity/stop", {}, 2.0)
+    ]
+
+
+def test_shutdown_does_not_stop_a_registered_but_exited_coordinator(
+    tmp_path: Path,
+    monkeypatch,
+):
+    class ExitableSupervisor(_FakeSupervisor):
+        running = True
+
+        def status(self, role=None):
+            if role is None:
+                return []
+            if not self.running:
+                return RoleStatus(
+                    role=role,
+                    state="stopped",
+                    return_code=0,
+                )
+            return super().status(role)
+
+    supervisor = ExitableSupervisor()
+    stop_requests = []
+    monkeypatch.setattr(agent_module.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(agent_module, "_tcp_port_available", lambda port: True)
+    monkeypatch.setattr(
+        agent_module,
+        "_post_json",
+        lambda url, payload, timeout: stop_requests.append((url, payload, timeout)),
+    )
+
+    app = create_app(
+        rdma_probe_fn=fake_rdma_probe,
+        supervisor=supervisor,
+        rank_ready_fn=lambda pid, port, timeout: True,
+        rank_stabilize_fn=lambda seconds: None,
+        rank_connected_fn=lambda pid, request, timeout: True,
+        runtime_preflight_fn=lambda *_: [],
+    )
+    with TestClient(app) as client:
+        _start_ready_gateway_model(
+            client,
+            model_id="shutdown-exited-model",
+            instance_id="instance-shutdown-exited",
+            operation_id="operation-shutdown-exited",
+            port=23_600,
+        )
+        supervisor.running = False
+
+    assert stop_requests == []
+
+
 def _managed_agent_info():
     return {
         "agent_contract": {
@@ -662,7 +1036,8 @@ def test_distributed_start_fans_out_worker_rank_over_http():
     runtime = client.get("/v1/node/status").json()["cluster_runtime"]
     assert runtime["rank"] == 0
     assert runtime["world_size"] == 2
-    assert runtime["connection_mode"] == "jaccl"
+    assert runtime["connection_mode"] == "jaccl-ring"
+    assert supervisor.starts[0][2]["MLX_JACCL_RING"] == "1"
     assert runtime["role"] == "controller"
 
     stop = client.post(
@@ -881,7 +1256,7 @@ def test_instance_quorum_requires_matching_ready_rank_evidence(tmp_path: Path, m
                 "operation_id": worker_payloads[0]["operation_id"],
                 "rank": 1,
                 "world_size": 2,
-                "connection_mode": "jaccl",
+                "connection_mode": "jaccl-ring",
                 "model_revision": None,
                 "phase": "ready",
                 "updated_at": time.time(),
@@ -943,7 +1318,7 @@ def test_instance_quorum_requires_matching_ready_rank_evidence(tmp_path: Path, m
                 "operation_id": operation_id,
                 "rank": 0,
                 "world_size": 2,
-                "connection_mode": "jaccl",
+                "connection_mode": "jaccl-ring",
                 "model_revision": None,
                 "phase": "ready",
                 "updated_at": time.time(),
@@ -2095,6 +2470,34 @@ def test_inferred_four_billion_parameter_model_is_a_fast_route_candidate():
 
     assert qwen.warm_ttft_p95_ms == 120.0
     assert qwen.task_quality["general"] == 0.72
+
+
+def test_inferred_qwen_profile_reads_nested_text_context_capacity(tmp_path: Path):
+    model = tmp_path / "Qwen3.5-4B-Native-MTP-4bit"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_5",
+                "text_config": {
+                    "model_type": "qwen3_5_text",
+                    "max_position_embeddings": 262_144,
+                    "max_new_tokens": 16_384,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    profile = agent_module._infer_gateway_model_profile(
+        model.name,
+        "revision-qwen",
+        str(model),
+    )
+
+    assert profile.context_length == 262_144
+    assert profile.max_output_length == 16_384
+    assert "long-context" in profile.task_tags
 
 
 def test_inferred_profiles_route_fast_to_qwen_four_b_and_quality_to_glm(

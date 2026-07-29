@@ -92,6 +92,44 @@ class ResourceAdmissionError(RuntimeError):
     pass
 
 
+def live_system_available_memory_bytes(
+    memory: dict[str, object],
+    *,
+    minimum_headroom_ratio: float = 0.1,
+) -> int | None:
+    """Return memory that a new reservation may safely consume right now.
+
+    The reservation ledger alone cannot see wired/compressed memory left behind
+    by an exited MLX process. Bound new allocations by both the non-reclaimable
+    page counts and macOS memory-pressure headroom when those observations are
+    available. Returning ``None`` preserves the ledger-only fallback on hosts
+    where neither signal exists.
+    """
+
+    total = memory.get("total_bytes")
+    if not isinstance(total, int) or total <= 0:
+        return None
+    headroom_ratio = min(max(minimum_headroom_ratio, 0.0), 0.9)
+    candidates: list[int] = []
+
+    in_use = memory.get("in_use_bytes")
+    if isinstance(in_use, int) and in_use >= 0:
+        usable_limit = int(total * (1.0 - headroom_ratio))
+        candidates.append(max(0, usable_limit - in_use))
+
+    pressure_available_ratio = memory.get("pressure_available_ratio")
+    if isinstance(pressure_available_ratio, (int, float)):
+        pressure_available_ratio = min(
+            max(float(pressure_available_ratio), 0.0),
+            1.0,
+        )
+        candidates.append(
+            max(0, int(total * (pressure_available_ratio - headroom_ratio)))
+        )
+
+    return min(candidates) if candidates else None
+
+
 class GenerationQueueFull(InstanceConflict):
     pass
 
@@ -272,6 +310,18 @@ class ModelInstance:
             self.readiness_evidence = dict(readiness_evidence)
         if error is not None:
             self.last_error = dict(error)
+        if state in {InstanceLifecycle.UNLOADING, InstanceLifecycle.STOPPED}:
+            self.health_ready = False
+            self.health_sampled_at = self.updated_at
+            self.health_issues = [
+                "Instance is unloading."
+                if state == InstanceLifecycle.UNLOADING
+                else "Instance is stopped."
+            ]
+        if state == InstanceLifecycle.STOPPED:
+            self.actual_memory_bytes = None
+            self.active_request_count = 0
+            self.queued_request_count = 0
         return self.version
 
     def acquire_request_lease(self) -> int:
@@ -349,14 +399,32 @@ class ModelInstance:
 class ResourceLedger:
     """Per-node reservations and ports used for admission before process launch."""
 
-    def __init__(self, total_memory_bytes: int, *, minimum_headroom_ratio: float = 0.1) -> None:
+    def __init__(
+        self,
+        total_memory_bytes: int,
+        *,
+        minimum_headroom_ratio: float = 0.1,
+        port_reuse_delay_seconds: float = 0.0,
+        monotonic_clock=time.monotonic,
+    ) -> None:
         if total_memory_bytes < 0:
             raise ValueError("total_memory_bytes must be non-negative")
+        if port_reuse_delay_seconds < 0:
+            raise ValueError("port_reuse_delay_seconds must be non-negative")
         self.total_memory_bytes = total_memory_bytes
         self.minimum_headroom_ratio = min(max(minimum_headroom_ratio, 0.0), 0.9)
+        self.port_reuse_delay_seconds = port_reuse_delay_seconds
         self._reservations: dict[str, int] = {}
         self._ports: dict[int, str] = {}
+        self._quarantined_ports: dict[int, float] = {}
+        self._monotonic_clock = monotonic_clock
         self._lock = threading.RLock()
+
+    def _prune_port_quarantine(self) -> None:
+        now = self._monotonic_clock()
+        for port, deadline in list(self._quarantined_ports.items()):
+            if deadline <= now:
+                del self._quarantined_ports[port]
 
     @property
     def reserved_memory_bytes(self) -> int:
@@ -366,28 +434,61 @@ class ResourceLedger:
     @property
     def available_memory_bytes(self) -> int:
         with self._lock:
-            usable = int(self.total_memory_bytes * (1.0 - self.minimum_headroom_ratio))
-            return max(0, usable - sum(self._reservations.values()))
+            return self._available_memory_bytes()
 
-    def reserve(self, instance_id: str, memory_bytes: int, ports: list[int]) -> None:
+    def _available_memory_bytes(
+        self,
+        system_available_memory_bytes: int | None = None,
+    ) -> int:
+        usable = int(self.total_memory_bytes * (1.0 - self.minimum_headroom_ratio))
+        ledger_available = max(0, usable - sum(self._reservations.values()))
+        if system_available_memory_bytes is None:
+            return ledger_available
+        return min(ledger_available, max(0, system_available_memory_bytes))
+
+    def reserve(
+        self,
+        instance_id: str,
+        memory_bytes: int,
+        ports: list[int],
+        *,
+        system_available_memory_bytes: int | None = None,
+    ) -> None:
         if memory_bytes < 0:
             raise ResourceAdmissionError("Memory reservation cannot be negative.")
+        if system_available_memory_bytes is not None and system_available_memory_bytes < 0:
+            raise ResourceAdmissionError("System-available memory cannot be negative.")
         with self._lock:
+            self._prune_port_quarantine()
             current = self._reservations.get(instance_id, 0)
             additional = max(0, memory_bytes - current)
-            if additional > self.available_memory_bytes:
+            available = self._available_memory_bytes(system_available_memory_bytes)
+            if additional > available:
                 raise ResourceAdmissionError(
                     f"Instance {instance_id} needs {memory_bytes} bytes but only "
-                    f"{self.available_memory_bytes + current} bytes are admissible."
+                    f"{available + current} bytes are admissible."
                 )
-            conflicts = [port for port in ports if port in self._ports and self._ports[port] != instance_id]
+            conflicts = [
+                port
+                for port in ports
+                if (
+                    port in self._quarantined_ports
+                    or (port in self._ports and self._ports[port] != instance_id)
+                )
+            ]
             if conflicts:
                 raise ResourceAdmissionError(f"Ports already reserved: {sorted(conflicts)}")
             self._reservations[instance_id] = memory_bytes
             for port in ports:
                 self._ports[port] = instance_id
 
-    def resize(self, instance_id: str, memory_bytes: int) -> int:
+    def resize(
+        self,
+        instance_id: str,
+        memory_bytes: int,
+        *,
+        system_available_memory_bytes: int | None = None,
+    ) -> int:
         """Atomically replace memory for an existing reservation.
 
         Port ownership is deliberately untouched. A failed growth leaves both
@@ -396,12 +497,20 @@ class ResourceLedger:
 
         if memory_bytes < 0:
             raise ResourceAdmissionError("Memory reservation cannot be negative.")
+        if system_available_memory_bytes is not None and system_available_memory_bytes < 0:
+            raise ResourceAdmissionError("System-available memory cannot be negative.")
         with self._lock:
             if instance_id not in self._reservations:
                 raise ResourceAdmissionError(f"Unknown memory reservation: {instance_id}")
             current = self._reservations[instance_id]
             usable = int(self.total_memory_bytes * (1.0 - self.minimum_headroom_ratio))
-            admissible = usable - (sum(self._reservations.values()) - current)
+            ledger_available = max(0, usable - sum(self._reservations.values()))
+            additional_available = (
+                ledger_available
+                if system_available_memory_bytes is None
+                else min(ledger_available, max(0, system_available_memory_bytes))
+            )
+            admissible = current + additional_available
             if memory_bytes > admissible:
                 raise ResourceAdmissionError(
                     f"Instance {instance_id} needs {memory_bytes} bytes but only "
@@ -419,6 +528,7 @@ class ResourceLedger:
         safety_margin_ratio: float = 0.1,
         minimum_reservation_bytes: int = 0,
         breakdown: MemoryReservationBreakdown | None = None,
+        system_available_memory_bytes: int | None = None,
     ) -> int:
         """Resize from local observed memory while retaining a safety floor."""
 
@@ -458,24 +568,47 @@ class ResourceLedger:
             if not observations:
                 raise ValueError("At least one local memory observation is required")
             target = math.ceil(max(observations) * (1.0 + safety_margin_ratio))
-        return self.resize(instance_id, max(minimum_reservation_bytes, target))
+        return self.resize(
+            instance_id,
+            max(minimum_reservation_bytes, target),
+            system_available_memory_bytes=system_available_memory_bytes,
+        )
 
     def release(self, instance_id: str) -> None:
         with self._lock:
             self._reservations.pop(instance_id, None)
+            quarantine_until = self._monotonic_clock() + self.port_reuse_delay_seconds
             for port, owner in list(self._ports.items()):
                 if owner == instance_id:
                     del self._ports[port]
+                    if self.port_reuse_delay_seconds > 0:
+                        self._quarantined_ports[port] = quarantine_until
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(
+        self,
+        *,
+        system_available_memory_bytes: int | None = None,
+    ) -> dict[str, Any]:
         with self._lock:
+            self._prune_port_quarantine()
+            ledger_available = self._available_memory_bytes()
+            now = self._monotonic_clock()
             return {
                 "total_memory_bytes": self.total_memory_bytes,
                 "reserved_memory_bytes": sum(self._reservations.values()),
-                "available_memory_bytes": self.available_memory_bytes,
+                "available_memory_bytes": self._available_memory_bytes(
+                    system_available_memory_bytes
+                ),
+                "ledger_available_memory_bytes": ledger_available,
+                "system_available_memory_bytes": system_available_memory_bytes,
                 "minimum_headroom_ratio": self.minimum_headroom_ratio,
+                "port_reuse_delay_seconds": self.port_reuse_delay_seconds,
                 "reservations": dict(self._reservations),
                 "ports": {str(port): owner for port, owner in sorted(self._ports.items())},
+                "quarantined_ports": {
+                    str(port): max(0.0, deadline - now)
+                    for port, deadline in sorted(self._quarantined_ports.items())
+                },
             }
 
 

@@ -20,6 +20,7 @@ from tokenity.control.instances import (
     ResourceAdmissionError,
     ResourceLedger,
     StaleInstanceUpdate,
+    live_system_available_memory_bytes,
 )
 
 
@@ -116,6 +117,22 @@ def test_registry_start_is_idempotent_by_instance_and_operation():
         registry.create(**_instance_values(operation_id="operation-b"))
 
 
+def test_stopped_instance_clears_live_health_and_memory_fields():
+    instance = ModelInstance(**_instance_values())
+    instance.actual_memory_bytes = 4_096
+    instance.health_ready = True
+    instance.health_issues = []
+    instance.transition(InstanceLifecycle.LAUNCHING)
+    instance.transition(InstanceLifecycle.LOADING_METADATA)
+    instance.transition(InstanceLifecycle.UNLOADING)
+    instance.transition(InstanceLifecycle.STOPPED)
+
+    assert instance.actual_memory_bytes is None
+    assert instance.health_ready is False
+    assert instance.health_sampled_at is not None
+    assert instance.health_issues == ["Instance is stopped."]
+
+
 def test_resource_admission_reserves_and_releases_memory_and_ports():
     ledger = ResourceLedger(10_000, minimum_headroom_ratio=0.1)
     ledger.reserve("instance-a", 6_000, [8000, 29500])
@@ -128,6 +145,98 @@ def test_resource_admission_reserves_and_releases_memory_and_ports():
     ledger.release("instance-a")
     ledger.reserve("instance-b", 4_000, [8000])
     assert ledger.snapshot()["reservations"] == {"instance-b": 4_000}
+
+
+def test_released_ports_are_quarantined_before_collective_epoch_reuse():
+    now = [100.0]
+    ledger = ResourceLedger(
+        20_000,
+        minimum_headroom_ratio=0,
+        port_reuse_delay_seconds=30,
+        monotonic_clock=lambda: now[0],
+    )
+    ledger.reserve("instance-a", 1_000, [8000, 29500, 29501])
+    ledger.release("instance-a")
+
+    snapshot = ledger.snapshot()
+    assert snapshot["ports"] == {}
+    assert set(snapshot["quarantined_ports"]) == {"8000", "29500", "29501"}
+    with pytest.raises(ResourceAdmissionError, match="Ports already reserved"):
+        ledger.reserve("instance-b", 1_000, [29500])
+
+    now[0] += 30
+    ledger.reserve("instance-b", 1_000, [29500])
+    assert ledger.snapshot()["ports"] == {"29500": "instance-b"}
+
+
+def test_resource_admission_honors_live_system_memory_headroom():
+    ledger = ResourceLedger(10_000, minimum_headroom_ratio=0.1)
+
+    with pytest.raises(ResourceAdmissionError, match="only 1,?500|only 1500"):
+        ledger.reserve(
+            "instance-a",
+            2_000,
+            [8000],
+            system_available_memory_bytes=1_500,
+        )
+
+    ledger.reserve(
+        "instance-a",
+        1_500,
+        [8000],
+        system_available_memory_bytes=1_500,
+    )
+    snapshot = ledger.snapshot(system_available_memory_bytes=750)
+    assert snapshot["available_memory_bytes"] == 750
+    assert snapshot["ledger_available_memory_bytes"] == 7_500
+    assert snapshot["system_available_memory_bytes"] == 750
+
+
+def test_live_system_available_memory_accounts_for_wired_residue_and_pressure():
+    gib = 1_073_741_824
+
+    available = live_system_available_memory_bytes(
+        {
+            "total_bytes": 512 * gib,
+            "in_use_bytes": 443 * gib,
+            "pressure_available_ratio": 0.19,
+        }
+    )
+
+    assert available == int(512 * gib * 0.9) - 443 * gib
+
+
+def test_live_system_available_memory_falls_back_when_signals_are_unavailable():
+    assert live_system_available_memory_bytes({"total_bytes": 10_000}) is None
+    assert live_system_available_memory_bytes({"total_bytes": None}) is None
+
+
+def test_resource_resize_uses_live_headroom_only_for_growth():
+    ledger = ResourceLedger(20_000, minimum_headroom_ratio=0)
+    ledger.reserve("instance-a", 8_000, [8000])
+
+    assert (
+        ledger.resize(
+            "instance-a",
+            9_000,
+            system_available_memory_bytes=1_000,
+        )
+        == 9_000
+    )
+    with pytest.raises(ResourceAdmissionError):
+        ledger.resize(
+            "instance-a",
+            11_000,
+            system_available_memory_bytes=1_000,
+        )
+    assert (
+        ledger.resize(
+            "instance-a",
+            7_000,
+            system_available_memory_bytes=0,
+        )
+        == 7_000
+    )
 
 
 def test_resource_ledger_atomically_resizes_and_reconciles_without_changing_ports():

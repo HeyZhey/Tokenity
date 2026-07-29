@@ -10,13 +10,47 @@ PAYLOAD_DIR="$WORK_DIR/payload"
 SCRIPTS_DIR="$WORK_DIR/scripts"
 DMG_ROOT="$WORK_DIR/dmg-root"
 RUNTIME_CACHE="$DIST_DIR/runtime-cache/TokenityRuntime"
-RUNTIME_SOURCE="${TOKENITY_RUNTIME_SOURCE:-/Users/Shared/TokenityRuntime}"
-NODE_AGENT_PACKAGE_MODE="${TOKENITY_NODE_AGENT_PACKAGE:-auto}"
-PKG_PATH="$DIST_DIR/Tokenity-NodeAgent-Runtime-${VERSION}.pkg"
+RUNTIME_LOCK="$ROOT/packaging/runtime/runtime-lock.json"
+RUNTIME_MANIFEST_TOOL="$ROOT/scripts/tokenity-runtime-manifest.py"
+RUNTIME_SOURCE="${TOKENITY_RUNTIME_SOURCE:-}"
+NODE_AGENT_PACKAGE_MODE="${TOKENITY_NODE_AGENT_PACKAGE:-required}"
+LOCK_TOKENITY_VERSION="$(
+  /usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tokenity_version"])' \
+    "$RUNTIME_LOCK"
+)"
+RUNTIME_ID="$(
+  /usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime_id"])' \
+    "$RUNTIME_LOCK"
+)"
+RUNTIME_MINIMUM_MACOS="$(
+  /usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["minimum_macos"])' \
+    "$RUNTIME_LOCK"
+)"
+RUNTIME_RELEASE_TAG="$(
+  /usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["release_tag"])' \
+    "$RUNTIME_LOCK"
+)"
+RUNTIME_PACKAGE_IDENTIFIER="$(
+  /usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["package_identifier"])' \
+    "$RUNTIME_LOCK"
+)"
+RUNTIME_ARTIFACT_NAME="$(
+  /usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["artifact_filename"])' \
+    "$RUNTIME_LOCK"
+)"
+RUNTIME_DOWNLOAD_BASE_URL="${TOKENITY_RUNTIME_DOWNLOAD_BASE_URL:-https://github.com/HeyZhey/Tokenity/releases/download/${RUNTIME_RELEASE_TAG}}"
+PKG_PATH="$DIST_DIR/$RUNTIME_ARTIFACT_NAME"
+PKG_CHECKSUM_PATH="$PKG_PATH.sha256"
+RUNTIME_CATALOG_PATH="$DIST_DIR/Tokenity-RuntimeCatalog-${RUNTIME_ID}.json"
 DMG_PATH="$DIST_DIR/Tokenity-${VERSION}.dmg"
 DMG_CHECKSUM_PATH="$DMG_PATH.sha256"
 APP_BUNDLE="$DMG_ROOT/TokenityControl.app"
 BACKEND_SOURCE="$ROOT/tokenity/serving/distributed_openai.py"
+
+if [[ "$VERSION" != "$LOCK_TOKENITY_VERSION" ]]; then
+  echo "TOKENITY_VERSION=$VERSION does not match the Runtime lock version $LOCK_TOKENITY_VERSION." >&2
+  exit 1
+fi
 
 if ! grep -q '^class TokenityDistributedRuntime' "$BACKEND_SOURCE"; then
   echo "Refusing to package a skeleton-only Tokenity backend." >&2
@@ -42,6 +76,9 @@ runtime_excludes=(
   --exclude "CACHEDIR.TAG"
   --exclude ".git"
   --exclude "cache"
+  --exclude "__pycache__"
+  --exclude "*.pyc"
+  --exclude "*.pyo"
 )
 
 copy_dir() {
@@ -58,9 +95,22 @@ copy_runtime_dir() {
   rsync -a --delete --delete-excluded "${runtime_excludes[@]}" "$source" "$destination/"
 }
 
+runtime_is_available() {
+  local root="$1"
+  [[ -d "$root" && -x "$root/current/.venv/bin/python" ]]
+}
+
+if [[ -z "$RUNTIME_SOURCE" ]]; then
+  if runtime_is_available "/Users/Shared/TokenityRuntime"; then
+    RUNTIME_SOURCE="/Users/Shared/TokenityRuntime"
+  else
+    RUNTIME_SOURCE="$RUNTIME_CACHE"
+  fi
+fi
+
 case "$NODE_AGENT_PACKAGE_MODE" in
   auto)
-    if [[ -d "$RUNTIME_SOURCE/current/.venv" || -d "$RUNTIME_CACHE/current/.venv" ]]; then
+    if runtime_is_available "$RUNTIME_SOURCE" || runtime_is_available "$RUNTIME_CACHE"; then
       BUILD_NODE_AGENT_PACKAGE=1
     else
       BUILD_NODE_AGENT_PACKAGE=0
@@ -85,7 +135,12 @@ fi
 
 echo "Preparing package workspace..."
 rm -rf "$WORK_DIR"
-rm -f "$PKG_PATH" "$DMG_PATH" "$DMG_CHECKSUM_PATH"
+rm -f \
+  "$PKG_PATH" \
+  "$PKG_CHECKSUM_PATH" \
+  "$RUNTIME_CATALOG_PATH" \
+  "$DMG_PATH" \
+  "$DMG_CHECKSUM_PATH"
 mkdir -p "$SCRIPTS_DIR" "$DMG_ROOT" "$DIST_DIR"
 
 echo "Building TokenityControl.app..."
@@ -107,14 +162,21 @@ echo "Copying Tokenity backend code..."
 copy_dir "$ROOT/" "$PAYLOAD_DIR/Users/Shared/TokenityCode"
 
 echo "Preparing Tokenity runtime..."
-if [[ -d "$RUNTIME_SOURCE/current/.venv" ]]; then
+if runtime_is_available "$RUNTIME_SOURCE" && [[ "$RUNTIME_SOURCE" != "$RUNTIME_CACHE" ]]; then
   copy_runtime_dir "$RUNTIME_SOURCE/" "$RUNTIME_CACHE"
-elif [[ -d "$RUNTIME_CACHE/current/.venv" ]]; then
+elif runtime_is_available "$RUNTIME_CACHE"; then
   echo "Using the cached Tokenity runtime at $RUNTIME_CACHE."
 else
-  echo "Tokenity runtime not found. Set TOKENITY_RUNTIME_SOURCE to a local directory." >&2
+  echo "Tokenity runtime not found or its Python is not executable." >&2
+  echo "Run scripts/import-tokenity-runtime.sh first, or set TOKENITY_RUNTIME_SOURCE." >&2
   exit 1
 fi
+"$RUNTIME_MANIFEST_TOOL" prepare "$RUNTIME_CACHE" \
+  --lock "$RUNTIME_LOCK" \
+  --output "$RUNTIME_CACHE/runtime-manifest.json"
+"$RUNTIME_MANIFEST_TOOL" verify "$RUNTIME_CACHE" \
+  --lock "$RUNTIME_LOCK" \
+  --manifest "$RUNTIME_CACHE/runtime-manifest.json"
 copy_runtime_dir "$RUNTIME_CACHE/" "$PAYLOAD_DIR/Users/Shared/TokenityRuntime"
 
 if [[ "${TOKENITY_INCLUDE_MODEL:-0}" == "1" ]]; then
@@ -174,9 +236,108 @@ cat > "$PAYLOAD_DIR/Library/LaunchDaemons/ai.tokenity.node-agent.plist" <<'PLIST
 </plist>
 PLIST
 
-cat > "$SCRIPTS_DIR/postinstall" <<'SCRIPT'
-#!/bin/zsh
-set -eu
+RUNTIME_SIZE_KB="$(du -sk "$RUNTIME_CACHE" | awk '{print $1}')"
+{
+  printf '#!/bin/zsh\nset -eu\n'
+  printf 'MINIMUM_MACOS="%s"\n' "$RUNTIME_MINIMUM_MACOS"
+  printf 'REQUIRED_KB="%s"\n' "$((RUNTIME_SIZE_KB + 1048576))"
+  cat <<'SCRIPT'
+
+NODE_AGENT_PLIST="/Library/LaunchDaemons/ai.tokenity.node-agent.plist"
+AGENT_URL="http://127.0.0.1:9100"
+
+remove_legacy_user_agents() {
+  local legacy_plist legacy_uid
+  for legacy_plist in /Users/*/Library/LaunchAgents/local.tokenity.node-agent.plist(N); do
+    legacy_uid="$(/usr/bin/stat -f '%u' "$legacy_plist" 2>/dev/null || true)"
+    if [[ -n "$legacy_uid" ]]; then
+      /bin/launchctl bootout \
+        "gui/$legacy_uid/local.tokenity.node-agent" 2>/dev/null || \
+        /bin/launchctl bootout "gui/$legacy_uid" "$legacy_plist" 2>/dev/null || true
+    fi
+    /bin/rm -f "$legacy_plist"
+  done
+}
+
+version_at_least() {
+  /usr/bin/awk -v observed="$1" -v required="$2" 'BEGIN {
+    observed_count = split(observed, observed_parts, ".")
+    required_count = split(required, required_parts, ".")
+    count = observed_count > required_count ? observed_count : required_count
+    for (index = 1; index <= count; index++) {
+      observed_value = observed_parts[index] + 0
+      required_value = required_parts[index] + 0
+      if (observed_value > required_value) exit 0
+      if (observed_value < required_value) exit 1
+    }
+    exit 0
+  }'
+}
+
+if [[ "$(/usr/bin/uname -m)" != "arm64" ]]; then
+  echo "Tokenity Runtime requires an Apple-silicon Mac (arm64)." >&2
+  exit 1
+fi
+
+observed_macos="$(/usr/bin/sw_vers -productVersion)"
+if ! version_at_least "$observed_macos" "$MINIMUM_MACOS"; then
+  echo "This Tokenity Runtime requires macOS $MINIMUM_MACOS or newer; found $observed_macos." >&2
+  exit 1
+fi
+
+available_kb="$(/bin/df -Pk /Users/Shared 2>/dev/null | /usr/bin/awk 'NR == 2 {print $4}')"
+if [[ -n "$available_kb" && "$available_kb" -lt "$REQUIRED_KB" ]]; then
+  echo "Tokenity Runtime needs at least $REQUIRED_KB KB free under /Users/Shared." >&2
+  exit 1
+fi
+
+if /usr/bin/curl --noproxy '*' --silent --fail --max-time 3 \
+  "$AGENT_URL/v1/node/info" >/dev/null; then
+  /usr/bin/curl --noproxy '*' --silent --show-error --max-time 5 \
+    -H 'Content-Type: application/json' \
+    -d '{}' \
+    "$AGENT_URL/v1/node/request-stop-all" >/dev/null 2>&1 || true
+  /usr/bin/curl --noproxy '*' --silent --show-error --max-time 40 \
+    -H 'Content-Type: application/json' \
+    -d '{"timeout":30}' \
+    "$AGENT_URL/v1/node/stop-all" >/dev/null 2>&1 || true
+fi
+
+remove_legacy_user_agents
+
+for _ in {1..45}; do
+  if ! /usr/bin/pgrep -f 'tokenity distributed-openai serve' >/dev/null 2>&1; then
+    break
+  fi
+  /bin/sleep 1
+done
+if /usr/bin/pgrep -f 'tokenity distributed-openai serve' >/dev/null 2>&1; then
+  echo "A Tokenity model runtime is still active; refusing to overwrite it." >&2
+  exit 1
+fi
+
+/bin/launchctl bootout system "$NODE_AGENT_PLIST" 2>/dev/null || true
+/usr/bin/pkill -f \
+  "/Users/Shared/TokenityRuntime/current/.venv/bin/python -u -m tokenity node-agent" \
+  2>/dev/null || true
+
+exit 0
+SCRIPT
+} > "$SCRIPTS_DIR/preinstall"
+
+RUNTIME_EXPECTED_MLX="$(
+  /usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["packages"]["mlx"])' \
+    "$RUNTIME_LOCK"
+)"
+RUNTIME_EXPECTED_MLX_LM="$(
+  /usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["packages"]["mlx-lm"])' \
+    "$RUNTIME_LOCK"
+)"
+{
+  printf '#!/bin/zsh\nset -eu\n'
+  printf 'EXPECTED_MLX="%s"\n' "$RUNTIME_EXPECTED_MLX"
+  printf 'EXPECTED_MLX_LM="%s"\n' "$RUNTIME_EXPECTED_MLX_LM"
+  cat <<'SCRIPT'
 
 NODE_AGENT_PLIST="/Library/LaunchDaemons/ai.tokenity.node-agent.plist"
 TB_PLIST="/Library/LaunchDaemons/ai.tokenity.thunderbolt-keepalive.plist"
@@ -192,6 +353,7 @@ fi
 /bin/mkdir -p /Users/Shared/TokenityLogs /Users/Shared/TokenityModels /usr/local/bin
 /usr/sbin/chown root:wheel "$NODE_AGENT_PLIST" 2>/dev/null || true
 /usr/sbin/chown -R "$AGENT_USER":staff /Users/Shared/TokenityLogs 2>/dev/null || true
+/usr/sbin/chown -R "$AGENT_USER":staff /Users/Shared/TokenityModels 2>/dev/null || true
 /bin/chmod 644 "$NODE_AGENT_PLIST"
 /bin/chmod -R a+rX /Users/Shared/TokenityCode /Users/Shared/TokenityRuntime /Users/Shared/TokenityModels 2>/dev/null || true
 
@@ -278,6 +440,30 @@ elif /usr/bin/printf "%s\n" "$lan_ips" | /usr/bin/grep -q '^192\.168\.5\.75$'; t
 fi
 
 if [[ -x "$PYTHON" ]]; then
+  TOKENITY_EXPECTED_MLX="$EXPECTED_MLX" \
+  TOKENITY_EXPECTED_MLX_LM="$EXPECTED_MLX_LM" \
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONNOUSERSITE=1 \
+  PYTHONPATH=/Users/Shared/TokenityCode \
+  "$PYTHON" - <<'PY'
+from importlib.metadata import version
+
+import mlx.core as mx
+import mlx_lm
+import tokenity
+
+import os
+
+required = {
+    "mlx": os.environ["TOKENITY_EXPECTED_MLX"],
+    "mlx-lm": os.environ["TOKENITY_EXPECTED_MLX_LM"],
+}
+observed = {name: version(name) for name in required}
+if observed != required:
+    raise SystemExit(f"Runtime package mismatch: expected {required}, found {observed}")
+mx.eval(mx.array([1], dtype=mx.int32))
+print(f"Validated installed Tokenity Runtime: {observed}")
+PY
   /usr/bin/pkill -f "/Users/Shared/TokenityRuntime/current/.venv/bin/python -u -m tokenity node-agent" 2>/dev/null || true
   /bin/launchctl bootout system "$NODE_AGENT_PLIST" 2>/dev/null || true
   /bin/launchctl bootstrap system "$NODE_AGENT_PLIST" 2>/dev/null || true
@@ -286,7 +472,8 @@ fi
 
 exit 0
 SCRIPT
-/bin/chmod 755 "$SCRIPTS_DIR/postinstall"
+} > "$SCRIPTS_DIR/postinstall"
+/bin/chmod 755 "$SCRIPTS_DIR/preinstall" "$SCRIPTS_DIR/postinstall"
 
 echo "Building installer package..."
 /usr/bin/xattr -cr "$PAYLOAD_DIR" 2>/dev/null || true
@@ -298,11 +485,36 @@ pkgbuild \
   --filter '(^|/)CVS(/|$)' \
   --root "$PAYLOAD_DIR" \
   --scripts "$SCRIPTS_DIR" \
-  --identifier "ai.tokenity.node-agent.installer" \
+  --identifier "$RUNTIME_PACKAGE_IDENTIFIER" \
   --version "$VERSION" \
   --install-location "/" \
   "$PKG_PATH"
-cp "$PKG_PATH" "$DMG_ROOT/Install Tokenity Node Agent.pkg"
+
+(
+  cd "$DIST_DIR"
+  shasum -a 256 "$RUNTIME_ARTIFACT_NAME" > "$(basename "$PKG_CHECKSUM_PATH")"
+)
+RUNTIME_DOWNLOAD_URL="${RUNTIME_DOWNLOAD_BASE_URL%/}/$RUNTIME_ARTIFACT_NAME"
+"$RUNTIME_MANIFEST_TOOL" catalog \
+  --lock "$RUNTIME_LOCK" \
+  --runtime-manifest "$RUNTIME_CACHE/runtime-manifest.json" \
+  --artifact "$PKG_PATH" \
+  --download-url "$RUNTIME_DOWNLOAD_URL" \
+  --output "$RUNTIME_CATALOG_PATH"
+"$RUNTIME_MANIFEST_TOOL" verify-artifact \
+  --catalog "$RUNTIME_CATALOG_PATH" \
+  --artifact "$PKG_PATH"
+
+cp "$PKG_PATH" "$APP_BUNDLE/Contents/Resources/$RUNTIME_ARTIFACT_NAME"
+cp "$RUNTIME_CATALOG_PATH" "$APP_BUNDLE/Contents/Resources/RuntimeCatalog.json"
+codesign --force --deep --sign - "$APP_BUNDLE" >/dev/null
+codesign --verify --deep --strict "$APP_BUNDLE"
+
+ln -s \
+  "TokenityControl.app/Contents/Resources/$RUNTIME_ARTIFACT_NAME" \
+  "$DMG_ROOT/Install Tokenity Node Agent.pkg"
+cp "$PKG_CHECKSUM_PATH" "$DMG_ROOT/Runtime Installer.sha256"
+cp "$RUNTIME_CATALOG_PATH" "$DMG_ROOT/Runtime Catalog.json"
 else
   if [[ "$NODE_AGENT_PACKAGE_MODE" == "required" ]]; then
     echo "Tokenity runtime not found. Set TOKENITY_RUNTIME_SOURCE to a local directory." >&2
@@ -323,6 +535,10 @@ The Node Agent package installs:
 - /Users/Shared/TokenityCode
 - /Users/Shared/TokenityRuntime
 - NodeAgent LaunchDaemon on port 9100
+
+This Runtime is validated for Apple silicon and requires macOS
+${RUNTIME_MINIMUM_MACOS} or newer. The same verified installer remains embedded
+inside TokenityControl.app after the app is copied to Applications.
 
 Model weights are not included by default because they are very large.
 Place compatible MLX models under:
@@ -357,11 +573,16 @@ hdiutil create \
   -format UDZO \
   "$DMG_PATH"
 
-shasum -a 256 "$DMG_PATH" > "$DMG_CHECKSUM_PATH"
+(
+  cd "$DIST_DIR"
+  shasum -a 256 "$(basename "$DMG_PATH")" > "$(basename "$DMG_CHECKSUM_PATH")"
+)
 
 echo "Built:"
 if [[ "$BUILD_NODE_AGENT_PACKAGE" == "1" ]]; then
   echo "$PKG_PATH"
+  echo "$PKG_CHECKSUM_PATH"
+  echo "$RUNTIME_CATALOG_PATH"
 fi
 echo "$DMG_PATH"
 echo "$DMG_CHECKSUM_PATH"

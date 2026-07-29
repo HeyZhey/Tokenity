@@ -272,7 +272,7 @@ final class TokenityStore: ObservableObject {
     private let residentAutoPreferencesKey = "TokenityResidentAutoPreferences.v1"
     private let chatSessionsKey = "TokenityChatSessions.v1"
     private let onboardingRevisionKey = "TokenityOnboarding.completedRevision"
-    private static let currentOnboardingRevision = 1
+    private static let currentOnboardingRevision = 2
     private let chatHistoryQueue = DispatchQueue(label: "ai.tokenity.chat-history", qos: .utility)
     private let writesChatHistorySynchronously: Bool
     private var chatHistoryRevision = 0
@@ -2008,9 +2008,9 @@ final class TokenityStore: ObservableObject {
         if let activeModelInstanceID {
             let activeSnapshotState = snapshotsByID[activeModelInstanceID]?.state.lowercased()
             let preservesLoadingIdentity = activeModelLoadID != nil
-                && activeSnapshotState.map {
+                && (activeSnapshotState.map {
                     !["stopped", "failed", "orphaned"].contains($0)
-                } == true
+                } ?? true)
             if !preservesLoadingIdentity,
                managedModelInstances[activeModelInstanceID]?.isRoutable != true {
                 restoreActiveManagedInstance()
@@ -2075,15 +2075,25 @@ final class TokenityStore: ObservableObject {
 
         let previousActiveInstanceID = activeModelInstanceID
         recomputeManagedModelLoadStates()
-        if let previousActiveInstanceID,
-           managedModelInstances[previousActiveInstanceID]?.isRoutable != true {
-            cancelActiveChat(
-                message: "Generation stopped because the active model instance is no longer ready.",
-                logReason: "managed instance health"
-            )
-            restoreActiveManagedInstance()
-        } else if activeModelInstanceID == nil {
-            restoreActiveManagedInstance()
+        // The coordinator start response becomes authoritative before the
+        // next background node-info snapshot necessarily contains that new
+        // instance. Do not redirect its readiness/inference probe to an
+        // already-ready sibling during this short propagation window.
+        if activeModelLoadID == nil {
+            if let previousActiveInstanceID,
+               managedModelInstances[previousActiveInstanceID]?.isRoutable != true {
+                cancelActiveChat(
+                    message: "Generation stopped because the active model instance is no longer ready.",
+                    logReason: "managed instance health"
+                )
+                restoreActiveManagedInstance()
+            } else if activeModelInstanceID == nil {
+                restoreActiveManagedInstance()
+            }
+        }
+
+        if activeModelLoadID != nil {
+            return
         }
 
         if let activeModelInstanceID,

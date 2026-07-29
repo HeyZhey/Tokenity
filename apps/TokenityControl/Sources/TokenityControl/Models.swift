@@ -465,6 +465,28 @@ struct AgentContractInfo: Codable, Hashable {
     }
 }
 
+struct NodeRuntimeIdentity: Codable, Hashable {
+    var runtimeID: String?
+    var manifestSHA256: String?
+    var payloadSHA256: String?
+    var architecture: String?
+    var minimumMacOS: String?
+    var pythonVersion: String?
+    var packages: [String: String]?
+    var installState: String?
+
+    enum CodingKeys: String, CodingKey {
+        case runtimeID = "runtime_id"
+        case manifestSHA256 = "manifest_sha256"
+        case payloadSHA256 = "payload_sha256"
+        case architecture
+        case minimumMacOS = "minimum_macos"
+        case pythonVersion = "python_version"
+        case packages
+        case installState = "install_state"
+    }
+}
+
 struct NodeInfoResponse: Codable {
     var nodeID: String
     var hostname: String
@@ -478,6 +500,7 @@ struct NodeInfoResponse: Codable {
     var mlxLMVersion: String?
     var tokenityVersion: String
     var tokenityCodeRevision: String?
+    var runtime: NodeRuntimeIdentity?
     var agentContract: AgentContractInfo?
     var processRoles: [ProcessRole]
     var memory: MemoryStats?
@@ -495,6 +518,7 @@ struct NodeInfoResponse: Codable {
         case mlxLMVersion = "mlx_lm_version"
         case tokenityVersion = "tokenity_version"
         case tokenityCodeRevision = "tokenity_code_revision"
+        case runtime
         case agentContract = "agent_contract"
         case processRoles = "process_roles"
         case clusterRuntime = "cluster_runtime"

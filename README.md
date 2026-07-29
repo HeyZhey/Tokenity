@@ -362,12 +362,27 @@ Build a standard drag-to-Applications DMG:
 ./scripts/package-tokenity-dmg.sh
 ```
 
-The DMG always contains `TokenityControl.app` and an Applications link. When a
-Tokenity runtime source or cached runtime is available, it also contains a
-separate **Install Tokenity Node Agent.pkg** for every Mac that will execute
-models. Without a runtime, the script still produces a controller-only DMG.
+Release DMGs require the pinned Apple-silicon Runtime by default. Import and
+cross-check a Runtime once, then build:
+
+```bash
+./scripts/import-tokenity-runtime.sh \
+  apple@192.168.5.23:/Users/Shared/TokenityRuntime \
+  probriefing@192.168.5.75:/Users/Shared/TokenityRuntime
+./scripts/package-tokenity-dmg.sh
+```
+
+The full DMG contains `TokenityControl.app`, an Applications link, and a
+verified **Install Tokenity Node Agent.pkg**. The same installer remains
+embedded in the app after it is dragged to Applications. On first launch,
+Tokenity opens the bundled installer; a thin build can download the exact
+catalog-pinned package and verifies its size and SHA-256 before opening
+Installer.app.
+
+The currently validated Runtime is Apple-silicon only and requires macOS 26.2
+or newer because the MLX/JACCL binaries were built with that deployment target.
 Model weights are excluded by default. See [Installer DMG](docs/installer-dmg.md)
-for runtime modes, signing, and verification details.
+for Runtime identity, online publishing, signing, and verification details.
 
 ## Troubleshooting
 

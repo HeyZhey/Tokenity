@@ -16,6 +16,7 @@ from .instances import (
     ResourceAdmissionError,
     ResourceLedger,
     StaleInstanceUpdate,
+    live_system_available_memory_bytes,
 )
 from .routing import (
     AutoRouter,
@@ -47,6 +48,7 @@ __all__ = [
     "ResourceAdmissionError",
     "ResourceLedger",
     "StaleInstanceUpdate",
+    "live_system_available_memory_bytes",
     "AutoRouter",
     "CandidateScore",
     "CapabilityRegistry",

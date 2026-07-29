@@ -18,6 +18,7 @@ import threading
 import time
 import textwrap
 import uuid
+import zlib
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -47,6 +48,7 @@ class ChatCompletionRequest(BaseModel):
     messages: list[dict[str, Any]]
     stream: bool = False
     max_tokens: int | None = Field(default=None, ge=1)
+    max_completion_tokens: int | None = Field(default=None, ge=1)
     temperature: float | None = Field(default=None, ge=0)
     top_p: float | None = Field(default=None, ge=0, le=1)
     top_k: int | None = Field(default=None, ge=0)
@@ -55,6 +57,8 @@ class ChatCompletionRequest(BaseModel):
     repetition_penalty: float | None = Field(default=None, ge=0, le=2)
     stop: str | list[str] | None = None
     seed: int | None = None
+    logprobs: bool | None = None
+    top_logprobs: int | None = Field(default=None, ge=0, le=20)
     tools: list[Any] | None = None
     role_mapping: dict[str, Any] | None = None
     chat_template_kwargs: dict[str, Any] | None = None
@@ -86,6 +90,8 @@ class _TimelineStreamingResponse(StreamingResponse):
 class _GenerationResult:
     text: str
     reasoning: str
+    tool_calls: list[dict[str, Any]]
+    logprobs: dict[str, Any] | None
     finish_reason: str
     prompt_tokens: int
     completion_tokens: int
@@ -163,6 +169,12 @@ class _LoadEvalPolicy:
 _LOAD_PROGRESS_LOCK = threading.Lock()
 _ACTIVE_LOAD_STATE: ReadinessState | None = None
 _ACTIVE_LOAD_CANCEL: threading.Event | None = None
+_STREAM_CANCEL_DRAIN_TIMEOUT_SECONDS = 2.0
+_JACCL_CONTROL_MAGIC = 0x544F4B4E
+_JACCL_CONTROL_VERSION = 1
+_JACCL_CONTROL_WORDS = 10
+_JACCL_CONTROL_MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
+_TOKENITY_DISTRIBUTED_STOP = ("tokenity-distributed-stop", 1)
 
 
 class _ModelLoadCancelled(SystemExit):
@@ -274,6 +286,7 @@ def _install_jaccl_server_control_collectives(server: Any) -> None:
     generate_source = textwrap.dedent(inspect.getsource(original_generate))
     seed_material = os.environ.get("TOKENITY_INSTANCE_ID", "tokenity").encode("utf-8")
     synchronized_seed = int.from_bytes(hashlib.sha256(seed_material).digest()[:4], "little")
+    epoch_words = _jaccl_epoch_words()
     patched_namespace: dict[str, Any] = {}
     exec(
         compile(
@@ -284,31 +297,128 @@ def _install_jaccl_server_control_collectives(server: Any) -> None:
         original_generate.__globals__,
         patched_namespace,
     )
-    response_generator._generate = patched_namespace["_generate"]
+    patched_generate = patched_namespace["_generate"]
+    original_serve_single = response_generator._serve_single
+    serve_single_source = textwrap.dedent(inspect.getsource(original_serve_single))
+    patched_namespace = {}
+    exec(
+        compile(
+            _replace_jaccl_sequential_cancel_collective(serve_single_source),
+            inspect.getsourcefile(original_serve_single) or "<mlx_lm.server>",
+            "exec",
+        ),
+        original_serve_single.__globals__,
+        patched_namespace,
+    )
+    patched_serve_single = patched_namespace["_serve_single"]
+
+    def tokenity_generate(self: Any) -> None:
+        try:
+            patched_generate(self)
+        finally:
+            # Unwire while this thread still owns the model's Metal stream.
+            # Relying on the worker main thread to reach runtime teardown is
+            # racy: the distributed generation loop can be the final owner of
+            # the model shard and macOS may otherwise retain its residency-set
+            # pages after the process has exited.
+            try:
+                unwire_started = time.monotonic()
+                logging.warning(
+                    "Tokenity is unwiring the MLX Metal residency set on the "
+                    "generation thread."
+                )
+                sys.stderr.flush()
+                mx.set_wired_limit(0)
+                logging.warning(
+                    "Tokenity unwired the MLX Metal residency set on the "
+                    "generation thread in %.3fs (active=%s cache=%s).",
+                    time.monotonic() - unwire_started,
+                    mx.get_active_memory(),
+                    mx.get_cache_memory(),
+                )
+            except Exception:
+                logging.exception(
+                    "Tokenity could not unwire generation-thread MLX memory."
+                )
+            # MLX 0.32 exposes this specifically so applications can destroy
+            # thread-local streams before the owning thread exits.  Explicit
+            # cleanup avoids relying on fragile TLS/static destruction order
+            # while JACCL is dismantling the worker rank.
+            try:
+                mx.clear_streams()
+            except Exception:
+                logging.exception(
+                    "Tokenity could not clear MLX generation-thread streams."
+                )
+            try:
+                sys.stderr.flush()
+            except Exception:
+                pass
+
+    response_generator._generate = tokenity_generate
+    response_generator._serve_single = patched_serve_single
 
     def tokenity_share_object(self: Any, obj: Any) -> Any:
         if not self._is_distributed:
             return obj
 
+        sequence = int(getattr(self, "_tokenity_control_sequence", 0)) + 1
         if self._rank == 0:
-            if obj is None:
-                control = mx.zeros((10,), dtype=mx.uint32)
-                mx.eval(mx.distributed.all_sum(control, stream=mx.cpu))
-                return None
-            data = mx.array(pickle.dumps(obj))
-            control = mx.full((10,), int(data.size), dtype=mx.uint32)
+            coordinated_stop = (
+                obj is None
+                and bool(
+                    getattr(self, "_tokenity_shutdown_requested", False)
+                )
+            )
+            shared_object = (
+                _TOKENITY_DISTRIBUTED_STOP if coordinated_stop else obj
+            )
+            payload = (
+                b""
+                if shared_object is None
+                else pickle.dumps(shared_object, protocol=5)
+            )
+            header = _jaccl_control_header(
+                sequence=sequence,
+                payload=payload,
+                epoch_words=epoch_words,
+            )
+            control = mx.array(header, dtype=mx.uint32)
             mx.eval(mx.distributed.all_sum(control, stream=mx.cpu))
-            mx.eval(mx.distributed.all_sum(data, stream=mx.cpu))
+            if payload:
+                data = mx.array(payload, dtype=mx.uint8)
+                mx.eval(mx.distributed.all_sum(data, stream=mx.cpu))
+            self._tokenity_control_sequence = sequence
+            if coordinated_stop:
+                self._stop = True
+                return None
             return obj
 
-        control = mx.zeros((10,), dtype=mx.uint32)
+        control = mx.zeros((_JACCL_CONTROL_WORDS,), dtype=mx.uint32)
         control = mx.distributed.all_sum(control, stream=mx.cpu)
-        size = int(control[0].item())
-        if size == 0:
+        header = [int(value) for value in control.tolist()]
+        message_type, size, checksum = _validate_jaccl_control_header(
+            header,
+            expected_sequence=sequence,
+            expected_epoch_words=epoch_words,
+        )
+        self._tokenity_control_sequence = sequence
+        if message_type == 0:
             return None
         data = mx.zeros((size,), dtype=mx.uint8)
         data = mx.distributed.all_sum(data, stream=mx.cpu)
-        return pickle.loads(bytes(data.tolist()))
+        payload = bytes(data.tolist())
+        _validate_jaccl_control_payload(payload, checksum)
+        try:
+            shared_object = pickle.loads(payload)
+        except Exception as exc:
+            raise RuntimeError(
+                "JACCL control protocol mismatch: validated payload is not a pickle."
+            ) from exc
+        if shared_object == _TOKENITY_DISTRIBUTED_STOP:
+            self._stop = True
+            return None
+        return shared_object
 
     response_generator._share_object = tokenity_share_object
     server._tokenity_jaccl_server_control_collectives = True
@@ -316,6 +426,86 @@ def _install_jaccl_server_control_collectives(server: Any) -> None:
         "Tokenity installed a deterministic per-instance JACCL seed and multi-element "
         "CPU control collectives for the mlx-lm request loop."
     )
+
+
+def _jaccl_epoch_words() -> tuple[int, int, int, int]:
+    material = (
+        f"{os.environ.get('TOKENITY_INSTANCE_ID', 'tokenity')}\0"
+        f"{os.environ.get('TOKENITY_OPERATION_ID', 'tokenity')}"
+    ).encode("utf-8")
+    digest = hashlib.sha256(material).digest()
+    return tuple(
+        int.from_bytes(digest[index : index + 4], "little")
+        for index in range(0, 16, 4)
+    )  # type: ignore[return-value]
+
+
+def _jaccl_control_header(
+    *,
+    sequence: int,
+    payload: bytes,
+    epoch_words: tuple[int, int, int, int],
+) -> tuple[int, ...]:
+    if sequence <= 0 or sequence > 0xFFFFFFFF:
+        raise RuntimeError("JACCL control protocol sequence is out of range.")
+    if len(payload) > _JACCL_CONTROL_MAX_PAYLOAD_BYTES:
+        raise RuntimeError(
+            "JACCL control protocol payload exceeds the 64 MiB safety limit."
+        )
+    return (
+        _JACCL_CONTROL_MAGIC,
+        _JACCL_CONTROL_VERSION,
+        1 if payload else 0,
+        sequence,
+        len(payload),
+        *epoch_words,
+        zlib.crc32(payload) & 0xFFFFFFFF if payload else 0,
+    )
+
+
+def _validate_jaccl_control_header(
+    header: list[int] | tuple[int, ...],
+    *,
+    expected_sequence: int,
+    expected_epoch_words: tuple[int, int, int, int],
+) -> tuple[int, int, int]:
+    if len(header) != _JACCL_CONTROL_WORDS:
+        raise RuntimeError(
+            "JACCL control protocol mismatch: invalid header length."
+        )
+    magic, version, message_type, sequence, size, *tail = header
+    epoch_words = tuple(tail[:4])
+    checksum = tail[4]
+    mismatches: list[str] = []
+    if magic != _JACCL_CONTROL_MAGIC:
+        mismatches.append("magic")
+    if version != _JACCL_CONTROL_VERSION:
+        mismatches.append("version")
+    if message_type not in {0, 1}:
+        mismatches.append("message_type")
+    if sequence != expected_sequence:
+        mismatches.append("sequence")
+    if epoch_words != expected_epoch_words:
+        mismatches.append("epoch")
+    if size < 0 or size > _JACCL_CONTROL_MAX_PAYLOAD_BYTES:
+        mismatches.append("payload_size")
+    if message_type == 0 and (size != 0 or checksum != 0):
+        mismatches.append("empty_frame")
+    if message_type == 1 and size == 0:
+        mismatches.append("payload_frame")
+    if mismatches:
+        raise RuntimeError(
+            "JACCL control protocol mismatch: " + ", ".join(mismatches) + "."
+        )
+    return message_type, size, checksum
+
+
+def _validate_jaccl_control_payload(payload: bytes, expected_checksum: int) -> None:
+    checksum = zlib.crc32(payload) & 0xFFFFFFFF
+    if checksum != expected_checksum:
+        raise RuntimeError(
+            "JACCL control protocol mismatch: payload checksum."
+        )
 
 
 def _replace_jaccl_seed_collective(source: str, synchronized_seed: int) -> str:
@@ -332,6 +522,40 @@ def _replace_jaccl_seed_collective(source: str, synchronized_seed: int) -> str:
         raise RuntimeError(
             "The installed mlx-lm ResponseGenerator seed synchronization does not "
             "match Tokenity's pinned JACCL compatibility contract."
+        )
+    return source.replace(needle, replacement)
+
+
+def _replace_jaccl_sequential_cancel_collective(source: str) -> str:
+    """Make a sequential client cancellation visible to every JACCL rank."""
+
+    needle = """\
+            if ctx._should_stop:
+                if self._is_distributed:
+                    raise NotImplementedError()
+                break
+"""
+    replacement = """\
+            tokenity_cancelled = ctx._should_stop
+            if self._is_distributed:
+                tokenity_cancel_control = mx.array(
+                    [int(tokenity_cancelled)] * 10,
+                    dtype=mx.uint32,
+                )
+                tokenity_cancel_control = mx.distributed.all_sum(
+                    tokenity_cancel_control,
+                    stream=mx.cpu,
+                )
+                tokenity_cancelled = bool(tokenity_cancel_control[0].item())
+            if tokenity_cancelled:
+                if self._is_distributed:
+                    raise NotImplementedError()
+                break
+"""
+    if source.count(needle) != 1:
+        raise RuntimeError(
+            "The installed mlx-lm ResponseGenerator sequential cancellation does "
+            "not match Tokenity's pinned JACCL compatibility contract."
         )
     return source.replace(needle, replacement)
 
@@ -591,13 +815,14 @@ def _delay_rank0_distributed_init() -> None:
 
 
 def _requires_process_isolated_shutdown(model: str) -> bool:
-    """Return whether model teardown must bypass MLX thread destructors.
+    """Return whether model teardown needs coordinated MLX thread cleanup.
 
-    MLX 0.31.x can double-free the thread-local CompilerCache when the GLM
-    generation thread exits after JACCL inference.  The runtime already lives
-    in a disposable subprocess, so an explicit ``os._exit(0)`` is the safest
-    ownership boundary: macOS reclaims Metal/JACCL resources without running
-    the faulty C++ TLS destructor.
+    Older MLX builds could double-free the thread-local CompilerCache when the
+    GLM generation thread exited after JACCL inference.  MLX 0.32 provides
+    ``clear_streams()`` so Tokenity can destroy those thread-owned objects
+    explicitly.  The process must still finish normal interpreter teardown:
+    bypassing JACCL group destruction with ``os._exit()`` can leave the worker
+    rank's registered Metal pages wired until the machine reboots.
     """
 
     config_path = Path(model) / "config.json"
@@ -611,6 +836,36 @@ def _requires_process_isolated_shutdown(model: str) -> bool:
         identities.extend(str(item) for item in architectures)
     identity = " ".join(identities).lower()
     return "glm" in identity and ("moe" in identity or "5.2" in identity)
+
+
+def _configure_mlx_wired_memory(
+    mx: Any,
+    *,
+    model: str,
+    execution_mode: str,
+    connection_mode: str | None,
+) -> int | None:
+    if not mx.metal.is_available():
+        return None
+    unsafe_glm_jaccl_residency = (
+        execution_mode == "distributed"
+        and (connection_mode or "").lower() in {"jaccl", "jaccl-ring"}
+        and _requires_process_isolated_shutdown(model)
+    )
+    if unsafe_glm_jaccl_residency:
+        # GLM's worker shard is roughly 198 GiB.  Keeping it in MLX's Metal
+        # residency set can leave that entire shard wired after JACCL teardown
+        # on macOS even when the worker PID has exited.  A zero limit leaves
+        # the allocations pageable and lets normal process exit reclaim them.
+        limit = 0
+        logging.warning(
+            "Tokenity disabled wired Metal residency for GLM/JACCL so model "
+            "shutdown remains reclaimable."
+        )
+    else:
+        limit = int(mx.device_info()["max_recommended_working_set_size"])
+    mx.set_wired_limit(limit)
+    return limit
 
 
 def _should_run_post_load_barrier(model: str) -> bool:
@@ -703,6 +958,10 @@ class TokenityDistributedRuntime:
         self._request_count_lock = threading.Lock()
         self._status_heartbeat_stop = threading.Event()
         self._status_heartbeat: threading.Thread | None = None
+        self._retirement_lock = threading.Lock()
+        self._retired_reason: str | None = None
+        self._pending_stream_tasks: set[asyncio.Task[Any]] = set()
+        self._stream_cancel_drain_timeout = _STREAM_CANCEL_DRAIN_TIMEOUT_SECONDS
 
     def start(self) -> None:
         self._start_status_heartbeat()
@@ -726,8 +985,12 @@ class TokenityDistributedRuntime:
         try:
             import mlx.core as mx  # type: ignore
 
-            if mx.metal.is_available():
-                mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
+            _configure_mlx_wired_memory(
+                mx,
+                model=self.model,
+                execution_mode=self.execution_mode,
+                connection_mode=self.state.connection_mode,
+            )
             _delay_rank0_distributed_init()
             self._group = mx.distributed.init()
         except Exception as exc:  # pragma: no cover - depends on target MLX runtime
@@ -755,7 +1018,8 @@ class TokenityDistributedRuntime:
         args = self._server_args()
         self._provider = self._symbols.ModelProvider(args)
         self._map_model_aliases(self._provider)
-        cache = self._symbols.LRUPromptCache(args.prompt_cache_size)
+        self._prepare_distributed_generation_mode()
+        cache = self._symbols.LRUPromptCache(self._distributed_prompt_cache_size)
         self._generator = self._symbols.ResponseGenerator(self._provider, cache)
         self._load_monitor = threading.Thread(target=self._monitor_model_load, daemon=True)
         self._load_monitor.start()
@@ -777,8 +1041,12 @@ class TokenityDistributedRuntime:
             from mlx.utils import tree_flatten  # type: ignore
             from mlx_lm import load  # type: ignore
 
-            if mx.metal.is_available():
-                mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
+            _configure_mlx_wired_memory(
+                mx,
+                model=self.model,
+                execution_mode=self.execution_mode,
+                connection_mode=self.state.connection_mode,
+            )
             self._single_model, self._single_tokenizer = load(
                 self.model,
                 tokenizer_config={"trust_remote_code": True if self.trust_remote_code else None},
@@ -883,8 +1151,15 @@ class TokenityDistributedRuntime:
         with self._single_contexts_lock:
             for context in list(self._single_contexts):
                 context.stop()
-        if self._generator is not None and not self.process_isolated_shutdown:
-            self._generator._stop = True
+        if self._generator is not None:
+            if self._uses_coordinated_jaccl_shutdown():
+                # Rank 0 broadcasts this flag through the existing validated
+                # request-control collective.  Every generation thread then
+                # leaves the same loop iteration and clears its own MLX
+                # streams before either process performs the final _exit.
+                self._generator._tokenity_shutdown_requested = True
+            else:
+                self._generator._stop = True
 
     def _start_status_heartbeat(self) -> None:
         if not self.state.status_path or self._status_heartbeat is not None:
@@ -908,11 +1183,26 @@ class TokenityDistributedRuntime:
         if self.execution_mode == "single":
             self._release_memory()
             return
-        if self.process_isolated_shutdown:
+        if self._uses_coordinated_jaccl_shutdown():
             logging.warning(
-                "Tokenity is using process-isolated GLM teardown to bypass the MLX CompilerCache destructor bug."
+                "Tokenity is coordinating JACCL generation-thread cleanup before "
+                "normal JACCL process teardown."
             )
-            os._exit(0)
+            generation_thread = getattr(
+                self._generator,
+                "_generation_thread",
+                None,
+            )
+            if generation_thread is not None:
+                generation_thread.join(timeout=5.0)
+                if generation_thread.is_alive():
+                    logging.error(
+                        "Tokenity JACCL generation-thread cleanup exceeded its "
+                        "deadline; forcing the process-isolated exit."
+                    )
+                    os._exit(0)
+            self._release_memory()
+            return
         if self._generator is not None:
             self.state.phase = ReadinessPhase.STOPPING
             self.state.message = "Stopping model runtime and releasing MLX memory."
@@ -921,9 +1211,40 @@ class TokenityDistributedRuntime:
             finally:
                 self._release_memory()
 
+    def _uses_coordinated_jaccl_shutdown(self) -> bool:
+        return (
+            self.execution_mode == "distributed"
+            and (self.state.connection_mode or "").lower()
+            in {"jaccl", "jaccl-ring"}
+        )
+
     def _release_memory(self) -> None:
         distributed_runtime = self.state.world_size > 1
         _set_active_load_state(None)
+        mx: Any | None = None
+        if self.process_isolated_shutdown:
+            try:
+                import mlx.core as mx_module  # type: ignore
+
+                mx = mx_module
+                # set_wired_limit() owns MLX's Metal residency set.  Shrinking
+                # it to zero explicitly removes every allocation and commits
+                # that change before Python and JACCL start destroying the
+                # object graph.  Process exit alone is not sufficient on a
+                # worker rank: macOS can otherwise retain the model shard as
+                # wired memory until reboot even after the PID is gone.
+                mx.set_wired_limit(0)
+                logging.warning(
+                    "Tokenity set the MLX wired residency limit to zero "
+                    "(active=%s cache=%s).",
+                    mx.get_active_memory(),
+                    mx.get_cache_memory(),
+                )
+            except Exception:
+                logging.exception(
+                    "Tokenity could not unwire the MLX Metal residency set "
+                    "during shutdown"
+                )
         self._generator = None
         self._provider = None
         self._symbols = None
@@ -931,16 +1252,36 @@ class TokenityDistributedRuntime:
         self._single_model = None
         self._single_tokenizer = None
         gc.collect()
-        if distributed_runtime:
+        try:
+            if mx is None:
+                import mlx.core as mx_module  # type: ignore
+
+                mx = mx_module
+
+            mx.clear_streams()
+        except Exception:
+            logging.exception(
+                "Tokenity could not clear MLX streams during shutdown"
+            )
+        if distributed_runtime and not self.process_isolated_shutdown:
             # A distributed process exits immediately after shutdown, so the
             # OS will reclaim its Metal allocations. Calling mx.clear_cache()
             # while JACCL/MLX ranks are dismantling their groups can segfault
-            # GLM on rank 0 or leave a worker blocked in teardown.
+            # an uncoordinated rank or leave a worker blocked in teardown.
             return
+        # GLM/JACCL reaches this point only after the validated stop sentinel
+        # has released both generation threads and each thread has destroyed
+        # its MLX streams.  Clearing the allocator cache now is required on
+        # worker ranks: process exit alone can otherwise leave the sharded
+        # model's wired Metal allocation resident until the next reboot.
         try:
-            import mlx.core as mx  # type: ignore
-
             mx.clear_cache()
+            logging.warning(
+                "Tokenity finished MLX allocator cleanup "
+                "(active=%s cache=%s).",
+                mx.get_active_memory(),
+                mx.get_cache_memory(),
+            )
         except Exception:
             logging.exception("Tokenity could not clear the MLX memory cache during shutdown")
 
@@ -967,18 +1308,23 @@ class TokenityDistributedRuntime:
         self._acquire_request()
         try:
             result = self._complete_sync(request)
+            choice: dict[str, object] = {
+                "index": 0,
+                "message": _message_payload(
+                    result.text,
+                    result.reasoning,
+                    result.tool_calls,
+                ),
+                "finish_reason": result.finish_reason,
+            }
+            if request.logprobs:
+                choice["logprobs"] = result.logprobs or {"content": []}
             return {
                 "id": f"chatcmpl-tokenity-{uuid.uuid4()}",
                 "object": "chat.completion",
                 "created": int(time.time()),
                 "model": self.model_id,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": _message_payload(result.text, result.reasoning),
-                        "finish_reason": result.finish_reason,
-                    }
-                ],
+                "choices": [choice],
                 "usage": {
                     "prompt_tokens": result.prompt_tokens,
                     "completion_tokens": result.completion_tokens,
@@ -1005,7 +1351,13 @@ class TokenityDistributedRuntime:
         ctx = None
         finish_reason = "stop"
         tokens = 0
+        tool_text = ""
+        tool_texts: list[str] = []
+        previous_state: str | None = None
         repetition_detector = _RepetitionDetector()
+        begin_task: asyncio.Task[tuple[Any, Iterator[Any]]] | None = None
+        next_task: asyncio.Task[Any] | None = None
+        responses: Iterator[Any] | None = None
         self._acquire_request()
         try:
             begin_task = asyncio.create_task(asyncio.to_thread(self._begin_generation, request))
@@ -1016,7 +1368,9 @@ class TokenityDistributedRuntime:
                 if self.state.last_request is not None and "first_keepalive" not in self.state.last_request:
                     self.state.record_request_event(request_id, "first_keepalive")
                 yield f": keep-alive request_id={request_id}\n\n"
-            ctx, responses = await begin_task
+            # Shield the owned task so an ASGI disconnect cannot cancel the
+            # asyncio wrapper while its worker thread keeps running unseen.
+            ctx, responses = await asyncio.shield(begin_task)
             self.state.transition(
                 ReadinessPhase.GENERATING,
                 message="Generating tokens.",
@@ -1030,7 +1384,7 @@ class TokenityDistributedRuntime:
                     if self.state.last_request is not None and "first_keepalive" not in self.state.last_request:
                         self.state.record_request_event(request_id, "first_keepalive")
                     yield f": keep-alive request_id={request_id}\n\n"
-                item = await next_task
+                item = await asyncio.shield(next_task)
                 if item is _DONE:
                     break
                 if repetition_detector.observe(getattr(item, "text", "")):
@@ -1038,8 +1392,19 @@ class TokenityDistributedRuntime:
                     logging.warning("Tokenity stopped generation after detecting repeated output.")
                     break
                 tokens += 1
+                item_state = getattr(item, "state", None)
+                if item_state == "tool":
+                    tool_text += getattr(item, "text", "")
+                elif previous_state == "tool" and tool_text:
+                    tool_texts.append(tool_text)
+                    tool_text = ""
                 finish_reason = getattr(item, "finish_reason", None) or finish_reason
-                payload = _stream_payload(item, self.model_id, finish_reason=None)
+                payload = _stream_payload(
+                    item,
+                    self.model_id,
+                    finish_reason=None,
+                    include_logprobs=request.logprobs is True,
+                )
                 if payload is not None:
                     if self.state.last_request is not None and "prefill_end" not in self.state.last_request:
                         self.state.record_request_event(request_id, "prefill_end")
@@ -1048,6 +1413,17 @@ class TokenityDistributedRuntime:
                             self.state.record_request_event(request_id, "first_content_token")
                         self.state.record_request_event(request_id, "last_token")
                     yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                previous_state = item_state
+            if previous_state == "tool" and tool_text:
+                tool_texts.append(tool_text)
+            tool_calls = _format_tool_calls(
+                ctx,
+                tool_texts,
+                request.tools,
+                streaming=True,
+            )
+            if tool_calls and finish_reason == "stop":
+                finish_reason = "tool_calls"
             final = {
                 "id": f"chatcmpl-tokenity-{uuid.uuid4()}",
                 "object": "chat.completion.chunk",
@@ -1056,7 +1432,7 @@ class TokenityDistributedRuntime:
                 "choices": [
                     {
                         "index": 0,
-                        "delta": {},
+                        "delta": {"tool_calls": tool_calls} if tool_calls else {},
                         "finish_reason": finish_reason,
                     }
                 ],
@@ -1072,8 +1448,16 @@ class TokenityDistributedRuntime:
             yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
             self.state.record_request_event(request_id, "completed")
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, GeneratorExit):
             self.state.record_request_event(request_id, "cancelled")
+            if self._stream_cancel_requires_retirement():
+                self._retire_after_stream_cancel(request_id)
+            await self._settle_cancelled_stream(
+                begin_task=begin_task,
+                next_task=next_task,
+                ctx=ctx,
+                responses=responses,
+            )
             raise
         except Exception as exc:
             self.state.record_request_event(request_id, "failed")
@@ -1085,12 +1469,154 @@ class TokenityDistributedRuntime:
                 ctx.stop()
             self._release_request()
 
+    def _stream_cancel_requires_retirement(self) -> bool:
+        return (
+            self.execution_mode == "distributed"
+            and self.process_isolated_shutdown
+            and (self.state.connection_mode or "").lower() in {"jaccl", "jaccl-ring"}
+        )
+
+    def _retire_after_stream_cancel(self, request_id: str) -> None:
+        message = (
+            "Runtime retired after a cancelled GLM/JACCL stream because its distributed "
+            "collective state cannot be safely reused. Stop and reload the model before "
+            "sending another request."
+        )
+        with self._retirement_lock:
+            if self._retired_reason is not None:
+                return
+            # Publish the local guard before the state transition so another
+            # request-release callback cannot race this failure back to Ready.
+            self._retired_reason = message
+            self.state.transition(
+                ReadinessPhase.FAILED,
+                message=message,
+                error={
+                    "stage": "stream_cancelled",
+                    "message": message,
+                    "request_id": request_id,
+                    "requires_reload": True,
+                },
+            )
+        logging.error(
+            "Tokenity retired the GLM/JACCL runtime after stream cancellation; "
+            "the existing distributed group will not accept another request."
+        )
+
+    async def _settle_cancelled_stream(
+        self,
+        *,
+        begin_task: asyncio.Task[tuple[Any, Iterator[Any]]] | None,
+        next_task: asyncio.Task[Any] | None,
+        ctx: Any,
+        responses: Iterator[Any] | None,
+    ) -> None:
+        """Bound cleanup of thread-backed generation work after a disconnect."""
+
+        deadline = asyncio.get_running_loop().time() + self._stream_cancel_drain_timeout
+        active_ctx = ctx
+        active_responses = responses
+
+        if active_ctx is not None:
+            active_ctx.stop()
+
+        if active_ctx is None and begin_task is not None:
+            settled, succeeded, result = await self._settle_stream_task(
+                begin_task,
+                deadline=deadline,
+                label="generation start",
+            )
+            if not settled:
+                return
+            if succeeded and result is not None:
+                active_ctx, active_responses = result
+                active_ctx.stop()
+
+        next_result: Any = None
+        if next_task is not None:
+            settled, succeeded, next_result = await self._settle_stream_task(
+                next_task,
+                deadline=deadline,
+                label="next response",
+            )
+            if not settled:
+                return
+            if not succeeded:
+                _close_response_iterator(active_responses)
+                return
+
+        if active_responses is None or next_result is _DONE:
+            _close_response_iterator(active_responses)
+            return
+
+        drain_task = asyncio.create_task(
+            asyncio.to_thread(_drain_response_iterator, active_responses)
+        )
+        await self._settle_stream_task(
+            drain_task,
+            deadline=deadline,
+            label="response drain",
+        )
+
+    async def _settle_stream_task(
+        self,
+        task: asyncio.Task[Any],
+        *,
+        deadline: float,
+        label: str,
+    ) -> tuple[bool, bool, Any]:
+        if not task.done():
+            remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+            if remaining > 0:
+                try:
+                    done, _ = await asyncio.wait({task}, timeout=remaining)
+                except asyncio.CancelledError:
+                    done = {task} if task.done() else set()
+            else:
+                done = set()
+            if not done:
+                self._track_pending_stream_task(task, label)
+                logging.error(
+                    "Timed out after %.2fs while settling cancelled stream %s; "
+                    "the runtime remains retired.",
+                    self._stream_cancel_drain_timeout,
+                    label,
+                )
+                return False, False, None
+
+        try:
+            return True, True, task.result()
+        except BaseException as exc:
+            # Cancellation commonly makes mlx-lm's distributed sequential
+            # iterator terminate with NotImplementedError. It is observed here,
+            # but it is not treated as proof that the collective can be reused.
+            logging.info("Cancelled stream %s terminated with %r.", label, exc)
+            return True, False, None
+
+    def _track_pending_stream_task(self, task: asyncio.Task[Any], label: str) -> None:
+        if task in self._pending_stream_tasks:
+            return
+        self._pending_stream_tasks.add(task)
+
+        def finished(completed: asyncio.Task[Any]) -> None:
+            self._pending_stream_tasks.discard(completed)
+            try:
+                completed.result()
+            except BaseException as exc:
+                logging.info("Late cancelled stream %s terminated with %r.", label, exc)
+
+        task.add_done_callback(finished)
+
     def _complete_sync(self, request: ChatCompletionRequest) -> _GenerationResult:
         ctx = None
         text = ""
         reasoning = ""
         finish_reason = "stop"
         tokens = 0
+        generated_items: list[Any] = []
+        tool_text = ""
+        tool_texts: list[str] = []
+        previous_state: str | None = None
         repetition_detector = _RepetitionDetector()
         try:
             ctx, responses = self._begin_generation(request)
@@ -1101,14 +1627,32 @@ class TokenityDistributedRuntime:
                     logging.warning("Tokenity stopped generation after detecting repeated output.")
                     break
                 tokens += 1
+                generated_items.append(item)
                 finish_reason = item.finish_reason or finish_reason
                 if item.state == "reasoning":
                     reasoning += item.text
-                elif item.state != "tool":
+                elif item.state == "tool":
+                    tool_text += item.text
+                else:
+                    if previous_state == "tool" and tool_text:
+                        tool_texts.append(tool_text)
+                        tool_text = ""
                     text += item.text
+                previous_state = item.state
+            if previous_state == "tool" and tool_text:
+                tool_texts.append(tool_text)
+            tool_calls = _format_tool_calls(ctx, tool_texts, request.tools)
+            if tool_calls and finish_reason == "stop":
+                finish_reason = "tool_calls"
             return _GenerationResult(
                 text=text,
                 reasoning=reasoning,
+                tool_calls=tool_calls,
+                logprobs=(
+                    _completion_logprobs(generated_items)
+                    if request.logprobs
+                    else None
+                ),
                 finish_reason=finish_reason,
                 prompt_tokens=len(ctx.prompt),
                 completion_tokens=tokens,
@@ -1119,6 +1663,8 @@ class TokenityDistributedRuntime:
                 ctx.stop()
 
     def _begin_generation(self, request: ChatCompletionRequest) -> tuple[Any, Iterator[Any]]:
+        if self._retired_reason is not None:
+            raise RuntimeError(self._retired_reason)
         if self.execution_mode == "single":
             return self._begin_single_generation(request)
         if self._symbols is None or self._generator is None:
@@ -1180,6 +1726,7 @@ class TokenityDistributedRuntime:
 
             from mlx_lm import stream_generate  # type: ignore
             from mlx_lm.sample_utils import make_logits_processors, make_sampler  # type: ignore
+            from mlx_lm.server import _format_top_logprobs  # type: ignore
 
             context = _SingleGenerationContext(list(prompt))
             with self._single_contexts_lock:
@@ -1210,7 +1757,7 @@ class TokenityDistributedRuntime:
                 model=self._single_model,
                 tokenizer=tokenizer,
                 prompt=prompt,
-                max_tokens=request.max_tokens or self.max_tokens,
+                max_tokens=_request_max_tokens(request, self.max_tokens),
                 sampler=sampler,
                 logits_processors=logits_processors,
                 prefill_step_size=self.prefill_step_size,
@@ -1222,9 +1769,19 @@ class TokenityDistributedRuntime:
                     for item in generated:
                         if context.stopped or self._stop_event.is_set():
                             break
+                        token, logprob, top_tokens = _single_token_logprobs(
+                            item,
+                            tokenizer=tokenizer,
+                            include_logprob=request.logprobs is True,
+                            top_n=request.top_logprobs or 0,
+                            top_formatter=_format_top_logprobs,
+                        )
                         yield SimpleNamespace(
                             text=getattr(item, "text", ""),
+                            token=token,
                             state="content",
+                            logprob=logprob,
+                            top_tokens=top_tokens,
                             finish_reason=getattr(item, "finish_reason", None),
                         )
                 finally:
@@ -1245,7 +1802,11 @@ class TokenityDistributedRuntime:
         with self._request_count_lock:
             self._active_request_count = max(0, self._active_request_count - 1)
             remaining = self._active_request_count
-        if remaining == 0 and self.state.phase not in {ReadinessPhase.FAILED, ReadinessPhase.STOPPING}:
+        if (
+            remaining == 0
+            and self._retired_reason is None
+            and self.state.phase not in {ReadinessPhase.FAILED, ReadinessPhase.STOPPING}
+        ):
             self.state.transition(
                 ReadinessPhase.READY,
                 message="Runtime is accepting generation requests.",
@@ -1253,7 +1814,7 @@ class TokenityDistributedRuntime:
 
     def _generation_args(self, request: ChatCompletionRequest) -> Any:
         assert self._symbols is not None
-        max_tokens = request.max_tokens or self.max_tokens
+        max_tokens = _request_max_tokens(request, self.max_tokens)
         return self._symbols.GenerationArguments(
             model=self._symbols.ModelDescription(
                 model="default_model",
@@ -1288,8 +1849,12 @@ class TokenityDistributedRuntime:
             stop_words=_stop_words(request.stop),
             max_tokens=max_tokens,
             num_draft_tokens=0,
-            logprobs=False,
-            top_logprobs=-1,
+            logprobs=request.logprobs is True,
+            top_logprobs=(
+                request.top_logprobs
+                if request.top_logprobs is not None
+                else -1
+            ),
             seed=request.seed,
             chat_template_kwargs=request.chat_template_kwargs,
         )
@@ -1325,7 +1890,7 @@ class TokenityDistributedRuntime:
             model_map[self.model_id] = self.model
 
     def _is_serving_model(self) -> bool:
-        return self.state.phase in {
+        return self._retired_reason is None and self.state.phase in {
             ReadinessPhase.READY,
             ReadinessPhase.PREFILL_PENDING,
             ReadinessPhase.GENERATING,
@@ -1334,34 +1899,57 @@ class TokenityDistributedRuntime:
     def _configure_distributed_generation_mode(self) -> None:
         if (
             self._provider is not None
-            and self.process_isolated_shutdown
             and (self.state.connection_mode or "").lower() in {"jaccl", "jaccl-ring"}
         ):
-            # MLX-LM 0.31.x keeps BatchGenerator collectives alive between
-            # requests. GLM-5.2's distributed MoE/DSA graph leaves JACCL
-            # receive work requests attached to that persistent batch and the
-            # following prefill can fail with ibv_post_recv(ENOMEM). The
-            # configured concurrency for this compatibility path is one, so
-            # the sequential engine preserves throughput semantics without
-            # carrying cross-request collective state.
+            # MLX-LM 0.31.x keeps BatchGenerator collectives and prompt-cache
+            # state alive between requests. On JACCL this can let a worker
+            # enter the next request-control collective while rank 0 is still
+            # finishing the previous model collective. The next control frame
+            # then consumes model data (or ibv_post_recv reaches ENOMEM).
+            # Tokenity configures one decode at a time, so the sequential
+            # engine preserves the supported concurrency without carrying
+            # cross-request collective state.
             if getattr(self._provider, "is_batchable", False):
                 self._provider.is_batchable = False
 
-            # ResponseGenerator also keeps an LRU prompt/KV cache on each
-            # process. Only rank 0 owns the HTTP readiness warmup, so workers
-            # can otherwise retain that warmup entry while rank 0 replaces
-            # its cache. Reusing the same prompt on the next request then
-            # gives the ranks different sequence lengths and mismatched JACCL
-            # collectives. A zero-sized LRU immediately evicts every entry and
-            # keeps all ranks on identical request-local state.
+            # Only rank 0 owns the HTTP readiness warmup. A worker can
+            # otherwise retain that warmup cache while rank 0 replaces its
+            # copy, giving the ranks different prefill lengths on the next
+            # request. A zero-sized LRU keeps all ranks request-local.
             self._distributed_prompt_cache_size = 0
             if self._generator is not None and self._symbols is not None:
                 self._generator.prompt_cache = self._symbols.LRUPromptCache(0)
             logging.warning(
-                "Tokenity selected sequential generation for GLM-5.2 over JACCL "
-                "and disabled distributed prompt caching to isolate collective "
+                "Tokenity selected sequential generation over JACCL and "
+                "disabled distributed prompt caching to isolate collective "
                 "state between requests."
             )
+
+    def _prepare_distributed_generation_mode(self) -> None:
+        """Install JACCL invariants before ResponseGenerator starts its thread."""
+
+        if (
+            self._provider is None
+            or (self.state.connection_mode or "").lower()
+            not in {"jaccl", "jaccl-ring"}
+        ):
+            return
+        provider = self._provider
+        self._distributed_prompt_cache_size = 0
+        if getattr(provider, "_tokenity_jaccl_sequential_prepared", False):
+            return
+        load_default = provider.load_default
+
+        def tokenity_load_default() -> Any:
+            result = load_default()
+            # ModelProvider._load recomputes this after materializing the
+            # model. Override it in the generation thread, before that thread
+            # can receive the readiness warmup or any user request.
+            provider.is_batchable = False
+            return result
+
+        provider.load_default = tokenity_load_default
+        provider._tokenity_jaccl_sequential_prepared = True
 
     def _monitor_model_load(self) -> None:
         assert self._generator is not None
@@ -1650,14 +2238,29 @@ def _skeleton_completion(*, model: str) -> dict[str, object]:
     }
 
 
-def _message_payload(content: str, reasoning: str) -> dict[str, str]:
-    payload = {"role": "assistant", "content": content}
+def _message_payload(
+    content: str,
+    reasoning: str,
+    tool_calls: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "role": "assistant",
+        "content": content if content or not tool_calls else None,
+    }
     if reasoning:
         payload["reasoning_content"] = reasoning
+    if tool_calls:
+        payload["tool_calls"] = tool_calls
     return payload
 
 
-def _stream_payload(item: Any, model_id: str, finish_reason: str | None) -> dict[str, object] | None:
+def _stream_payload(
+    item: Any,
+    model_id: str,
+    finish_reason: str | None,
+    *,
+    include_logprobs: bool = False,
+) -> dict[str, object] | None:
     if not getattr(item, "text", "") and finish_reason is None:
         return None
     delta: dict[str, object] = {}
@@ -1667,19 +2270,124 @@ def _stream_payload(item: Any, model_id: str, finish_reason: str | None) -> dict
         delta["content"] = item.text
     else:
         return None
+    choice: dict[str, object] = {
+        "index": 0,
+        "delta": delta,
+        "finish_reason": finish_reason,
+    }
+    if include_logprobs:
+        choice["logprobs"] = {
+            "content": [_token_logprob_payload(item)]
+        }
     return {
         "id": f"chatcmpl-tokenity-{uuid.uuid4()}",
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": model_id,
-        "choices": [
+        "choices": [choice],
+    }
+
+
+def _request_max_tokens(
+    request: ChatCompletionRequest,
+    runtime_default: int,
+) -> int:
+    return request.max_completion_tokens or request.max_tokens or runtime_default
+
+
+def _single_token_logprobs(
+    item: Any,
+    *,
+    tokenizer: Any,
+    include_logprob: bool,
+    top_n: int,
+    top_formatter,
+) -> tuple[int, float, tuple[dict[str, Any], ...]]:
+    token = getattr(item, "token", -1)
+    raw_logprobs = getattr(item, "logprobs", None)
+    if raw_logprobs is None or not isinstance(token, int) or token < 0:
+        return token, 0.0, ()
+    logprob = (
+        float(raw_logprobs[token].item())
+        if include_logprob
+        else 0.0
+    )
+    top_tokens = (
+        top_formatter(raw_logprobs, top_n, tokenizer)
+        if top_n > 0
+        else ()
+    )
+    return token, logprob, top_tokens
+
+
+def _token_logprob_payload(item: Any) -> dict[str, Any]:
+    text = str(getattr(item, "text", ""))
+    top_tokens = getattr(item, "top_tokens", ()) or ()
+    return {
+        "token": text,
+        "bytes": list(text.encode("utf-8")),
+        "logprob": float(getattr(item, "logprob", 0.0)),
+        "top_logprobs": [
             {
-                "index": 0,
-                "delta": delta,
-                "finish_reason": finish_reason,
+                "token": str(candidate.get("token", "")),
+                "bytes": list(str(candidate.get("token", "")).encode("utf-8")),
+                "logprob": float(candidate.get("logprob", 0.0)),
             }
+            for candidate in top_tokens
+            if isinstance(candidate, dict)
         ],
     }
+
+
+def _completion_logprobs(items: list[Any]) -> dict[str, Any]:
+    return {
+        "content": [
+            _token_logprob_payload(item)
+            for item in items
+            if getattr(item, "state", None) != "tool"
+        ]
+    }
+
+
+def _format_tool_calls(
+    ctx: Any,
+    tool_texts: list[str],
+    tools: list[Any] | None,
+    *,
+    streaming: bool = False,
+) -> list[dict[str, Any]]:
+    parser = getattr(ctx, "tool_parser", None)
+    if not tool_texts or not callable(parser):
+        return []
+    formatted: list[dict[str, Any]] = []
+    for tool_text in tool_texts:
+        try:
+            parsed = parser(tool_text, tools)
+        except (ValueError, json.JSONDecodeError) as exc:
+            logging.warning(
+                "Failed to parse tool call (%s: %s); the model output may be truncated.",
+                type(exc).__name__,
+                exc,
+            )
+            continue
+        calls = parsed if isinstance(parsed, list) else [parsed]
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            function = dict(call)
+            tool_call_id = str(function.pop("id", "") or uuid.uuid4())
+            arguments = function.get("arguments", {})
+            if not isinstance(arguments, str):
+                function["arguments"] = json.dumps(arguments, ensure_ascii=False)
+            payload: dict[str, Any] = {
+                "id": tool_call_id,
+                "type": "function",
+                "function": function,
+            }
+            if streaming:
+                payload["index"] = len(formatted)
+            formatted.append(payload)
+    return formatted
 
 
 def _stop_words(value: str | list[str] | None) -> list[str]:
@@ -1698,6 +2406,25 @@ def _next_response(iterator: Iterator[Any]) -> Any:
         return next(iterator)
     except StopIteration:
         return _DONE
+
+
+def _close_response_iterator(iterator: Iterator[Any] | None) -> None:
+    close = getattr(iterator, "close", None)
+    if callable(close):
+        try:
+            close()
+        except (RuntimeError, ValueError):
+            # A timed-out to_thread call may still own the generator. The task
+            # remains tracked and the retired runtime will not be reused.
+            pass
+
+
+def _drain_response_iterator(iterator: Iterator[Any]) -> None:
+    try:
+        for _ in iterator:
+            pass
+    finally:
+        _close_response_iterator(iterator)
 
 
 def _process_resident_bytes(pid: int) -> int | None:
@@ -1819,20 +2546,20 @@ def serve(
 
     if runtime is not None and not runtime.is_rank0():
         def request_rank_stop(_signum: int, _frame: Any) -> None:
-            if runtime.process_isolated_shutdown:
-                os._exit(0)
             runtime.request_stop()
 
         signal.signal(signal.SIGTERM, request_rank_stop)
         signal.signal(signal.SIGINT, request_rank_stop)
         runtime.join()
+        # The GLM generation thread has already destroyed its thread-local MLX
+        # streams and runtime.join() has released Python references and the
+        # allocator cache.  Return normally so MLX/JACCL can unregister the
+        # worker rank's RDMA-backed Metal pages during interpreter teardown.
         return
 
     server_holder: dict[str, Any] = {}
 
     def request_server_exit() -> None:
-        if runtime is not None and runtime.process_isolated_shutdown:
-            os._exit(0)
         server = server_holder.get("server")
         if server is not None:
             server.should_exit = True

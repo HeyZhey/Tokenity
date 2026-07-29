@@ -49,6 +49,7 @@ from tokenity.control import (
     RouteDecision,
     RoutePolicy,
     RouteReason,
+    live_system_available_memory_bytes,
 )
 from tokenity.inference.native_mtp import scan_native_mtp_capability
 from tokenity.mlx.hostfile import ClusterNode, ConnectionMode, HostfileError, build_hostfile
@@ -58,6 +59,9 @@ from tokenity.process.supervisor import RoleSupervisor
 
 
 DEFAULT_MODEL_ROOT = "/Users/Shared/TokenityModels"
+DEFAULT_RUNTIME_MANIFEST = "/Users/Shared/TokenityRuntime/runtime-manifest.json"
+MINIMUM_MEMORY_HEADROOM_RATIO = 0.25
+PORT_REUSE_QUARANTINE_SECONDS = 30.0
 NODE_AGENT_CONTRACT_VERSION = 1
 NODE_AGENT_CAPABILITIES = (
     "cluster_runtime",
@@ -280,7 +284,11 @@ def create_app(
         capability_registry.register(profile)
     auto_router = AutoRouter()
     session_routes: dict[str, tuple[str, str]] = {}
-    resource_ledger = ResourceLedger(_total_memory_bytes() or 0)
+    resource_ledger = ResourceLedger(
+        _total_memory_bytes() or 0,
+        minimum_headroom_ratio=MINIMUM_MEMORY_HEADROOM_RATIO,
+        port_reuse_delay_seconds=PORT_REUSE_QUARANTINE_SECONDS,
+    )
     instance_workers: dict[str, list[str]] = {}
     instance_roles: dict[str, str] = {}
     instance_ports: dict[str, int] = {}
@@ -290,10 +298,24 @@ def create_app(
     launch_generation = 0
     launch_tokens: dict[str, int] = {}
     lease_deadline: float | None = None
-    runtime_port = 8_000
     cluster_runtime: dict[str, object] | None = None
     cluster_runtimes: dict[str, dict[str, object]] = {}
     startup_orphans: list[dict[str, object]] = []
+
+    def system_available_memory_bytes(
+        memory: dict[str, object] | None = None,
+    ) -> int | None:
+        return live_system_available_memory_bytes(
+            memory or _memory_stats(),
+            minimum_headroom_ratio=resource_ledger.minimum_headroom_ratio,
+        )
+
+    def resource_ledger_snapshot(
+        memory: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        return resource_ledger.snapshot(
+            system_available_memory_bytes=system_available_memory_bytes(memory)
+        )
 
     def begin_launch(instance_id: str) -> int:
         nonlocal launch_generation
@@ -397,6 +419,7 @@ def create_app(
                 observed_footprint_bytes=observed_footprint,
                 safety_margin_ratio=0.1,
                 breakdown=breakdown,
+                system_available_memory_bytes=system_available_memory_bytes(),
             )
         except ResourceAdmissionError as exc:
             return str(exc)
@@ -466,10 +489,29 @@ def create_app(
             cluster_runtime = None
             cluster_runtimes.clear()
 
+    def owned_running_coordinator_ports() -> dict[str, int]:
+        with lifecycle_lock:
+            candidates = [
+                (instance_id, instance_roles.get(instance_id), port)
+                for instance_id, port in instance_ports.items()
+            ]
+
+        owned: dict[str, int] = {}
+        for instance_id, role, port in candidates:
+            if role not in {"distributed-openai", "single-node-openai"}:
+                continue
+            status = supervisor_status(role, instance_id)
+            if (
+                getattr(status, "pid", None) is None
+                or getattr(status, "return_code", None) is not None
+            ):
+                continue
+            owned[instance_id] = port
+        return owned
+
     def request_local_model_roles_stop() -> list[dict[str, object]]:
         coordinator_requested: set[str | None] = set()
-        ports = {None: runtime_port, **{key: value for key, value in instance_ports.items()}}
-        for instance_id, port in ports.items():
+        for instance_id, port in owned_running_coordinator_ports().items():
             try:
                 _post_json(f"http://127.0.0.1:{port}/v1/tokenity/stop", {}, 2.0)
                 coordinator_requested.add(instance_id)
@@ -726,6 +768,7 @@ def create_app(
             "mlx_lm_version": _package_version("mlx-lm"),
             "tokenity_version": __version__,
             "tokenity_code_revision": _tokenity_code_revision(),
+            "runtime": _runtime_identity(),
             "agent_contract": {
                 "version": NODE_AGENT_CONTRACT_VERSION,
                 "capabilities": list(NODE_AGENT_CAPABILITIES),
@@ -735,7 +778,7 @@ def create_app(
             "cluster_runtime": cluster_runtime_snapshot(),
             "cluster_runtimes": cluster_runtimes_snapshot(),
             "instances": instances.snapshots(),
-            "resource_ledger": resource_ledger.snapshot(),
+            "resource_ledger": resource_ledger_snapshot(memory),
             "orphaned_processes": list(startup_orphans),
             "memory": memory,
             "rdma": rdma.to_dict(),
@@ -747,19 +790,23 @@ def create_app(
 
     @app.get("/v1/node/status")
     def node_status() -> dict[str, object]:
+        memory = _memory_stats()
         return {
             "roles": [status.__dict__ for status in roles.status()],  # type: ignore[union-attr]
             "cluster_runtime": cluster_runtime_snapshot(),
             "cluster_runtimes": cluster_runtimes_snapshot(),
             "instances": instances.snapshots(),
-            "resource_ledger": resource_ledger.snapshot(),
+            "resource_ledger": resource_ledger_snapshot(memory),
             "orphaned_processes": list(startup_orphans),
-            "memory": _memory_stats(),
+            "memory": memory,
         }
 
     @app.get("/v1/node/instances")
     def list_instances() -> dict[str, object]:
-        return {"data": instances.snapshots(), "resource_ledger": resource_ledger.snapshot()}
+        return {
+            "data": instances.snapshots(),
+            "resource_ledger": resource_ledger_snapshot(),
+        }
 
     @app.get("/v1/node/instances/{instance_id}")
     def get_instance(instance_id: str) -> dict[str, object]:
@@ -1671,7 +1718,6 @@ def create_app(
 
     @app.post("/v1/node/start-distributed-openai")
     def start_distributed(request: StartRequest) -> dict[str, object]:
-        nonlocal runtime_port
         if issue := standalone_model_issue(request.model):
             raise HTTPException(status_code=400, detail=issue)
         if not request.dry_run and Path(request.python).resolve() != Path(sys.executable).resolve():
@@ -1694,9 +1740,9 @@ def create_app(
             )
             if request.connection_mode != requested_connection_mode:
                 logging.warning(
-                    "Tokenity selected %s instead of %s for GLM-5.2 because "
-                    "reusing the direct JACCL path across requests can fail "
-                    "with Recv error -12.",
+                    "Tokenity selected %s instead of %s because the direct "
+                    "JACCL mesh can fail with Recv error -12 after readiness "
+                    "or when another resident communicator is active.",
                     request.connection_mode.value,
                     requested_connection_mode.value,
                 )
@@ -1710,7 +1756,7 @@ def create_app(
                     status_code=412,
                     detail={"stage": "preflight", "instance_id": instance_id, "issues": issues},
                 )
-            ledger_snapshot = resource_ledger.snapshot()
+            ledger_snapshot = resource_ledger_snapshot()
             request.port = _allocate_instance_port(request.port, ledger_snapshot)
             request.starting_port = _allocate_collective_port(
                 request.starting_port,
@@ -1785,13 +1831,17 @@ def create_app(
             }
         ports = [request.port, *range(request.starting_port, request.starting_port + max(1, len(nodes)))]
         try:
-            resource_ledger.reserve(instance_id, reservation, ports)
+            resource_ledger.reserve(
+                instance_id,
+                reservation,
+                ports,
+                system_available_memory_bytes=system_available_memory_bytes(),
+            )
         except ResourceAdmissionError as exc:
             instances.remove(instance_id)
             raise HTTPException(status_code=409, detail={"stage": "resource_admission", "message": str(exc)}) from exc
         instance.transition(InstanceLifecycle.LAUNCHING)
 
-        runtime_port = request.port
         generation = begin_launch(instance_id)
         local_request = rank_requests[0]
         set_cluster_runtime(local_request, "controller")
@@ -1894,7 +1944,6 @@ def create_app(
 
     @app.post("/v1/node/start-distributed-rank")
     def start_distributed_rank(request: RankStartRequest) -> dict[str, object]:
-        nonlocal runtime_port
         if issue := standalone_model_issue(request.model):
             raise HTTPException(status_code=400, detail=issue)
         if request.rank >= request.world_size:
@@ -1929,7 +1978,6 @@ def create_app(
             command, env = _rank_command_and_environment(request)
         except HostfileError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        runtime_port = request.port
         generation = begin_launch(instance_id)
         set_cluster_runtime(request, "worker")
         reservation_breakdown = _estimated_memory_reservation_breakdown(
@@ -1972,6 +2020,7 @@ def create_app(
                     instance_id,
                     reservation,
                     list(range(request.starting_port, request.starting_port + max(1, request.world_size))),
+                    system_available_memory_bytes=system_available_memory_bytes(),
                 )
                 instance.transition(InstanceLifecycle.LAUNCHING)
                 instance.transition(InstanceLifecycle.DISTRIBUTED_INITIALIZING)
@@ -2032,8 +2081,10 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
         port = instance_ports.get(instance_id, instance.http_port)
+        coordinator_stop_requested = False
         try:
             _post_json(f"http://127.0.0.1:{port}/v1/tokenity/stop", {}, 2.0)
+            coordinator_stop_requested = True
         except Exception:
             pass
 
@@ -2052,8 +2103,52 @@ def create_app(
         role = instance_roles.get(instance_id)
         status = None
         if role is not None:
-            supervisor_request_stop(role, instance_id)
-            status = supervisor_wait(role, request.timeout, instance_id)
+            deadline = time.monotonic() + request.timeout
+            if role == "distributed-openai-rank" and _requires_coordinated_rank_stop(
+                instance.connection_mode,
+            ):
+                # The coordinator broadcasts a validated stop sentinel through
+                # the existing control collective.  Give the worker rank time
+                # to receive it, leave the generation loop, and clear its
+                # thread-local MLX streams before escalating to SIGTERM.
+                status = supervisor_wait(
+                    role,
+                    min(2.0, request.timeout),
+                    instance_id,
+                )
+                if getattr(status, "pid", None) is not None:
+                    supervisor_request_stop(role, instance_id)
+                    status = supervisor_wait(
+                        role,
+                        max(0.0, deadline - time.monotonic()),
+                        instance_id,
+                    )
+            elif (
+                role in {"distributed-openai", "single-node-openai"}
+                and coordinator_stop_requested
+            ):
+                # The successful admin request already initiated natural
+                # Uvicorn/runtime teardown.  Let it finish before using a
+                # signal fallback so a clean exit is not reported as -15.
+                status = supervisor_wait(
+                    role,
+                    max(0.0, deadline - time.monotonic()),
+                    instance_id,
+                )
+                if getattr(status, "pid", None) is not None:
+                    supervisor_request_stop(role, instance_id)
+                    status = supervisor_wait(
+                        role,
+                        max(0.0, deadline - time.monotonic()),
+                        instance_id,
+                    )
+            else:
+                supervisor_request_stop(role, instance_id)
+                status = supervisor_wait(
+                    role,
+                    max(0.0, deadline - time.monotonic()),
+                    instance_id,
+                )
             if getattr(status, "pid", None) is not None:
                 status = supervisor_stop(role, min(2.0, request.timeout), instance_id)
         resource_ledger.release(instance_id)
@@ -2425,10 +2520,17 @@ def _first_positive_int(
     *keys: str,
     default: int,
 ) -> int:
-    for key in keys:
-        value = values.get(key)
-        if isinstance(value, int) and value > 0:
-            return value
+    candidates = [values]
+    candidates.extend(
+        nested
+        for nested_key in ("text_config", "language_config")
+        if isinstance((nested := values.get(nested_key)), dict)
+    )
+    for candidate in candidates:
+        for key in keys:
+            value = candidate.get(key)
+            if isinstance(value, int) and value > 0:
+                return value
     return default
 
 
@@ -2697,17 +2799,22 @@ def _stable_connection_mode_for_model(
     model: str,
     requested: ConnectionMode,
 ) -> ConnectionMode:
+    del model
     if requested != ConnectionMode.JACCL:
         return requested
-    config = _read_model_config(Path(model) / "config.json")
-    identities = [Path(model).name, str(config.get("model_type", ""))]
-    architectures = config.get("architectures")
-    if isinstance(architectures, list):
-        identities.extend(str(item) for item in architectures)
-    identity = " ".join(identities).lower()
-    if "glm" in identity and ("moe" in identity or "5.2" in identity):
-        return ConnectionMode.JACCL_RING
-    return requested
+    # The direct two-rank JACCL mesh can leave receives posted after a
+    # completed request. A later request, or a second resident communicator on
+    # the same RDMA device, then fails in ibv_post_recv with ENOMEM (-12).
+    # The ring implementation drains its work requests and has passed the
+    # repeated-request and multi-resident hardware matrix, so make it the
+    # stable implementation for every model.
+    return ConnectionMode.JACCL_RING
+
+
+def _requires_coordinated_rank_stop(
+    connection_mode: str,
+) -> bool:
+    return str(connection_mode).lower() in {"jaccl", "jaccl-ring"}
 
 
 def _quantization_description(config: dict[str, object], model_path: Path) -> str | None:
@@ -3223,6 +3330,47 @@ def _tokenity_code_revision() -> str | None:
     return digest.hexdigest()
 
 
+def _runtime_identity() -> dict[str, object] | None:
+    path = Path(os.environ.get("TOKENITY_RUNTIME_MANIFEST", DEFAULT_RUNTIME_MANIFEST))
+    try:
+        raw = path.read_bytes()
+        manifest = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(manifest, dict):
+        return None
+
+    packages = manifest.get("packages")
+    payload = manifest.get("payload")
+    if not isinstance(packages, dict) or not isinstance(payload, dict):
+        return None
+
+    expected_packages = {
+        str(name): str(version)
+        for name, version in packages.items()
+        if isinstance(name, str) and isinstance(version, str)
+    }
+    observed_packages = {
+        name: _package_version(name)
+        for name in expected_packages
+    }
+    compatible = (
+        manifest.get("architecture") == platform.machine()
+        and manifest.get("python_version") == platform.python_version()
+        and observed_packages == expected_packages
+    )
+    return {
+        "runtime_id": manifest.get("runtime_id"),
+        "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+        "payload_sha256": payload.get("tree_sha256"),
+        "architecture": manifest.get("architecture"),
+        "minimum_macos": manifest.get("minimum_macos"),
+        "python_version": manifest.get("python_version"),
+        "packages": expected_packages,
+        "install_state": "ready" if compatible else "incompatible",
+    }
+
+
 def _estimated_memory_reservation_breakdown(
     model: str,
     world_size: int,
@@ -3301,6 +3449,10 @@ def _estimated_memory_reservation(model: str, world_size: int) -> int:
 
 def _allocate_instance_port(preferred: int, ledger: dict[str, object]) -> int:
     reserved = {int(port) for port in dict(ledger.get("ports") or {}).keys()}
+    reserved.update(
+        int(port)
+        for port in dict(ledger.get("quarantined_ports") or {}).keys()
+    )
     for port in range(preferred, min(65_536, preferred + 256)):
         if port in reserved:
             continue
@@ -3317,6 +3469,10 @@ def _allocate_collective_port(
     excluded_ports: set[int] | None = None,
 ) -> int:
     reserved = {int(port) for port in dict(ledger.get("ports") or {}).keys()}
+    reserved.update(
+        int(port)
+        for port in dict(ledger.get("quarantined_ports") or {}).keys()
+    )
     reserved.update(excluded_ports or set())
     width = max(1, world_size)
     last_starting_port = min(65_536 - width, preferred + 255)
