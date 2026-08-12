@@ -1017,7 +1017,12 @@ def test_cluster_payload_rejects_credentials_in_agent_url():
 
 @pytest.mark.parametrize(
     "endpoint",
-    ["http://127.0.0.2:9100", "http://[::1]:9100", "http://worker.localhost:9100"],
+    [
+        "http://127.0.0.2:9100",
+        "http://127.1:9100",
+        "http://[::1]:9100",
+        "http://worker.localhost.:9100",
+    ],
 )
 def test_cluster_payload_rejects_remote_loopback_agent_url(endpoint):
     client = TestClient(create_app(rdma_probe_fn=fake_rdma_probe))

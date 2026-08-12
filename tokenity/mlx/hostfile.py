@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ipaddress
+import socket
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -40,10 +42,36 @@ def build_hostfile(nodes: list[ClusterNode], mode: ConnectionMode) -> list[dict[
     if not nodes:
         raise HostfileError("At least one node is required.")
     if mode == ConnectionMode.RING:
-        return _build_ring_hostfile(nodes)
-    if mode in {ConnectionMode.JACCL, ConnectionMode.JACCL_RING}:
-        return _build_jaccl_hostfile(nodes, include_ring_ips=mode == ConnectionMode.JACCL_RING)
-    raise HostfileError(f"Unsupported connection mode: {mode}")
+        rows = _build_ring_hostfile(nodes)
+    elif mode in {ConnectionMode.JACCL, ConnectionMode.JACCL_RING}:
+        rows = _build_jaccl_hostfile(nodes, include_ring_ips=mode == ConnectionMode.JACCL_RING)
+    else:
+        raise HostfileError(f"Unsupported connection mode: {mode}")
+    if len(nodes) > 1:
+        for node, row in zip(nodes, rows):
+            if any(is_loopback_host(address) for address in row["ips"]):
+                raise HostfileError(f"{node.id}: distributed data address must not use loopback.")
+    return rows
+
+
+def is_loopback_host(host: str) -> bool:
+    host = host.strip().rstrip(".").strip("[]")
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        lowered = host.lower()
+        if lowered == "localhost" or lowered.endswith(".localhost"):
+            return True
+        try:
+            addresses = socket.getaddrinfo(
+                host,
+                None,
+                type=socket.SOCK_STREAM,
+                flags=socket.AI_NUMERICHOST,
+            )
+        except socket.gaierror:
+            return False
+        return any(ipaddress.ip_address(address[4][0]).is_loopback for address in addresses)
 
 
 def validate_jaccl_readiness(nodes: list[ClusterNode]) -> list[str]:

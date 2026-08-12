@@ -4,7 +4,6 @@ import asyncio
 import getpass
 import hashlib
 import http.client
-import ipaddress
 import importlib.metadata
 import json
 import logging
@@ -58,7 +57,13 @@ from tokenity.control.routing import (
     RouteReason,
 )
 from tokenity.inference.native_mtp import scan_native_mtp_capability
-from tokenity.mlx.hostfile import ClusterNode, ConnectionMode, HostfileError, build_hostfile
+from tokenity.mlx.hostfile import (
+    ClusterNode,
+    ConnectionMode,
+    HostfileError,
+    build_hostfile,
+    is_loopback_host,
+)
 from tokenity.mlx.rdma_probe import RDMAProbeResult, probe_rdma
 from tokenity.model_inspection import (
     distributed_model_issue,
@@ -4602,12 +4607,7 @@ def _agent_url(node: ClusterNode, *, remote: bool = False) -> str:
         raise HostfileError(f"{node.id}: Agent URL must not contain a username or password.")
     if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
         raise HostfileError(f"{node.id}: Agent URL must be an HTTP origin without a path, query, or fragment.")
-    host = parsed.hostname.lower()
-    try:
-        loopback = ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        loopback = host == "localhost" or host.endswith(".localhost")
-    if remote and loopback:
+    if remote and is_loopback_host(parsed.hostname):
         raise HostfileError(f"{node.id}: remote Node Agent URL must not use loopback.")
     return url
 
@@ -4645,16 +4645,16 @@ def _http_rank_requests(
         # creates no hostfile, collective group, remote-rank request, or RDMA
         # environment.
         pass
-    elif request.connection_mode == ConnectionMode.RING:
-        port = request.starting_port
-        for node in nodes:
-            data_ip = node.lan_ip or node.rdma_ip
-            if not data_ip:
-                raise HostfileError(f"{node.id}: missing standard-network IP.")
-            ring_hosts.append([f"{data_ip}:{port}"])
-            port += 1
     else:
         hostfile = build_hostfile(nodes, request.connection_mode)
+    if world_size > 1 and request.connection_mode == ConnectionMode.RING:
+        port = request.starting_port
+        for node, row in zip(nodes, hostfile):
+            if not row["ips"]:
+                raise HostfileError(f"{node.id}: missing standard-network IP.")
+            ring_hosts.append([f"{row['ips'][0]}:{port}"])
+            port += 1
+    elif world_size > 1:
         if not hostfile[0]["ips"]:
             raise HostfileError("Rank 0 needs a Thunderbolt/RDMA coordinator IP.")
         coordinator_ip = str(hostfile[0]["ips"][0])
