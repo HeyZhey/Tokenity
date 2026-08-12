@@ -2423,6 +2423,37 @@ def _start_ready_gateway_model(
     return response.json()["instance"]["http_port"]
 
 
+@pytest.mark.parametrize("phase", ["prefill_pending", "generating"])
+def test_gateway_keeps_busy_runtime_routable(tmp_path: Path, monkeypatch, phase: str):
+    monkeypatch.setattr(agent_module.tempfile, "gettempdir", lambda: str(tmp_path))
+    client = TestClient(
+        create_app(
+            rdma_probe_fn=fake_rdma_probe,
+            supervisor=_FakeSupervisor(),
+            runtime_preflight_fn=lambda *_: [],
+        )
+    )
+    _start_ready_gateway_model(
+        client,
+        model_id="busy-model",
+        instance_id="instance-busy",
+        operation_id="operation-busy",
+        port=17_900,
+    )
+    runtime_path = agent_module._runtime_status_path("instance-busy", 0)
+    runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+    runtime.update(phase=phase, updated_at=time.time())
+    runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+
+    decision = client.post(
+        "/v1/router/decision",
+        json={"model": "instance-busy", "messages": []},
+    )
+
+    assert decision.status_code == 200, decision.text
+    assert decision.json()["selected_instance_id"] == "instance-busy"
+
+
 def test_stable_gateway_routes_multiple_instances_and_releases_request_leases(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(agent_module.tempfile, "gettempdir", lambda: str(tmp_path))
     supervisor = _FakeSupervisor()

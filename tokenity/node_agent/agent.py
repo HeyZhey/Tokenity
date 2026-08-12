@@ -1723,7 +1723,7 @@ def create_app(
                 issues.append(f"{node}: instance identity mismatch.")
             if runtime.get("operation_id") != instance.operation_id:
                 issues.append(f"{node}: operation identity mismatch.")
-            if runtime.get("phase") != "ready":
+            if runtime.get("phase") not in {"ready", "prefill_pending", "generating"}:
                 issues.append(f"{node}: runtime phase is {runtime.get('phase') or 'unknown'}.")
             if runtime.get("status_stale") is True:
                 issues.append(f"{node}: runtime heartbeat is stale.")
