@@ -10,8 +10,6 @@ BUNDLE_NAME="${TOKENITY_BUNDLE_NAME:-TokenityControl}"
 BUNDLE_VERSION="${TOKENITY_BUNDLE_VERSION:-1}"
 BUNDLE_SHORT_VERSION="${TOKENITY_BUNDLE_SHORT_VERSION:-0.1.0}"
 
-xcrun swift "$ROOT/scripts/generate-tokenity-brand-assets.swift" "$ROOT" >&2
-
 cd "$APP_DIR"
 swift build -c "$CONFIGURATION" >&2
 

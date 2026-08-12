@@ -13,7 +13,7 @@ authors = [{ name = "Tokenity" }]
 dependencies = [
   "fastapi>=0.115",
   "pydantic>=2.7",
-  "uvicorn[standard]>=0.30",
+  "uvicorn>=0.30",
 ]
 
 [project.optional-dependencies]
@@ -31,4 +31,3 @@ include = ["tokenity*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-
