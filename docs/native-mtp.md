@@ -163,9 +163,7 @@ contains no MTP tensors. Its correct result is therefore:
 That checkpoint cannot provide a real Native MTP throughput or acceptance
 measurement. It was retained as the missing-weight fail-closed test case.
 
-With explicit user approval, the 4B split target and MTP repositories were
-downloaded, pinned, assembled, checksum-verified on both Macs, and exercised
-with real model weights at world sizes one and two. See
-`docs/native-mtp-validation-2026-07-14.md` for sources, exact scope, parity,
-Ring/JACCL performance, memory, and cleanup evidence. Synthetic tests remain
-clearly separate from those real-checkpoint results.
+The 4B split target and MTP repositories have also been exercised with real
+model weights at world sizes one and two. Synthetic tests remain clearly
+separate from real-checkpoint validation; rerun those checks on the target
+hardware before relying on performance or acceptance claims.

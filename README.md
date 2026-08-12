@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="docs/assets/tokenity-hero.png" alt="Two Apple-silicon computers connected for distributed inference" width="100%">
-</p>
-
 <h1 align="center">Tokenity</h1>
 
 <p align="center">
@@ -461,10 +457,6 @@ busy; stop the existing model role before launching it again.
 - [External API](docs/external-api.md)
 - [Current RDMA + Qwen operations](docs/current-usage-rdma-qwen.md)
 - [Installer DMG](docs/installer-dmg.md)
-- [Validated RDMA/Qwen status capture](docs/rdma-qwen-status-2026-07-08.md)
-
-Some operational documents describe the original validated lab topology and
-contain machine-specific examples. Adapt those values to your own cluster.
 
 ## Security and project status
 

@@ -1,4 +1,4 @@
-# Tokenity UI Visual Baseline — 2026-07-29
+# Tokenity UI Visual Baseline
 
 This checklist records visual-language observations from the eight supplied reference images.
 It is intentionally limited to presentation. Existing Tokenity structure, behavior, state, data,
@@ -7,7 +7,7 @@ copy, accessibility, and lifecycle rules remain authoritative.
 - Use a warm ivory window, a slightly deeper pale-stone sidebar, near-white elevated surfaces,
   graphite text, and quiet hairline borders. Dark mode uses purpose-built graphite layers rather
   than a simple inversion or pure black.
-- Keep Alpine/Cobalt blue from `Logo-New.png` as the brand. Use Tokenity's lower-saturation
+- Keep the bundled Alpine/Cobalt assets as the brand. Use Tokenity's lower-saturation
   mineral-blue tokens for selection, focus rings, links, and primary controls instead of the
   brighter macOS default blue. Reserve green for healthy/normal, orange for warning/in-progress,
   and red for failure or destructive actions.
@@ -35,8 +35,6 @@ copy, accessibility, and lifecycle rules remain authoritative.
 - API Access, Logs, and Settings preserve their current functions and real data. Technical content
   remains monospaced and selectable; no reference-only examples, filters, charts, or statistics
   are added.
-- `Logo-New.png` is the sole brand source. Preserve it unchanged and derive a transparent full
-  lockup, cropped mark, and mark-based macOS icon deterministically. Light Mode retains the
-  recovered source color; Dark Mode maps the identical alpha and geometry to a higher-contrast
-  light cobalt. Verify both variants at small sizes, bundle inclusion, and all existing
-  accessibility labels/identifiers.
+- Preserve the tracked PNG lockup and mark variants plus the tracked macOS icon. Verify both
+  appearances at small sizes, bundle inclusion, and all existing accessibility
+  labels/identifiers.
