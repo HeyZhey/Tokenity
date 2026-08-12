@@ -298,19 +298,6 @@ def _install_jaccl_server_control_collectives(server: Any) -> None:
         patched_namespace,
     )
     patched_generate = patched_namespace["_generate"]
-    original_serve_single = response_generator._serve_single
-    serve_single_source = textwrap.dedent(inspect.getsource(original_serve_single))
-    patched_namespace = {}
-    exec(
-        compile(
-            _replace_jaccl_sequential_cancel_collective(serve_single_source),
-            inspect.getsourcefile(original_serve_single) or "<mlx_lm.server>",
-            "exec",
-        ),
-        original_serve_single.__globals__,
-        patched_namespace,
-    )
-    patched_serve_single = patched_namespace["_serve_single"]
 
     def tokenity_generate(self: Any) -> None:
         try:
@@ -356,7 +343,6 @@ def _install_jaccl_server_control_collectives(server: Any) -> None:
                 pass
 
     response_generator._generate = tokenity_generate
-    response_generator._serve_single = patched_serve_single
 
     def tokenity_share_object(self: Any, obj: Any) -> Any:
         if not self._is_distributed:
@@ -522,40 +508,6 @@ def _replace_jaccl_seed_collective(source: str, synchronized_seed: int) -> str:
         raise RuntimeError(
             "The installed mlx-lm ResponseGenerator seed synchronization does not "
             "match Tokenity's pinned JACCL compatibility contract."
-        )
-    return source.replace(needle, replacement)
-
-
-def _replace_jaccl_sequential_cancel_collective(source: str) -> str:
-    """Make a sequential client cancellation visible to every JACCL rank."""
-
-    needle = """\
-            if ctx._should_stop:
-                if self._is_distributed:
-                    raise NotImplementedError()
-                break
-"""
-    replacement = """\
-            tokenity_cancelled = ctx._should_stop
-            if self._is_distributed:
-                tokenity_cancel_control = mx.array(
-                    [int(tokenity_cancelled)] * 10,
-                    dtype=mx.uint32,
-                )
-                tokenity_cancel_control = mx.distributed.all_sum(
-                    tokenity_cancel_control,
-                    stream=mx.cpu,
-                )
-                tokenity_cancelled = bool(tokenity_cancel_control[0].item())
-            if tokenity_cancelled:
-                if self._is_distributed:
-                    raise NotImplementedError()
-                break
-"""
-    if source.count(needle) != 1:
-        raise RuntimeError(
-            "The installed mlx-lm ResponseGenerator sequential cancellation does "
-            "not match Tokenity's pinned JACCL compatibility contract."
         )
     return source.replace(needle, replacement)
 
@@ -1364,9 +1316,11 @@ class TokenityDistributedRuntime:
         tool_texts: list[str] = []
         previous_state: str | None = None
         repetition_detector = _RepetitionDetector()
+        discard_remaining = False
         begin_task: asyncio.Task[tuple[Any, Iterator[Any]]] | None = None
         next_task: asyncio.Task[Any] | None = None
         responses: Iterator[Any] | None = None
+        cancel_context = True
         self._acquire_request()
         try:
             begin_task = asyncio.create_task(asyncio.to_thread(self._begin_generation, request))
@@ -1396,9 +1350,17 @@ class TokenityDistributedRuntime:
                 item = await asyncio.shield(next_task)
                 if item is _DONE:
                     break
+                if discard_remaining:
+                    continue
                 if repetition_detector.observe(getattr(item, "text", "")):
                     finish_reason = "tokenity_repetition"
                     logging.warning("Tokenity stopped generation after detecting repeated output.")
+                    if self._is_jaccl_distributed():
+                        # GenerationContext.stop() is rank-local. Keep both
+                        # ranks in the same bounded request and suppress only
+                        # the remaining client-visible chunks.
+                        discard_remaining = True
+                        continue
                     break
                 tokens += 1
                 item_state = getattr(item, "state", None)
@@ -1460,34 +1422,39 @@ class TokenityDistributedRuntime:
         except (asyncio.CancelledError, GeneratorExit):
             self.state.record_request_event(request_id, "cancelled")
             if self._stream_cancel_requires_retirement():
+                cancel_context = False
                 self._retire_after_stream_cancel(request_id)
             await self._settle_cancelled_stream(
                 begin_task=begin_task,
                 next_task=next_task,
                 ctx=ctx,
                 responses=responses,
+                cancel_context=cancel_context,
             )
             raise
         except Exception as exc:
             self.state.record_request_event(request_id, "failed")
             if self.state.last_request is not None:
                 self.state.last_request["error"] = str(exc)
+            if ctx is not None and self._is_jaccl_distributed():
+                self._retire_after_generation_failure(request_id, exc)
             raise
         finally:
-            if ctx is not None:
+            if ctx is not None and not self._is_jaccl_distributed():
                 ctx.stop()
             self._release_request()
 
     def _stream_cancel_requires_retirement(self) -> bool:
-        return (
-            self.execution_mode == "distributed"
-            and self.process_isolated_shutdown
-            and (self.state.connection_mode or "").lower() in {"jaccl", "jaccl-ring"}
-        )
+        return self._is_jaccl_distributed()
+
+    def _is_jaccl_distributed(self) -> bool:
+        return self.execution_mode == "distributed" and (
+            self.state.connection_mode or ""
+        ).lower() in {"jaccl", "jaccl-ring"}
 
     def _retire_after_stream_cancel(self, request_id: str) -> None:
         message = (
-            "Runtime retired after a cancelled GLM/JACCL stream because its distributed "
+            "Runtime retired after a cancelled JACCL stream because its distributed "
             "collective state cannot be safely reused. Stop and reload the model before "
             "sending another request."
         )
@@ -1508,9 +1475,39 @@ class TokenityDistributedRuntime:
                 },
             )
         logging.error(
-            "Tokenity retired the GLM/JACCL runtime after stream cancellation; "
+            "Tokenity retired the JACCL runtime after stream cancellation; "
             "the existing distributed group will not accept another request."
         )
+
+    def _retire_after_generation_failure(
+        self,
+        request_id: str | None,
+        failure: BaseException,
+    ) -> None:
+        message = (
+            "Runtime retired after an unexpected JACCL generation failure because its "
+            "distributed collective state cannot be safely reused. Stop and reload the "
+            "model before sending another request."
+        )
+        with self._retirement_lock:
+            if self._retired_reason is not None:
+                return
+            self._retired_reason = message
+            error: dict[str, object] = {
+                "stage": "generation_failed",
+                "message": message,
+                "failure_type": type(failure).__name__,
+                "failure": str(failure),
+                "requires_reload": True,
+            }
+            if request_id is not None:
+                error["request_id"] = request_id
+            self.state.transition(
+                ReadinessPhase.FAILED,
+                message=message,
+                error=error,
+            )
+        logging.exception("Tokenity retired the JACCL runtime after generation failure.")
 
     async def _settle_cancelled_stream(
         self,
@@ -1519,6 +1516,7 @@ class TokenityDistributedRuntime:
         next_task: asyncio.Task[Any] | None,
         ctx: Any,
         responses: Iterator[Any] | None,
+        cancel_context: bool,
     ) -> None:
         """Bound cleanup of thread-backed generation work after a disconnect."""
 
@@ -1526,7 +1524,7 @@ class TokenityDistributedRuntime:
         active_ctx = ctx
         active_responses = responses
 
-        if active_ctx is not None:
+        if active_ctx is not None and cancel_context:
             active_ctx.stop()
 
         if active_ctx is None and begin_task is not None:
@@ -1539,7 +1537,8 @@ class TokenityDistributedRuntime:
                 return
             if succeeded and result is not None:
                 active_ctx, active_responses = result
-                active_ctx.stop()
+                if cancel_context:
+                    active_ctx.stop()
 
         next_result: Any = None
         if next_task is not None:
@@ -1627,13 +1626,19 @@ class TokenityDistributedRuntime:
         tool_texts: list[str] = []
         previous_state: str | None = None
         repetition_detector = _RepetitionDetector()
+        discard_remaining = False
         try:
             ctx, responses = self._begin_generation(request)
             self.state.phase = ReadinessPhase.GENERATING
             for item in responses:
+                if discard_remaining:
+                    continue
                 if repetition_detector.observe(getattr(item, "text", "")):
                     finish_reason = "tokenity_repetition"
                     logging.warning("Tokenity stopped generation after detecting repeated output.")
+                    if self._is_jaccl_distributed():
+                        discard_remaining = True
+                        continue
                     break
                 tokens += 1
                 generated_items.append(item)
@@ -1667,8 +1672,12 @@ class TokenityDistributedRuntime:
                 completion_tokens=tokens,
                 prompt_cache_tokens=ctx.prompt_cache_count,
             )
+        except Exception as exc:
+            if ctx is not None and self._is_jaccl_distributed():
+                self._retire_after_generation_failure(None, exc)
+            raise
         finally:
-            if ctx is not None:
+            if ctx is not None and not self._is_jaccl_distributed():
                 ctx.stop()
 
     def _begin_generation(self, request: ChatCompletionRequest) -> tuple[Any, Iterator[Any]]:

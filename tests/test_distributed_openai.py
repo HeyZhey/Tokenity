@@ -26,7 +26,6 @@ from tokenity.serving.distributed_openai import (
     _configure_mlx_wired_memory,
     _requires_process_isolated_shutdown,
     _report_load_progress,
-    _replace_jaccl_sequential_cancel_collective,
     _replace_jaccl_seed_collective,
     _set_active_load_state,
     _should_run_post_load_barrier,
@@ -304,6 +303,84 @@ def test_stream_reports_repetition_finish_reason_and_stops_generation_context():
     assert stopped.is_set()
 
 
+def test_jaccl_repetition_drains_without_rank_local_stop():
+    phrase = "wait while I reconsider the instruction. "
+    stopped = threading.Event()
+    drained = threading.Event()
+    context = SimpleNamespace(prompt=[], prompt_cache_count=0, stop=stopped.set)
+
+    def responses():
+        try:
+            for _ in range(5):
+                yield SimpleNamespace(text=phrase, state="content", finish_reason=None)
+        finally:
+            drained.set()
+
+    runtime = TokenityDistributedRuntime(
+        model="/models/qwen",
+        state=ReadinessState(
+            model="/models/qwen",
+            connection_mode="jaccl-ring",
+        ),
+    )
+    runtime._begin_generation = lambda _: (context, responses())  # type: ignore[method-assign]  # noqa: SLF001
+
+    async def collect() -> list[str]:
+        request = ChatCompletionRequest(
+            model="qwen",
+            messages=[{"role": "user", "content": "loop"}],
+            stream=True,
+        )
+        return [event async for event in runtime.stream(request)]
+
+    events = asyncio.run(collect())
+
+    assert any('"finish_reason": "tokenity_repetition"' in event for event in events)
+    assert drained.is_set()
+    assert not stopped.is_set()
+    assert runtime.state.phase == ReadinessPhase.READY
+
+
+def test_jaccl_nonstream_repetition_drains_without_rank_local_stop():
+    phrase = "wait while I reconsider the instruction. "
+    stopped = threading.Event()
+    drained = threading.Event()
+    context = SimpleNamespace(prompt=[], prompt_cache_count=0, stop=stopped.set)
+
+    def responses():
+        try:
+            for _ in range(5):
+                yield SimpleNamespace(
+                    text=phrase,
+                    state="content",
+                    finish_reason=None,
+                    token=None,
+                )
+        finally:
+            drained.set()
+
+    runtime = TokenityDistributedRuntime(
+        model="/models/qwen",
+        state=ReadinessState(
+            model="/models/qwen",
+            connection_mode="jaccl-ring",
+        ),
+    )
+    runtime._begin_generation = lambda _: (context, responses())  # type: ignore[method-assign]  # noqa: SLF001
+
+    response = runtime.complete(
+        ChatCompletionRequest(
+            model="qwen",
+            messages=[{"role": "user", "content": "loop"}],
+        )
+    )
+
+    assert response["choices"][0]["finish_reason"] == "tokenity_repetition"
+    assert drained.is_set()
+    assert not stopped.is_set()
+    assert runtime.state.phase == ReadinessPhase.READY
+
+
 def test_first_stream_emits_keepalives_then_incremental_content_with_timeline():
     stopped = threading.Event()
     context = SimpleNamespace(prompt=[1, 2], prompt_cache_count=0, stop=stopped.set)
@@ -372,13 +449,13 @@ def test_glm_jaccl_stream_cancel_retires_runtime_drains_task_and_returns_503(tmp
     runtime = TokenityDistributedRuntime(model=str(model), state=state)
     stopped = threading.Event()
     next_response_started = threading.Event()
+    release_response = threading.Event()
     context = SimpleNamespace(prompt=[], prompt_cache_count=0, stop=stopped.set)
 
     def responses():
         next_response_started.set()
-        assert stopped.wait(1)
-        raise NotImplementedError("distributed sequential cancellation")
-        yield  # pragma: no cover - make this a generator
+        assert release_response.wait(1)
+        yield SimpleNamespace(text="late", state="content", finish_reason="stop")
 
     runtime._begin_generation = lambda _: (context, responses())  # type: ignore[method-assign]  # noqa: SLF001
 
@@ -395,13 +472,16 @@ def test_glm_jaccl_stream_cancel_retires_runtime_drains_task_and_returns_503(tmp
         )
         consumer = asyncio.create_task(anext(stream))
         assert await asyncio.to_thread(next_response_started.wait, 1)
+        timer = threading.Timer(0.1, release_response.set)
+        timer.start()
         consumer.cancel()
         with pytest.raises(asyncio.CancelledError):
             await consumer
+        timer.join()
 
     asyncio.run(cancel_during_next_response())
 
-    assert stopped.is_set()
+    assert not stopped.is_set()
     assert state.phase == ReadinessPhase.FAILED
     assert state.last_error is not None
     assert state.last_error["stage"] == "stream_cancelled"
@@ -476,7 +556,7 @@ def test_glm_jaccl_cancel_during_generation_start_recovers_context_and_drains(tm
 
     asyncio.run(cancel_during_start())
 
-    assert stopped.is_set()
+    assert not stopped.is_set()
     assert drained.is_set()
     assert state.phase == ReadinessPhase.FAILED
     assert runtime._pending_stream_tasks == set()  # noqa: SLF001
@@ -514,13 +594,13 @@ def test_glm_jaccl_async_generator_close_retires_runtime(tmp_path):
 
     asyncio.run(close_after_first_chunk())
 
-    assert stopped.is_set()
+    assert not stopped.is_set()
     assert state.phase == ReadinessPhase.FAILED
     assert state.last_request is not None
     assert "cancelled" in state.last_request
 
 
-def test_non_glm_stream_cancel_does_not_retire_runtime():
+def test_qwen_jaccl_stream_cancel_retires_runtime_without_rank_local_stop():
     state = ReadinessState(
         model="/models/qwen",
         phase=ReadinessPhase.READY,
@@ -529,13 +609,13 @@ def test_non_glm_stream_cancel_does_not_retire_runtime():
     runtime = TokenityDistributedRuntime(model="/models/qwen", state=state)
     stopped = threading.Event()
     next_response_started = threading.Event()
+    release_response = threading.Event()
     context = SimpleNamespace(prompt=[], prompt_cache_count=0, stop=stopped.set)
 
     def responses():
         next_response_started.set()
-        assert stopped.wait(1)
-        return
-        yield  # pragma: no cover - make this a generator
+        assert release_response.wait(1)
+        yield SimpleNamespace(text="late", state="content", finish_reason="stop")
 
     runtime._begin_generation = lambda _: (context, responses())  # type: ignore[method-assign]  # noqa: SLF001
 
@@ -547,15 +627,73 @@ def test_non_glm_stream_cancel_does_not_retire_runtime():
         )
         consumer = asyncio.create_task(anext(runtime.stream(request)))
         assert await asyncio.to_thread(next_response_started.wait, 1)
+        timer = threading.Timer(0.1, release_response.set)
+        timer.start()
         consumer.cancel()
         with pytest.raises(asyncio.CancelledError):
             await consumer
+        timer.join()
 
     asyncio.run(cancel())
 
-    assert stopped.is_set()
-    assert state.phase == ReadinessPhase.READY
-    assert state.last_error is None
+    assert not stopped.is_set()
+    assert state.phase == ReadinessPhase.FAILED
+    assert state.last_error is not None
+    assert state.last_error["stage"] == "stream_cancelled"
+    assert state.last_error["requires_reload"] is True
+
+
+def test_jaccl_stream_and_nonstream_failures_retire_without_rank_local_stop():
+    runtimes = []
+    for streaming in (True, False):
+        state = ReadinessState(
+            model="/models/qwen",
+            phase=ReadinessPhase.READY,
+            connection_mode="jaccl-ring",
+        )
+        runtime = TokenityDistributedRuntime(model="/models/qwen", state=state)
+        stopped = threading.Event()
+        context = SimpleNamespace(prompt=[], prompt_cache_count=0, stop=stopped.set)
+
+        def responses():
+            raise RuntimeError("collective failed")
+            yield  # pragma: no cover - make this a generator
+
+        runtime._begin_generation = lambda _: (context, responses())  # type: ignore[method-assign]  # noqa: SLF001
+        request = ChatCompletionRequest(
+            model="qwen",
+            messages=[{"role": "user", "content": "fail"}],
+            stream=streaming,
+        )
+        if streaming:
+            async def collect() -> None:
+                async for _ in runtime.stream(request, request_id="failed-stream"):
+                    pass
+
+            with pytest.raises(RuntimeError, match="collective failed"):
+                asyncio.run(collect())
+        else:
+            with pytest.raises(RuntimeError, match="collective failed"):
+                runtime.complete(request)
+
+        assert not stopped.is_set()
+        assert state.phase == ReadinessPhase.FAILED
+        assert state.last_error is not None
+        assert state.last_error["stage"] == "generation_failed"
+        assert state.last_error["requires_reload"] is True
+        runtimes.append(runtime)
+
+    for runtime in runtimes:
+        runtime.stop = lambda: None  # type: ignore[method-assign]
+        with TestClient(create_app(model=runtime.model, runtime=runtime)) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": runtime.model_id,
+                    "messages": [{"role": "user", "content": "retry"}],
+                },
+            )
+        assert response.status_code == 503
 
 
 def test_stream_records_headers_only_when_asgi_response_start_is_sent():
@@ -812,7 +950,8 @@ def test_jaccl_request_control_avoids_one_element_collectives():
     source = inspect.getsource(_install_jaccl_server_control_collectives)
 
     assert "mx.zeros((_JACCL_CONTROL_WORDS,)" in source
-    assert "_replace_jaccl_sequential_cancel_collective" in source
+    assert "response_generator._serve_single" not in source
+    assert "tokenity_cancel_control" not in source
     assert "_jaccl_control_header(" in source
     assert "_validate_jaccl_control_header(" in source
     assert "_validate_jaccl_control_payload(" in source
@@ -889,31 +1028,6 @@ def _generate(self):
 def test_jaccl_seed_patch_rejects_unexpected_mlx_lm_source():
     with pytest.raises(RuntimeError, match="pinned JACCL compatibility contract"):
         _replace_jaccl_seed_collective("def _generate(self): pass", 12345)
-
-
-def test_jaccl_sequential_cancel_patch_synchronizes_all_ranks():
-    source = """\
-def _serve_single(self, request):
-    try:
-        for gen in responses:
-            if ctx._should_stop:
-                if self._is_distributed:
-                    raise NotImplementedError()
-                break
-"""
-
-    patched = _replace_jaccl_sequential_cancel_collective(source)
-
-    assert "[int(tokenity_cancelled)] * 10" in patched
-    assert "stream=mx.cpu" in patched
-    assert "tokenity_cancelled = bool(tokenity_cancel_control[0].item())" in patched
-
-
-def test_jaccl_sequential_cancel_patch_rejects_unexpected_mlx_lm_source():
-    with pytest.raises(RuntimeError, match="pinned JACCL compatibility contract"):
-        _replace_jaccl_sequential_cancel_collective(
-            "def _serve_single(self, request): pass"
-        )
 
 
 def test_runtime_rejects_qwen35_mtp_draft_checkpoint_before_mlx_init(tmp_path):
