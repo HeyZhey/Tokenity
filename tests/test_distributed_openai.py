@@ -26,6 +26,7 @@ from tokenity.serving.distributed_openai import (
     _configure_mlx_wired_memory,
     _requires_process_isolated_shutdown,
     _report_load_progress,
+    _replace_jaccl_sequential_cancel_collective,
     _replace_jaccl_seed_collective,
     _set_active_load_state,
     _should_run_post_load_barrier,
@@ -481,7 +482,7 @@ def test_glm_jaccl_stream_cancel_retires_runtime_drains_task_and_returns_503(tmp
 
     asyncio.run(cancel_during_next_response())
 
-    assert not stopped.is_set()
+    assert stopped.is_set()
     assert state.phase == ReadinessPhase.FAILED
     assert state.last_error is not None
     assert state.last_error["stage"] == "stream_cancelled"
@@ -556,8 +557,49 @@ def test_glm_jaccl_cancel_during_generation_start_recovers_context_and_drains(tm
 
     asyncio.run(cancel_during_start())
 
-    assert not stopped.is_set()
+    assert stopped.is_set()
     assert drained.is_set()
+    assert state.phase == ReadinessPhase.FAILED
+    assert runtime._pending_stream_tasks == set()  # noqa: SLF001
+
+
+def test_jaccl_cancel_stops_context_that_arrives_after_cleanup_deadline():
+    state = ReadinessState(
+        model="/models/qwen",
+        phase=ReadinessPhase.READY,
+        connection_mode="jaccl-ring",
+    )
+    runtime = TokenityDistributedRuntime(model="/models/qwen", state=state)
+    runtime._stream_cancel_drain_timeout = 0.01  # noqa: SLF001
+    begin_started = threading.Event()
+    release_begin = threading.Event()
+    stopped = threading.Event()
+    context = SimpleNamespace(prompt=[], prompt_cache_count=0, stop=stopped.set)
+
+    def begin(_request):
+        begin_started.set()
+        assert release_begin.wait(1)
+        return context, iter(())
+
+    runtime._begin_generation = begin  # type: ignore[method-assign]  # noqa: SLF001
+
+    async def cancel_before_context() -> None:
+        request = ChatCompletionRequest(
+            model=runtime.model_id,
+            messages=[{"role": "user", "content": "cancel during prefill"}],
+            stream=True,
+        )
+        consumer = asyncio.create_task(anext(runtime.stream(request)))
+        assert await asyncio.to_thread(begin_started.wait, 1)
+        consumer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await consumer
+        assert not stopped.is_set()
+        release_begin.set()
+        assert await asyncio.to_thread(stopped.wait, 1)
+
+    asyncio.run(cancel_before_context())
+
     assert state.phase == ReadinessPhase.FAILED
     assert runtime._pending_stream_tasks == set()  # noqa: SLF001
 
@@ -594,13 +636,13 @@ def test_glm_jaccl_async_generator_close_retires_runtime(tmp_path):
 
     asyncio.run(close_after_first_chunk())
 
-    assert not stopped.is_set()
+    assert stopped.is_set()
     assert state.phase == ReadinessPhase.FAILED
     assert state.last_request is not None
     assert "cancelled" in state.last_request
 
 
-def test_qwen_jaccl_stream_cancel_retires_runtime_without_rank_local_stop():
+def test_qwen_jaccl_stream_cancel_retires_runtime_with_rank_synchronized_stop():
     state = ReadinessState(
         model="/models/qwen",
         phase=ReadinessPhase.READY,
@@ -636,7 +678,7 @@ def test_qwen_jaccl_stream_cancel_retires_runtime_without_rank_local_stop():
 
     asyncio.run(cancel())
 
-    assert not stopped.is_set()
+    assert stopped.is_set()
     assert state.phase == ReadinessPhase.FAILED
     assert state.last_error is not None
     assert state.last_error["stage"] == "stream_cancelled"
@@ -950,8 +992,8 @@ def test_jaccl_request_control_avoids_one_element_collectives():
     source = inspect.getsource(_install_jaccl_server_control_collectives)
 
     assert "mx.zeros((_JACCL_CONTROL_WORDS,)" in source
-    assert "response_generator._serve_single" not in source
-    assert "tokenity_cancel_control" not in source
+    assert "response_generator._serve_single" in source
+    assert "_replace_jaccl_sequential_cancel_collective" in source
     assert "_jaccl_control_header(" in source
     assert "_validate_jaccl_control_header(" in source
     assert "_validate_jaccl_control_payload(" in source
@@ -1028,6 +1070,34 @@ def _generate(self):
 def test_jaccl_seed_patch_rejects_unexpected_mlx_lm_source():
     with pytest.raises(RuntimeError, match="pinned JACCL compatibility contract"):
         _replace_jaccl_seed_collective("def _generate(self): pass", 12345)
+
+
+def test_jaccl_sequential_cancel_uses_mlx_lm_generation_stream():
+    source = """\
+def _serve_single(self, request):
+    try:
+        for gen in responses:
+            if ctx._should_stop:
+                if self._is_distributed:
+                    raise NotImplementedError()
+                break
+"""
+
+    patched = _replace_jaccl_sequential_cancel_collective(source)
+
+    assert "[int(tokenity_cancelled)] * 10" in patched
+    assert 'stream_generate.__globals__["generation_stream"]' in patched
+    assert "with mx.stream(tokenity_generation_stream)" in patched
+    assert "stream=tokenity_generation_stream" in patched
+    assert "stream=mx.cpu" not in patched
+    assert "mx.default_stream" not in patched
+
+
+def test_jaccl_sequential_cancel_rejects_unexpected_mlx_lm_source():
+    with pytest.raises(RuntimeError, match="pinned JACCL compatibility contract"):
+        _replace_jaccl_sequential_cancel_collective(
+            "def _serve_single(self, request): pass"
+        )
 
 
 def test_runtime_rejects_qwen35_mtp_draft_checkpoint_before_mlx_init(tmp_path):

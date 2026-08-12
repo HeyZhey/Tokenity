@@ -298,6 +298,19 @@ def _install_jaccl_server_control_collectives(server: Any) -> None:
         patched_namespace,
     )
     patched_generate = patched_namespace["_generate"]
+    original_serve_single = response_generator._serve_single
+    serve_single_source = textwrap.dedent(inspect.getsource(original_serve_single))
+    patched_namespace = {}
+    exec(
+        compile(
+            _replace_jaccl_sequential_cancel_collective(serve_single_source),
+            inspect.getsourcefile(original_serve_single) or "<mlx_lm.server>",
+            "exec",
+        ),
+        original_serve_single.__globals__,
+        patched_namespace,
+    )
+    patched_serve_single = patched_namespace["_serve_single"]
 
     def tokenity_generate(self: Any) -> None:
         try:
@@ -343,6 +356,7 @@ def _install_jaccl_server_control_collectives(server: Any) -> None:
                 pass
 
     response_generator._generate = tokenity_generate
+    response_generator._serve_single = patched_serve_single
 
     def tokenity_share_object(self: Any, obj: Any) -> Any:
         if not self._is_distributed:
@@ -508,6 +522,42 @@ def _replace_jaccl_seed_collective(source: str, synchronized_seed: int) -> str:
         raise RuntimeError(
             "The installed mlx-lm ResponseGenerator seed synchronization does not "
             "match Tokenity's pinned JACCL compatibility contract."
+        )
+    return source.replace(needle, replacement)
+
+
+def _replace_jaccl_sequential_cancel_collective(source: str) -> str:
+    """Synchronize sequential cancellation on mlx-lm's generation stream."""
+
+    needle = """\
+            if ctx._should_stop:
+                if self._is_distributed:
+                    raise NotImplementedError()
+                break
+"""
+    replacement = """\
+            tokenity_cancelled = ctx._should_stop
+            if self._is_distributed:
+                tokenity_generation_stream = stream_generate.__globals__["generation_stream"]
+                with mx.stream(tokenity_generation_stream):
+                    tokenity_cancel_control = mx.array(
+                        [int(tokenity_cancelled)] * 10,
+                        dtype=mx.uint32,
+                    )
+                    tokenity_cancel_control = mx.distributed.all_sum(
+                        tokenity_cancel_control,
+                        stream=tokenity_generation_stream,
+                    )
+                    tokenity_cancelled = bool(tokenity_cancel_control[0].item())
+            if tokenity_cancelled:
+                if self._is_distributed:
+                    raise NotImplementedError()
+                break
+"""
+    if source.count(needle) != 1:
+        raise RuntimeError(
+            "The installed mlx-lm ResponseGenerator sequential cancellation does "
+            "not match Tokenity's pinned JACCL compatibility contract."
         )
     return source.replace(needle, replacement)
 
@@ -1422,7 +1472,6 @@ class TokenityDistributedRuntime:
         except (asyncio.CancelledError, GeneratorExit):
             self.state.record_request_event(request_id, "cancelled")
             if self._stream_cancel_requires_retirement():
-                cancel_context = False
                 self._retire_after_stream_cancel(request_id)
             await self._settle_cancelled_stream(
                 begin_task=begin_task,
@@ -1534,6 +1583,15 @@ class TokenityDistributedRuntime:
                 label="generation start",
             )
             if not settled:
+                if cancel_context:
+                    def stop_late_generation(completed: asyncio.Task[Any]) -> None:
+                        try:
+                            late_ctx, _ = completed.result()
+                        except BaseException:
+                            return
+                        late_ctx.stop()
+
+                    begin_task.add_done_callback(stop_late_generation)
                 return
             if succeeded and result is not None:
                 active_ctx, active_responses = result
