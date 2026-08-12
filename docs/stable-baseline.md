@@ -1,64 +1,71 @@
-# Tokenity Stable Baseline
+# Tokenity Lean Stable Baseline
 
-## Purpose
+This repository is a standalone Tokenity source tree. It does not use a Git
+worktree, source-tree remote, linked files, or a runtime `PYTHONPATH` pointing
+at another checkout.
 
-This workspace is the single source of truth for subsequent Tokenity work:
+## Supported Runtime Surface
 
-```text
-/path/to/Tokenity-Stable
-```
+- Tokenity Distributed Server and Single-Mac Tokenity Server.
+- OpenAI-compatible streaming and non-streaming chat, cancellation, readiness,
+  request admission, queues, timeouts, automatic routing, and instance-scoped
+  lifecycle management.
+- Native MTP capability detection and launch configuration.
+- HTTP Node Agent orchestration, stable `machine_id` discovery, watchdog
+  recovery, and single- or two-Mac execution. SSH rank launch is unsupported.
+- MiniMax H3 single-Mac and TP2/RDMA launch planning, video generation API,
+  SwiftUI generation workflow, progress, cancellation, recovery, and artifact
+  handling.
+- GLM 5.2, MiniMax H3, Qwen, and other MLX checkpoints selected through model
+  metadata and capability inspection rather than directory-name allowlists.
 
-It is a Git worktree on branch `stable-baseline`, forked from Tokenity commit
-`a39ddc7`. The original `/path/to/Tokenity` worktree and the legacy
-`/path/to/MLX-Distributed` directory remain untouched.
+The removed Official MLX-LM backend is not a supported mode. The two supported
+server modes share the maintained Tokenity runtime paths above.
 
-## Included Baseline
+## Deployment Contract
 
-- The current SwiftUI app from `Tokenity/apps/TokenityControl`.
-- The distributed MLX-LM/OpenAI runtime that loaded
-  `Qwen3.5-122B-A10B-4bit` across Node A and Node B.
-- HTTP Node Agent rank orchestration, NodeAgent memory reporting, child-rank
-  failure detection, and distributed process cleanup behavior.
-- The current DMG/pkg builder, now sourcing both UI and backend from this one
-  repository.
+Set deployment paths through the variables documented in
+`deployment-configuration.md`. Node Agent endpoints come from app settings or
+`TOKENITY_NODE_AGENT_URLS`. A remote endpoint is never inferred as loopback;
+an unconfigured remote Mac remains unbound. Display hostnames do not replace
+the saved Agent origin, and two-Mac H3 readiness requires two different stable
+machine IDs.
 
-The validated cluster topology remains:
+Builds consume the tracked PNG and ICNS resources directly. They do not
+regenerate brand assets or depend on a mounted volume being named or rooted at
+a fixed path.
 
-- Node A: `<node-a-user>@<node-a-lan-ip>`, `en4`, `rdma_en4`, `<node-a-rdma-ip>`
-- Node B: `<node-b-user>@<node-b-lan-ip>`, `en5`, `rdma_en5`, `<node-b-rdma-ip>`
-- Runtime Python: `${TOKENITY_RUNTIME_PYTHON}`
-- Model: `${TOKENITY_MODEL_ROOT}/Qwen3.5-122B-A10B-4bit`
+## Verification Baseline
 
-The consolidated backend was checked against `${TOKENITY_CODE_ROOT}` on
-both nodes. All three core files matched byte-for-byte:
-
-- `distributed_openai.py`: `bd014e1e2938ed0583b84343850c718170a20c6fd87dff773af554d0f4ebb306`
-- `launcher.py`: `a389816795df339193654c743bfa5d309ffb3874c4576ebb21672eed582a8487`
-- `agent.py`: `8a9f30703291eaf84ddfc6076d3820a5fc11800a6f8f1a2979e54cdd2fb85d1f`
-
-## Baseline Invariants
-
-1. Do not edit either UI or backend under `MLX-Distributed`.
-2. Build and launch the app through scripts in this worktree.
-3. Installer payloads must copy backend code from this worktree.
-4. `tokenity.serving.distributed_openai.TokenityDistributedRuntime` must be
-   present; the skeleton-only server is not a distributable backend.
-5. Run `./scripts/verify-stable-baseline.sh` before committing later fixes.
-
-## Start the UI
+Run from the repository root unless noted:
 
 ```bash
-cd /path/to/Tokenity-Stable
-./scripts/run-tokenity-control-app.sh
+python -m pytest -q
+(cd apps/TokenityControl && swift test)
+TOKENITY_APP_BUNDLE_PATH=/tmp/TokenityControl.app \
+  scripts/build-tokenity-control-app.sh
+python -m tokenity --help
+python -m tokenity.benchmarking.minimax_h3_tp2 --help
 ```
 
-This rebuilds the app bundle before opening it, preventing stale executable
-code from being mistaken for current source.
+The local lean validation baseline is 240 passing Python tests with 8 hardware
+tests skipped, and 143 passing Swift tests with 1 platform-dependent test
+skipped. The debug app bundle, Node Agent health/info API, single-Mac LLM
+dry-run, two-Mac HTTP launch plan, and single-Mac H3 dry-run also pass.
 
-## Scope of Stability
+## Hardware Validation
 
-This baseline consolidates the known-working UI/backend deployment source.
-Model-specific runtime and generation settings are available from the Models
-page, and non-conversational UI messages are excluded from model context.
-State recovery after app/NodeAgent restart and Agent/API authentication remain
-explicit follow-up work. Product rank startup no longer uses SSH.
+Unit tests and dry-runs cannot prove model weights, native binaries, RDMA links,
+or a second Mac. Before a production release, use the current deployment values
+to perform:
+
+1. A real GLM 5.2 non-streaming response and a streaming response cancelled
+   mid-generation.
+2. A real Qwen/MLX single-Mac response and a two-Mac HTTP Node Agent launch.
+3. A real MiniMax H3 single-Mac generation and TP2/RDMA generation, including
+   cancellation, retry, artifact download, save, and playback.
+4. A Node Agent termination/restart to confirm watchdog recovery and instance
+   journal adoption on each Mac.
+
+Do not mark the hardware baseline complete unless the configured model root,
+native H3 binary, active RDMA devices, and both Node Agents are present.
