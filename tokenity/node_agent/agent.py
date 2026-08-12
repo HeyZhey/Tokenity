@@ -178,6 +178,13 @@ class _GatewayStreamingResponse(StreamingResponse):
         finally:
             self._on_close()
 
+    async def listen_for_disconnect(self, receive) -> None:
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                self._on_close()
+                return
+
 
 class ClusterNodePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")

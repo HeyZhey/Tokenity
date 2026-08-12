@@ -409,6 +409,7 @@ final class VideoGenerationContractTests: XCTestCase {
         XCTAssertEqual(store.videoRuntimeInstanceID, "h3-ui-runtime")
         XCTAssertEqual(startBody?["optimization_profile"] as? String, "stock-qmm")
         XCTAssertEqual(startBody?["starting_port"] as? Int, 30_096)
+        XCTAssertEqual(startBody?["lease_seconds"] as? Double, 120)
         XCTAssertEqual((startBody?["nodes"] as? [[String: Any]])?.count, 2)
         XCTAssertEqual(
             (startBody?["nodes"] as? [[String: Any]])?[1]["agent_url"] as? String,
@@ -438,6 +439,51 @@ final class VideoGenerationContractTests: XCTestCase {
                 && url.port == 9_200
                 && url.path.contains("/v1/node/instances/")
         })
+    }
+
+    @MainActor
+    func testUserCancelledVideoStreamIsNotReportedAsAnUnreadableEvent() async throws {
+        var generationContinuation: AsyncThrowingStream<ChatStreamEvent, Error>.Continuation?
+        let store = TokenityStore(
+            dataTransport: { request in
+                let path = request.url?.path ?? ""
+                let payload: String
+                switch path {
+                case "/v1/node/info":
+                    payload = Self.h3NodeInfoPayload(for: request)
+                case "/v1/node/start-minimax-h3-video":
+                    payload = #"{"instance_id":"h3-cancel-runtime","operation_id":"h3-cancel-operation","api_base_url":"http://127.0.0.1:11242/v1"}"#
+                default:
+                    payload = #"{}"#
+                }
+                let response = try XCTUnwrap(
+                    HTTPURLResponse(
+                        url: request.url ?? URL(string: "http://localhost")!,
+                        statusCode: 200,
+                        httpVersion: nil,
+                        headerFields: ["Content-Type": "application/json"]
+                    )
+                )
+                return (Data(payload.utf8), response)
+            },
+            lineStreamTransport: { _ in
+                AsyncThrowingStream { generationContinuation = $0 }
+            }
+        )
+        store.h3WorkerAgentURL = "http://198.51.100.75:9200"
+        await store.startVideoRuntime()
+
+        store.beginVideoGeneration()
+        for _ in 0..<100 where generationContinuation == nil { await Task.yield() }
+        XCTAssertTrue(store.isVideoGenerating)
+        store.cancelVideoGeneration()
+        generationContinuation?.finish()
+        for _ in 0..<100 where store.isVideoGenerating { await Task.yield() }
+
+        XCTAssertFalse(store.isVideoGenerating)
+        XCTAssertEqual(store.videoProgressStage, "Cancelled")
+        XCTAssertNil(store.videoGenerationError)
+        await store.stopVideoRuntime()
     }
 
     @MainActor

@@ -3310,6 +3310,22 @@ def test_gateway_stream_response_cleans_up_when_response_start_fails():
     assert cleanup_calls == ["closed"]
 
 
+def test_gateway_stream_response_closes_upstream_on_client_disconnect():
+    cleanup_calls = []
+    response = agent_module._GatewayStreamingResponse(
+        iter([b"data: ignored\n\n"]),
+        on_close=lambda: cleanup_calls.append("closed"),
+        media_type="text/event-stream",
+    )
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    asyncio.run(response.listen_for_disconnect(receive))
+
+    assert cleanup_calls == ["closed"]
+
+
 def test_gateway_base_exception_during_open_releases_slot_and_request_lease(
     tmp_path: Path,
     monkeypatch,

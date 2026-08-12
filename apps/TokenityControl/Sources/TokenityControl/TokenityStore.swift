@@ -808,7 +808,7 @@ final class TokenityStore: ObservableObject {
             port: 11_242,
             dryRun: false,
             apiIdentifier: "MiniMax-H3",
-            leaseSeconds: modelLeaseSeconds,
+            leaseSeconds: appRestartLeaseGraceSeconds,
             instanceID: String(instanceID),
             operationID: String(operationID),
             optimizationProfile: h3OptimizationProfile
@@ -967,10 +967,12 @@ final class TokenityStore: ObservableObject {
                 }
             }
             guard didComplete else { throw H3VideoContractError.invalidEvent }
-        } catch is CancellationError {
-            videoProgressStage = "Cancelled"
-            appendLog("MiniMax H3 video generation cancelled.")
         } catch {
+            if Task.isCancelled {
+                videoProgressStage = "Cancelled"
+                appendLog("MiniMax H3 video generation cancelled.")
+                return
+            }
             let message = userFacingMessage(for: error)
             videoGenerationError = message
             videoProgressStage = "Failed"
