@@ -830,7 +830,7 @@ def _requires_process_isolated_shutdown(model: str) -> bool:
         config = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         config = {}
-    identities = [str(config.get("model_type", "")), Path(model).name]
+    identities = [str(config.get("model_type", ""))]
     architectures = config.get("architectures")
     if isinstance(architectures, list):
         identities.extend(str(item) for item in architectures)

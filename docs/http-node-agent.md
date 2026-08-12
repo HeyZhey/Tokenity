@@ -72,7 +72,7 @@ so discovery still works when an interface has an unusually broad netmask.
 Results are coalesced by `machine_id`, with backward-compatible matching by
 RDMA address, Node ID, and hostname/user for Agents deployed before
 `machine_id`. Consequently a Mac that moves from `<node-a-lan-ip>` to
-`<node-a-lan-ip>` keeps its selection, coordinator identity, models, and nickname.
+`<node-a-lan-ip>` keeps its selection, coordinator identity, and models.
 When one physical Mac exposes both the stable Agent on `:9100` and an isolated
 H3 Agent on `:9200`, the general cluster topology prefers `:9100`; Video retains
 its independently configured H3 endpoint. Updated control endpoints are saved

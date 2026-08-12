@@ -11,7 +11,6 @@ MODEL_ROOT="$INSTALL_ROOT/Models"
 STATE_ROOT="$INSTALL_ROOT/State"
 LOG_ROOT="$INSTALL_ROOT/Logs"
 RUNTIME_PYTHON="$RUNTIME_ROOT/current/.venv/bin/python"
-RUNTIME_MEDIA_ROOT="${TOKENITY_RUNTIME_MEDIA_ROOT:-$TOKENITY_RUNTIME_MEDIA_ROOT_DEFAULT}"
 TB_INTERFACE="${TOKENITY_TB_INTERFACE:-}"
 TB_LOCAL_IP="${TOKENITY_TB_LOCAL_IP:-}"
 TB_PEER_IP="${TOKENITY_TB_PEER_IP:-}"
@@ -25,12 +24,6 @@ export TOKENITY_RUNTIME_PYTHON="$RUNTIME_PYTHON"
 if [[ "$INSTALL_ROOT" != /* || "$INSTALL_ROOT" =~ [[:space:]\<\>\&] ||
       "$INSTALL_ROOT" == *\"* || "$INSTALL_ROOT" == *\\* ]]; then
   echo "TOKENITY_INSTALL_ROOT must be an absolute path without whitespace or XML metacharacters." >&2
-  exit 1
-fi
-if [[ "$RUNTIME_MEDIA_ROOT" != /* || "$RUNTIME_MEDIA_ROOT" == *\"* ||
-      "$RUNTIME_MEDIA_ROOT" == *\\* || "$RUNTIME_MEDIA_ROOT" == *$'\n'* ||
-      "$RUNTIME_MEDIA_ROOT" == *$'\r'* || "$RUNTIME_MEDIA_ROOT" == *$'\t'* ]]; then
-  echo "TOKENITY_RUNTIME_MEDIA_ROOT must be an absolute path without JSON metacharacters." >&2
   exit 1
 fi
 VERSION="${TOKENITY_VERSION:-0.1.0}"
@@ -192,7 +185,6 @@ cat > "$APP_BUNDLE/Contents/Resources/DeploymentConfiguration.json" <<JSON
   "TOKENITY_MODEL_ROOT": "$MODEL_ROOT",
   "TOKENITY_RUNTIME_ROOT": "$RUNTIME_ROOT",
   "TOKENITY_RUNTIME_PYTHON": "$RUNTIME_PYTHON",
-  "TOKENITY_RUNTIME_MEDIA_ROOT": "$RUNTIME_MEDIA_ROOT",
   "TOKENITY_STATE_ROOT": "$STATE_ROOT",
   "TOKENITY_LOG_ROOT": "$LOG_ROOT"
 }

@@ -16,7 +16,7 @@ It is a Git worktree on branch `stable-baseline`, forked from Tokenity commit
 
 - The current SwiftUI app from `Tokenity/apps/TokenityControl`.
 - The distributed MLX-LM/OpenAI runtime that loaded
-  `Qwen3.5-122B-A10B-4bit` across Mango and Kiwi.
+  `Qwen3.5-122B-A10B-4bit` across Node A and Node B.
 - HTTP Node Agent rank orchestration, NodeAgent memory reporting, child-rank
   failure detection, and distributed process cleanup behavior.
 - The current DMG/pkg builder, now sourcing both UI and backend from this one
@@ -24,13 +24,13 @@ It is a Git worktree on branch `stable-baseline`, forked from Tokenity commit
 
 The validated cluster topology remains:
 
-- Mango: `<node-a-user>@<node-a-lan-ip>`, `en4`, `rdma_en4`, `<node-a-rdma-ip>`
-- Kiwi: `<node-b-user>@<node-b-lan-ip>`, `en5`, `rdma_en5`, `<node-b-rdma-ip>`
+- Node A: `<node-a-user>@<node-a-lan-ip>`, `en4`, `rdma_en4`, `<node-a-rdma-ip>`
+- Node B: `<node-b-user>@<node-b-lan-ip>`, `en5`, `rdma_en5`, `<node-b-rdma-ip>`
 - Runtime Python: `${TOKENITY_RUNTIME_PYTHON}`
 - Model: `${TOKENITY_MODEL_ROOT}/Qwen3.5-122B-A10B-4bit`
 
 The consolidated backend was checked against `${TOKENITY_CODE_ROOT}` on
-both Mango and Kiwi. All three core files matched byte-for-byte:
+both nodes. All three core files matched byte-for-byte:
 
 - `distributed_openai.py`: `bd014e1e2938ed0583b84343850c718170a20c6fd87dff773af554d0f4ebb306`
 - `launcher.py`: `a389816795df339193654c743bfa5d309ffb3874c4576ebb21672eed582a8487`

@@ -19,8 +19,8 @@ final class TokenityStoreTests: XCTestCase {
             nodes: [
                 AgentClusterNodeRequest(
                     id: "mac-b",
-                    agentURL: "http://127.0.0.1:9200",
-                    lanIP: "127.0.0.1",
+                    agentURL: "http://198.51.100.75:9200",
+                    lanIP: "198.51.100.75",
                     rdmaIP: "tokenity-rdma-b.invalid",
                     rdmaDevices: ["rdma_en5"]
                 )
@@ -43,7 +43,7 @@ final class TokenityStoreTests: XCTestCase {
         )
         let nodes = try XCTUnwrap(object["nodes"] as? [[String: Any]])
 
-        XCTAssertEqual(nodes.first?["agent_url"] as? String, "http://127.0.0.1:9200")
+        XCTAssertEqual(nodes.first?["agent_url"] as? String, "http://198.51.100.75:9200")
         XCTAssertNil(nodes.first?["ssh"])
         XCTAssertNil(object["native_mtp"])
 
@@ -158,7 +158,7 @@ final class TokenityStoreTests: XCTestCase {
         let model = try XCTUnwrap(store.modelLibraryRows.first)
         await store.loadModel(model)
 
-        XCTAssertEqual(startHost, "127.0.0.1")
+        XCTAssertEqual(startHost, "198.51.100.75")
         XCTAssertEqual(rankNodeIDs, ["mac-b", "mac-a"])
         XCTAssertEqual(store.loadedModelName, model.id)
     }
@@ -173,8 +173,8 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertEqual(mango.displayRuntime, "Offline")
         XCTAssertEqual(mango.memoryPercentText, "Unavailable")
         XCTAssertEqual(mango.memoryUsageText, "Node offline")
-        XCTAssertTrue(store.launchPreview.readinessIssues.contains { $0.contains("Mango Node Agent is offline") })
-        XCTAssertTrue(store.launchPreview.readinessIssues.contains { $0.contains("Kiwi Node Agent is offline") })
+        XCTAssertTrue(store.launchPreview.readinessIssues.contains { $0.contains("Mac A Node Agent is offline") })
+        XCTAssertTrue(store.launchPreview.readinessIssues.contains { $0.contains("Mac B Node Agent is offline") })
         XCTAssertTrue(store.launchPreview.networkPlan.allSatisfy { $0.readiness == "Needs attention" })
     }
 
@@ -758,7 +758,7 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertEqual(store.backendMode, .singleNode)
         XCTAssertEqual(startNodeCount, 1)
         XCTAssertEqual(store.loadedModelName, row.id)
-        XCTAssertEqual(store.modelLoadTargetSummary(for: row), "1/1 load target · Mango")
+        XCTAssertEqual(store.modelLoadTargetSummary(for: row), "1/1 load target · 127.0.0.1")
         XCTAssertEqual(store.chatTopologyLabel, "1 Mac · Single")
         XCTAssertFalse(store.chatUsesMultipleNodes)
         XCTAssertEqual(store.activeBackendDisplayName, "Tokenity Single-Mac Server")
@@ -1683,6 +1683,16 @@ final class TokenityStoreTests: XCTestCase {
                 }
             }
         )
+        for nodeIndex in store.nodes.indices {
+            store.nodes[nodeIndex].models = [
+                ModelEntry(
+                    id: "Qwen3.5-122B-A10B-4bit",
+                    path: "/models/Qwen3.5-122B-A10B-4bit",
+                    architecture: "Qwen3_5MoeForCausalLM",
+                    modelType: "qwen3_5_moe_text"
+                )
+            ]
+        }
         let model = try XCTUnwrap(store.modelLibraryRows.first)
         var configuration = store.modelConfiguration(for: model.id)
         configuration.thinkingMode = .disabled

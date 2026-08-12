@@ -4,6 +4,7 @@ import asyncio
 import getpass
 import hashlib
 import http.client
+import ipaddress
 import importlib.metadata
 import json
 import logging
@@ -1262,7 +1263,7 @@ def create_app(
                 }
             )
         for node in nodes[1:]:
-            agent_url = _agent_url(node)
+            agent_url = _agent_url(node, remote=True)
             try:
                 info = get_json(f"{agent_url}/v1/node/info", 3.0)
             except Exception as exc:
@@ -4587,7 +4588,7 @@ def _h3_request_nodes(request: H3VideoStartRequest) -> list[ClusterNode]:
     ]
 
 
-def _agent_url(node: ClusterNode) -> str:
+def _agent_url(node: ClusterNode, *, remote: bool = False) -> str:
     if node.agent_url:
         url = node.agent_url.rstrip("/")
     elif node.lan_ip:
@@ -4601,6 +4602,13 @@ def _agent_url(node: ClusterNode) -> str:
         raise HostfileError(f"{node.id}: Agent URL must not contain a username or password.")
     if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
         raise HostfileError(f"{node.id}: Agent URL must be an HTTP origin without a path, query, or fragment.")
+    host = parsed.hostname.lower()
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = host == "localhost" or host.endswith(".localhost")
+    if remote and loopback:
+        raise HostfileError(f"{node.id}: remote Node Agent URL must not use loopback.")
     return url
 
 
@@ -4623,8 +4631,8 @@ def _http_rank_requests(
 ) -> list[RankStartRequest]:
     if not nodes:
         raise HostfileError("At least one node is required.")
-    for node in nodes:
-        _agent_url(node)
+    for rank, node in enumerate(nodes):
+        _agent_url(node, remote=rank > 0)
 
     world_size = len(nodes)
     ring_hosts: list[list[str]] = []
@@ -4698,8 +4706,8 @@ def _h3_rank_requests(
         raise HostfileError("At least one node is required.")
     if len(nodes) > 2:
         raise HostfileError("MiniMax H3 Tensor Parallel currently supports exactly two ranks.")
-    for node in nodes:
-        _agent_url(node)
+    for rank, node in enumerate(nodes):
+        _agent_url(node, remote=rank > 0)
 
     world_size = len(nodes)
     if world_size > 1 and request.connection_mode == ConnectionMode.RING:

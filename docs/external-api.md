@@ -5,7 +5,7 @@ HTTP API on the coordinator Mac.
 
 ## Client Configuration
 
-For the default Mango/Kiwi cluster:
+For a two-node cluster:
 
 - Provider type: Custom OpenAI / OpenAI Compatible
 - Base URL: `http://<node-a-lan-ip>:9100/v1`

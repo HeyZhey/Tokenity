@@ -66,13 +66,6 @@ enum TokenityDeploymentConfiguration {
             .path
     }
 
-    static var runtimeMediaRoot: URL {
-        configuredURL(
-            "TOKENITY_RUNTIME_MEDIA_ROOT",
-            fallback: URL(fileURLWithPath: "/Volumes", isDirectory: true)
-        )
-    }
-
     static var agentBaseURL: String {
         value("TOKENITY_AGENT_URL") ?? "http://127.0.0.1:9100"
     }

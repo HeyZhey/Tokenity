@@ -24,7 +24,6 @@ final class RuntimeBootstrapTests: XCTestCase {
         try Data("verified-runtime".utf8).write(to: artifact)
         let catalog = catalog(for: artifact)
         let service = TokenityRuntimeBootstrapService(
-            volumesDirectory: temporary.appendingPathComponent("volumes"),
             cachesDirectory: temporary.appendingPathComponent("cache"),
             installedPythonPath: temporary.appendingPathComponent("missing-python").path
         )
@@ -50,7 +49,6 @@ final class RuntimeBootstrapTests: XCTestCase {
         try Data("cached-runtime".utf8).write(to: seed)
         let catalog = catalog(for: seed)
         let service = TokenityRuntimeBootstrapService(
-            volumesDirectory: temporary.appendingPathComponent("volumes"),
             cachesDirectory: temporary.appendingPathComponent("cache"),
             installedPythonPath: temporary.appendingPathComponent("missing-python").path
         )

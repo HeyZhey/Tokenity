@@ -16,11 +16,12 @@ precedence when set:
 | `TOKENITY_MODEL_ROOT` | Model inventory | `$TOKENITY_DATA_ROOT/Models` |
 | `TOKENITY_RUNTIME_ROOT` | Pinned Python/MLX runtime | `$TOKENITY_DATA_ROOT/Runtime` |
 | `TOKENITY_RUNTIME_PYTHON` | Exact Python executable | `$TOKENITY_RUNTIME_ROOT/current/.venv/bin/python` |
-| `TOKENITY_RUNTIME_MEDIA_ROOT` | Removable/offline Runtime search root | macOS volume mount root |
 | `TOKENITY_STATE_ROOT` | Instance and watchdog state | `$TOKENITY_DATA_ROOT/State` |
 | `TOKENITY_LOG_ROOT` | Agent and watchdog logs | `$TOKENITY_DATA_ROOT/Logs` |
 
-The macOS package build reads `packaging/install-layout.env`. Override
+Offline Runtime installers are discovered through macOS's mounted-volume API,
+without assuming a filesystem mount root. The macOS package build reads
+`packaging/install-layout.env`. Override
 `TOKENITY_INSTALL_ROOT` when building a package for a different managed
 layout. The generated launchd jobs receive all resolved paths explicitly, and
 the resolved layout is embedded in the control app's deployment configuration.

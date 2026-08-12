@@ -1015,6 +1015,37 @@ def test_cluster_payload_rejects_credentials_in_agent_url():
     assert "must not contain a username or password" in response.json()["detail"]
 
 
+@pytest.mark.parametrize(
+    "endpoint",
+    ["http://127.0.0.2:9100", "http://[::1]:9100", "http://worker.localhost:9100"],
+)
+def test_cluster_payload_rejects_remote_loopback_agent_url(endpoint):
+    client = TestClient(create_app(rdma_probe_fn=fake_rdma_probe))
+    response = client.post(
+        "/v1/node/start-distributed-openai",
+        json={
+            "model": "/models/qwen",
+            "connection_mode": "ring",
+            "dry_run": True,
+            "nodes": [
+                {
+                    "id": "mac-a",
+                    "agent_url": "http://127.0.0.1:9100",
+                    "lan_ip": "127.0.0.1",
+                },
+                {
+                    "id": "mac-b",
+                    "agent_url": endpoint,
+                    "lan_ip": "198.51.100.75",
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    assert "remote Node Agent URL must not use loopback" in response.json()["detail"]
+
+
 def test_rank_environment_matches_mlx_jaccl_contract(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("tokenity.node_agent.agent.tempfile.gettempdir", lambda: str(tmp_path))
     request = RankStartRequest(

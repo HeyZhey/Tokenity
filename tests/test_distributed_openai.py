@@ -1176,6 +1176,17 @@ def test_glm_process_isolated_shutdown_coordinates_generation_thread_exit(tmp_pa
     assert runtime.state.phase.value == "stopping"
 
 
+def test_glm_compatibility_uses_metadata_not_directory_name(tmp_path):
+    disguised = tmp_path / "GLM-5.2-by-name-only"
+    disguised.mkdir()
+    (disguised / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5"}),
+        encoding="utf-8",
+    )
+
+    assert _requires_process_isolated_shutdown(str(disguised)) is False
+
+
 def test_qwen_jaccl_shutdown_uses_the_validated_stop_sentinel(tmp_path):
     qwen = tmp_path / "Qwen3.5-4B"
     qwen.mkdir()

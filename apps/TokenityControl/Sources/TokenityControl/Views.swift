@@ -1234,7 +1234,7 @@ private struct ModelConfigurationSheet: View {
                         .pickerStyle(.segmented)
                         .frame(width: 260)
                     }
-                    if row.isQwen35 {
+                    if row.usesQwen35Sampling {
                         Toggle("Use Qwen3.5 recommended sampling", isOn: $draft.useRecommendedSampling)
                         if draft.useRecommendedSampling {
                             Text(recommendedSamplingSummary)
@@ -1329,7 +1329,7 @@ private struct ModelConfigurationSheet: View {
     }
 
     private func switchToCustomSamplingIfNeeded() {
-        guard row.isQwen35, draft.useRecommendedSampling else { return }
+        guard row.usesQwen35Sampling, draft.useRecommendedSampling else { return }
         let recommended = draft.resolvedSampling(forQwen35: true)
         draft.temperature = recommended.temperature
         draft.topP = recommended.topP

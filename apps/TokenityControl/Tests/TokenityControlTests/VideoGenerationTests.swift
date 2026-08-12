@@ -28,8 +28,8 @@ final class VideoGenerationContractTests: XCTestCase {
                 ),
                 AgentClusterNodeRequest(
                     id: "mac-b",
-                    agentURL: "http://127.0.0.1:9200",
-                    lanIP: "127.0.0.1",
+                    agentURL: "http://198.51.100.75:9200",
+                    lanIP: "198.51.100.75",
                     rdmaIP: "tokenity-rdma-b.invalid",
                     rdmaDevices: ["rdma_en5"]
                 ),
@@ -52,7 +52,7 @@ final class VideoGenerationContractTests: XCTestCase {
         let nodes = try XCTUnwrap(object["nodes"] as? [[String: Any]])
 
         XCTAssertEqual(nodes.count, 2)
-        XCTAssertEqual(nodes[1]["agent_url"] as? String, "http://127.0.0.1:9200")
+        XCTAssertEqual(nodes[1]["agent_url"] as? String, "http://198.51.100.75:9200")
         XCTAssertEqual(object["optimization_profile"] as? String, "stock-qmm")
         XCTAssertEqual(object["api_identifier"] as? String, "MiniMax-H3")
         XCTAssertNil(object["environment"])
@@ -199,6 +199,50 @@ final class VideoGenerationContractTests: XCTestCase {
     }
 
     @MainActor
+    func testH3WorkerLoopbackIsNeverAcceptedAsMacB() async throws {
+        let store = TokenityStore(dataTransport: { request in
+            let response = try XCTUnwrap(
+                HTTPURLResponse(
+                    url: request.url ?? URL(string: "http://localhost")!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )
+            )
+            return (Data(Self.h3NodeInfoPayload(for: request).utf8), response)
+        })
+        store.h3WorkerAgentURL = "http://127.0.0.2:9200"
+
+        await store.refreshVideoNodes()
+
+        let worker = try XCTUnwrap(store.videoNodes.first { $0.id == "h3-mac-b" })
+        XCTAssertFalse(worker.isOnline)
+        XCTAssertTrue(store.videoRuntimeReadinessIssues.contains { $0.contains("offline") })
+    }
+
+    @MainActor
+    func testH3TP2RequiresTwoStableMachineIDs() async {
+        let store = TokenityStore(dataTransport: { request in
+            let payload = Self.h3NodeInfoPayload(for: request)
+                .replacingOccurrences(of: "mac-b-machine", with: "mac-a-machine")
+            let response = try XCTUnwrap(
+                HTTPURLResponse(
+                    url: request.url ?? URL(string: "http://localhost")!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )
+            )
+            return (Data(payload.utf8), response)
+        })
+        store.h3WorkerAgentURL = "http://198.51.100.75:9200"
+
+        await store.refreshVideoNodes()
+
+        XCTAssertTrue(store.videoRuntimeReadinessIssues.contains { $0.contains("two different Macs") })
+    }
+
+    @MainActor
     func testStoppingAnInFlightVideoLoadReleasesTheLoadFenceForRetry() async throws {
         let firstStart = expectation(description: "first H3 start began")
         let secondStart = expectation(description: "second H3 start began")
@@ -231,7 +275,7 @@ final class VideoGenerationContractTests: XCTestCase {
             )
             return (Data(payload.utf8), response)
         })
-        store.h3WorkerAgentURL = "http://127.0.0.1:9200"
+        store.h3WorkerAgentURL = "http://198.51.100.75:9200"
         let videoModel = try XCTUnwrap(
             store.modelLibraryRows.first { $0.id == "MiniMax-H3" }
         )
@@ -274,7 +318,7 @@ final class VideoGenerationContractTests: XCTestCase {
             return (Data(payload.utf8), response)
         })
 
-        store.h3WorkerAgentURL = "http://127.0.0.1:9200"
+        store.h3WorkerAgentURL = "http://198.51.100.75:9200"
         await store.startVideoRuntime()
         XCTAssertEqual(store.videoRuntimeState, .ready)
         await store.refreshVideoNodes()
@@ -358,7 +402,7 @@ final class VideoGenerationContractTests: XCTestCase {
                 )
             }
         )
-        store.h3WorkerAgentURL = "http://127.0.0.1:9200"
+        store.h3WorkerAgentURL = "http://198.51.100.75:9200"
         let videoModel = try XCTUnwrap(store.modelLibraryRows.first { $0.id == "MiniMax-H3" })
         await store.loadModel(videoModel)
         XCTAssertEqual(store.videoRuntimeState, .ready)
@@ -368,7 +412,7 @@ final class VideoGenerationContractTests: XCTestCase {
         XCTAssertEqual((startBody?["nodes"] as? [[String: Any]])?.count, 2)
         XCTAssertEqual(
             (startBody?["nodes"] as? [[String: Any]])?[1]["agent_url"] as? String,
-            "http://127.0.0.1:9200"
+            "http://198.51.100.75:9200"
         )
 
         await store.generateVideo()
@@ -390,7 +434,7 @@ final class VideoGenerationContractTests: XCTestCase {
                 && url.path == "/v1/node/instances/h3-ui-runtime/stop"
         })
         XCTAssertFalse(controlRequests.contains { url in
-            url.host == "127.0.0.1"
+            url.host == "198.51.100.75"
                 && url.port == 9_200
                 && url.path.contains("/v1/node/instances/")
         })
@@ -427,7 +471,7 @@ final class VideoGenerationContractTests: XCTestCase {
             return (Data(payload.utf8), response)
         })
 
-        store.h3WorkerAgentURL = "http://127.0.0.1:9200"
+        store.h3WorkerAgentURL = "http://198.51.100.75:9200"
         await store.startVideoRuntime()
 
         guard case .failed(let message) = store.videoRuntimeState else {
@@ -443,11 +487,12 @@ final class VideoGenerationContractTests: XCTestCase {
     private static func h3NodeInfoPayload(for request: URLRequest) -> String {
         let isWorker = request.url?.port == 9_200
         let nodeID = isWorker ? "mac-b" : "mac-a"
-        let lanIP = isWorker ? "127.0.0.1" : "127.0.0.1"
+        let lanIP = isWorker ? "198.51.100.75" : "127.0.0.1"
+        let machineID = isWorker ? "mac-b-machine" : "mac-a-machine"
         let rdmaIP = isWorker ? "tokenity-rdma-b.invalid" : "tokenity-rdma-a.invalid"
         let rdmaDevice = isWorker ? "rdma_en5" : "rdma_en4"
         return """
-        {"node_id":"\(nodeID)","hostname":"\(lanIP)","user":"test","ips":["\(lanIP)"],"architecture":"arm64","macos_version":"26.5.1","python_path":"/runtime/python","mlx_version":"0.32.0","mlx_lm_version":"0.31.3","tokenity_version":"0.1.0","tokenity_code_revision":"test-h3-ui","agent_contract":{"version":1,"capabilities":["managed_instances","instance_runtimes","instance_quorum","cluster_runtime","minimax_h3_video"]},"process_roles":[],"memory":{"total_bytes":549755813888,"used_bytes":107374182400,"free_bytes":442381631488,"used_ratio":0.1953125},"rdma":{"rdma_enabled":true,"rdma_devices":["\(rdmaDevice)"],"rdma_port_state":{"\(rdmaDevice)":"active"},"thunderbolt_ip":"\(rdmaIP)","rdma_errors":[]},"instances":[]}
+        {"node_id":"\(nodeID)","hostname":"\(lanIP)","user":"test","ips":["\(lanIP)"],"architecture":"arm64","macos_version":"26.5.1","python_path":"/runtime/python","mlx_version":"0.32.0","mlx_lm_version":"0.31.3","tokenity_version":"0.1.0","machine_id":"\(machineID)","tokenity_code_revision":"test-h3-ui","agent_contract":{"version":1,"capabilities":["managed_instances","instance_runtimes","instance_quorum","cluster_runtime","minimax_h3_video"]},"process_roles":[],"memory":{"total_bytes":549755813888,"used_bytes":107374182400,"free_bytes":442381631488,"used_ratio":0.1953125},"rdma":{"rdma_enabled":true,"rdma_devices":["\(rdmaDevice)"],"rdma_port_state":{"\(rdmaDevice)":"active"},"thunderbolt_ip":"\(rdmaIP)","rdma_errors":[]},"instances":[]}
         """
     }
 }

@@ -8,15 +8,15 @@ enum TokenityTestFixtures {
         includesThirdNode: Bool = false
     ) {
         let endpoints = [
-            "mac-b": "http://127.0.0.1:9200",
-            "mac-c": "http://127.0.0.1:9300",
+            "mac-b": "http://198.51.100.75:9200",
+            "mac-c": "http://203.0.113.75:9300",
         ]
         for id in includesThirdNode ? ["mac-b", "mac-c"] : ["mac-b"] {
             guard let index = store.nodes.firstIndex(where: { $0.id == id }),
                   let endpoint = endpoints[id]
             else { continue }
             store.nodes[index].agentURL = endpoint
-            store.nodes[index].ips = ["127.0.0.1"]
+            store.nodes[index].ips = [id == "mac-b" ? "198.51.100.75" : "203.0.113.75"]
             store.selectedNodeIDs.insert(id)
         }
     }
@@ -24,7 +24,7 @@ enum TokenityTestFixtures {
     static func basicNodeInfoPayload(for request: URLRequest) -> String {
         let isWorker = request.url?.port == 9_200
         let nodeID = isWorker ? "mac-b" : "mac-a"
-        let lanIP = isWorker ? "127.0.0.1" : "127.0.0.1"
+        let lanIP = isWorker ? "198.51.100.75" : "127.0.0.1"
         let rdmaIP = isWorker ? "tokenity-rdma-b.invalid" : "tokenity-rdma-a.invalid"
         let rdmaDevice = isWorker ? "rdma_en5" : "rdma_en4"
         return """

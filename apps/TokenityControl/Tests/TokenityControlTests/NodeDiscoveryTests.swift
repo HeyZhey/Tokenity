@@ -4,15 +4,15 @@ import XCTest
 
 final class NodeDiscoveryTests: XCTestCase {
     @MainActor
-    func testDiscoveryRebindsMangoByRDMAIdentityAndPersistsTheNewEndpoint() async throws {
+    func testDiscoveryRebindsNodeByRDMAIdentityAndPersistsTheNewEndpoint() async throws {
         let suite = "TokenityNodeDiscoveryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defaults.removePersistentDomain(forName: suite)
         defer { defaults.removePersistentDomain(forName: suite) }
         let discovery = try Self.endpoint(
             agentURL: "http://node-a.local:9100",
-            machineID: "machine-mango",
-            hostname: "Mango-Studio.local",
+            machineID: "machine-node-a",
+            hostname: "node-a.local",
             user: "apple",
             lanIP: "node-a.local",
             rdmaIP: "tokenity-rdma-a.invalid",
@@ -33,12 +33,12 @@ final class NodeDiscoveryTests: XCTestCase {
 
         await store.discoverNodes()
 
-        let mango = try XCTUnwrap(store.nodes.first { $0.id == "mac-a" })
-        XCTAssertEqual(mango.agentURL, "http://node-a.local:9100")
-        XCTAssertEqual(mango.primaryIP, "node-a.local")
-        XCTAssertEqual(mango.machineID, "machine-mango")
-        XCTAssertEqual(mango.displayName, "Mango")
-        XCTAssertTrue(mango.isOnline)
+        let node = try XCTUnwrap(store.nodes.first { $0.id == "mac-a" })
+        XCTAssertEqual(node.agentURL, "http://node-a.local:9100")
+        XCTAssertEqual(node.primaryIP, "node-a.local")
+        XCTAssertEqual(node.machineID, "machine-node-a")
+        XCTAssertEqual(node.displayName, "node-a.local")
+        XCTAssertTrue(node.isOnline)
         XCTAssertTrue(store.selectedNodeIDs.contains("mac-a"))
         XCTAssertEqual(store.nodes.filter { $0.rdma.thunderboltIP == "tokenity-rdma-a.invalid" }.count, 1)
 
@@ -58,8 +58,8 @@ final class NodeDiscoveryTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suite) }
         let stable = try Self.endpoint(
             agentURL: "http://node-b.local:9100",
-            machineID: "machine-kiwi",
-            hostname: "Kiwi-Studio.local",
+            machineID: "machine-node-b",
+            hostname: "node-b.local",
             user: "node-user",
             lanIP: "node-b.local",
             rdmaIP: "tokenity-rdma-b.invalid",
@@ -67,8 +67,8 @@ final class NodeDiscoveryTests: XCTestCase {
         )
         let isolatedH3 = try Self.endpoint(
             agentURL: "http://node-b.local:9200",
-            machineID: "machine-kiwi",
-            hostname: "Kiwi-Studio.local",
+            machineID: "machine-node-b",
+            hostname: "node-b.local",
             user: "node-user",
             lanIP: "node-b.local",
             rdmaIP: "tokenity-rdma-b.invalid",
@@ -88,10 +88,10 @@ final class NodeDiscoveryTests: XCTestCase {
 
         await store.discoverNodes()
 
-        let kiwi = try XCTUnwrap(store.nodes.first { $0.id == "mac-b" })
-        XCTAssertEqual(kiwi.agentURL, "http://node-b.local:9100")
-        XCTAssertEqual(kiwi.displayName, "Kiwi")
-        XCTAssertEqual(store.nodes.filter { $0.machineID == "machine-kiwi" }.count, 1)
+        let node = try XCTUnwrap(store.nodes.first { $0.id == "mac-b" })
+        XCTAssertEqual(node.agentURL, "http://node-b.local:9100")
+        XCTAssertEqual(node.displayName, "node-b.local")
+        XCTAssertEqual(store.nodes.filter { $0.machineID == "machine-node-b" }.count, 1)
         XCTAssertFalse(store.nodes.contains { $0.agentURL == "http://node-b.local:9200" })
     }
 
@@ -194,6 +194,34 @@ final class NodeDiscoveryTests: XCTestCase {
             (defaults.dictionary(forKey: "TokenityNodeAgentEndpoints.v1") as? [String: String])?["mac-b"],
             "http://node-b.local:9100"
         )
+    }
+
+    @MainActor
+    func testRemoteMacNeverPersistsOrClaimsALoopbackEndpoint() async throws {
+        let suite = "TokenityNodeDiscoveryLoopbackTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let loopback = try Self.endpoint(
+            agentURL: "http://127.0.0.1:9200",
+            machineID: "machine-local-isolated",
+            hostname: "local-isolated",
+            user: "service-user",
+            lanIP: "127.0.0.1",
+            rdmaIP: "tokenity-rdma-local.invalid",
+            rdmaDevice: "rdma_en4"
+        )
+        let store = TokenityStore(
+            nodeDiscoveryTransport: { _ in [loopback] },
+            userDefaults: defaults
+        )
+
+        await store.discoverNodes()
+
+        XCTAssertEqual(store.nodes.first { $0.id == "mac-b" }?.agentURL, "")
+        let saved = defaults.dictionary(forKey: "TokenityNodeAgentEndpoints.v1")
+            as? [String: String]
+        XCTAssertNil(saved?["mac-b"])
     }
 
     @MainActor

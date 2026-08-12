@@ -78,7 +78,6 @@ struct TokenityRuntimeBootstrapService {
     let bundle: Bundle
     let fileManager: FileManager
     let session: URLSession
-    let volumesDirectory: URL
     let cachesDirectory: URL
     let installedPythonPath: String
 
@@ -86,14 +85,12 @@ struct TokenityRuntimeBootstrapService {
         bundle: Bundle = .main,
         fileManager: FileManager = .default,
         session: URLSession = .shared,
-        volumesDirectory: URL = TokenityDeploymentConfiguration.runtimeMediaRoot,
         cachesDirectory: URL? = nil,
         installedPythonPath: String = TokenityDeploymentConfiguration.runtimePythonPath
     ) {
         self.bundle = bundle
         self.fileManager = fileManager
         self.session = session
-        self.volumesDirectory = volumesDirectory
         self.cachesDirectory = cachesDirectory
             ?? fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first!
         self.installedPythonPath = installedPythonPath
@@ -233,10 +230,9 @@ struct TokenityRuntimeBootstrapService {
             cachedArtifactURL(for: catalog)
         )
 
-        if let volumes = try? fileManager.contentsOfDirectory(
-            at: volumesDirectory,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
+        if let volumes = fileManager.mountedVolumeURLs(
+            includingResourceValuesForKeys: [.isDirectoryKey],
+            options: [.skipHiddenVolumes]
         ) {
             candidates.append(contentsOf: volumes.map {
                 $0.appendingPathComponent(catalog.artifact.filename)

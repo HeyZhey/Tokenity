@@ -43,7 +43,7 @@ installs and caches, normalizes symlinks and entry-point shebangs, validates
 the pinned versions and arm64 Mach-O files, and compares deterministic tree
 identities.
 
-For the validated Mango/Kiwi cluster:
+For a two-node cluster:
 
 ```bash
 cd /path/to/Tokenity-Stable

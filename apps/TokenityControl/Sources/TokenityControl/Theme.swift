@@ -129,10 +129,6 @@ extension Font {
         .system(size: size, weight: weight, design: .default)
     }
 
-    static func tokenityCaption(_ size: CGFloat = 11, weight: Font.Weight = .regular) -> Font {
-        .system(size: size, weight: weight, design: .default)
-    }
-
     static func tokenityText(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
         tokenityBody(size, weight: weight)
     }

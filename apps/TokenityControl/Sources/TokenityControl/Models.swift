@@ -740,21 +740,8 @@ struct TokenityNode: Identifiable, Hashable {
     var agentHealthDetail: String? = nil
     var watchdogRestartCount: Int = 0
     var lastAutomaticRecoveryAt: Date? = nil
-    var nickname: String? = nil
-
     var displayName: String {
-        if let nickname, !nickname.isEmpty {
-            return nickname
-        }
-        if agentURL.contains("127.0.0.1") {
-            return "Apple"
-        }
-        let names = ["Mango", "Kiwi", "Apple", "Lime", "Pear", "Plum", "Berry"]
-        let key = [id, agentURL, hostname].joined(separator: "|")
-        let index = key.unicodeScalars.reduce(0) { value, scalar in
-            (value * 31 + Int(scalar.value)) % names.count
-        }
-        return names[index]
+        hostname.isEmpty ? id : hostname
     }
 
     var primaryIP: String {
@@ -816,7 +803,15 @@ struct TokenityNode: Identifiable, Hashable {
             "",
         ]
         let resolvedEndpoints = (0 ..< 3).map { index in
-            endpoints.indices.contains(index) ? endpoints[index] : fallbackEndpoints[index]
+            let endpoint = endpoints.indices.contains(index) ? endpoints[index] : fallbackEndpoints[index]
+            guard index > 0,
+                  let host = URL(string: endpoint)?.host?.lowercased(),
+                  host == "localhost"
+                    || host.hasSuffix(".localhost")
+                    || host.hasPrefix("127.")
+                    || host == "::1"
+            else { return endpoint }
+            return ""
         }
         let modelPath = TokenityDeploymentConfiguration.modelRoot
             .appendingPathComponent("Qwen3.5-122B-A10B-4bit", isDirectory: true)
@@ -837,8 +832,7 @@ struct TokenityNode: Identifiable, Hashable {
                 roles: [],
                 memory: .unknown,
                 models: [ModelEntry(id: "Qwen3.5-122B-A10B-4bit", path: modelPath)],
-                isOnline: false,
-                nickname: "Mango"
+                isOnline: false
             ),
             TokenityNode(
                 id: "mac-b",
@@ -855,8 +849,7 @@ struct TokenityNode: Identifiable, Hashable {
                 roles: [],
                 memory: .unknown,
                 models: [ModelEntry(id: "Qwen3.5-122B-A10B-4bit", path: modelPath)],
-                isOnline: false,
-                nickname: "Kiwi"
+                isOnline: false
             ),
             TokenityNode(
                 id: "mac-c",
@@ -873,8 +866,7 @@ struct TokenityNode: Identifiable, Hashable {
                 roles: [],
                 memory: .unknown,
                 models: [ModelEntry(id: "Qwen3.5-122B-A10B-4bit", path: modelPath)],
-                isOnline: false,
-                nickname: "Apple"
+                isOnline: false
             )
         ]
     }
@@ -918,8 +910,8 @@ struct ModelLibraryRow: Identifiable, Hashable {
     var distributedLoadable: Bool
     var distributedLoadBlockReason: String?
 
-    var isQwen35: Bool {
-        let identity = [id, architecture ?? "", modelType ?? ""]
+    var usesQwen35Sampling: Bool {
+        let identity = [architecture ?? "", modelType ?? ""]
             .joined(separator: " ")
             .lowercased()
             .replacingOccurrences(of: "_", with: "")

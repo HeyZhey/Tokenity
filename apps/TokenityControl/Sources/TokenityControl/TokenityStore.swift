@@ -729,6 +729,10 @@ final class TokenityStore: ObservableObject {
         if h3BinaryPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             issues.append("MiniMax H3 native binary path is required.")
         }
+        if videoNodes.count == 2,
+           Set(videoNodes.compactMap(\.machineID)).count != videoNodes.count {
+            issues.append("MiniMax H3 TP2 endpoints must resolve to two different Macs.")
+        }
         for node in videoNodes {
             if !node.isOnline {
                 issues.append("\(node.displayName) Node Agent is offline.")
@@ -1367,44 +1371,6 @@ final class TokenityStore: ObservableObject {
         beginLoadingModel(row)
     }
 
-    func refreshLocalAgent() async {
-        guard let url = URL(string: "\(agentBaseURL)/v1/node/info") else {
-            appendLog("This Mac's control service address is not valid.")
-            return
-        }
-        do {
-            let (data, _) = try await URLSession.shared.data(from: url)
-            let decoded = try JSONDecoder().decode(NodeInfoResponse.self, from: data)
-            let node = TokenityNode(
-                id: decoded.nodeID,
-                hostname: decoded.hostname,
-                user: decoded.user,
-                agentURL: agentBaseURL,
-                ips: decoded.ips,
-                architecture: decoded.architecture,
-                pythonPath: decoded.pythonPath,
-                mlxVersion: decoded.mlxVersion,
-                mlxLMVersion: decoded.mlxLMVersion,
-                tokenityVersion: decoded.tokenityVersion,
-                machineID: decoded.machineID,
-                tokenityCodeRevision: decoded.tokenityCodeRevision,
-                agentContract: decoded.agentContract,
-                rdma: decoded.rdma,
-                roles: decoded.processRoles,
-                memory: decoded.memory ?? .unknown,
-                models: [],
-                isOnline: true,
-                clusterRuntime: decoded.clusterRuntime,
-                clusterRuntimes: decoded.clusterRuntimes ?? []
-            )
-            upsert(node)
-            appendLog("Refreshed this Mac: \(decoded.hostname)")
-            rebuildLaunchPreview()
-        } catch {
-            appendLog("Could not reach this Mac's control service.")
-        }
-    }
-
     func refreshVideoNodes() async {
         let endpoints = [
             H3VideoEndpoint(
@@ -1428,7 +1394,8 @@ final class TokenityStore: ObservableObject {
             guard let baseURL = URL(string: endpoint.agentURL),
                   let scheme = baseURL.scheme?.lowercased(),
                   ["http", "https"].contains(scheme),
-                  baseURL.host != nil
+                  baseURL.host != nil,
+                  endpoint.id != "h3-mac-b" || !Self.isLoopbackAgentURL(baseURL)
             else {
                 sampledNodes.append(offlineVideoNode(for: endpoint, previousNode: previousNode))
                 continue
@@ -2119,7 +2086,7 @@ final class TokenityStore: ObservableObject {
                 }
             }
             try ensureActiveModelLoad(operationID)
-            let role = backendRole
+            let role = "distributed-openai"
             loadedBackendRole = role
             let startResponse = try await startBackendModel(
                 row,
@@ -2555,10 +2522,6 @@ final class TokenityStore: ObservableObject {
         }
     }
 
-    func startDryRun() {
-        createCluster()
-    }
-
     func stopCluster() async {
         modelOperationEpoch &+= 1
         phase = .stopping
@@ -2787,6 +2750,9 @@ final class TokenityStore: ObservableObject {
         _ discovery: DiscoveredNodeEndpoint
     ) -> DiscoveryMergeResult {
         let info = discovery.info
+        guard let discoveredURL = Self.normalizedAgentBaseURL(discovery.agentURL) else {
+            return .unchanged
+        }
         var existingIndex = nodes.firstIndex { node in
             if node.agentURL == discovery.agentURL || node.id == info.nodeID {
                 return true
@@ -2807,6 +2773,7 @@ final class TokenityStore: ObservableObject {
         if existingIndex == nil {
             existingIndex = nodes.indices.first {
                 unboundPlaceholderNodeIDs.contains(nodes[$0].id)
+                    && !Self.isLoopbackAgentURL(discoveredURL)
             }
         }
 
@@ -2840,7 +2807,6 @@ final class TokenityStore: ObservableObject {
             let claimedPlaceholder = unboundPlaceholderNodeIDs.contains(existing.id)
             let endpointChanged = existing.agentURL != discovery.agentURL
             discoveredNode.id = existing.id
-            discoveredNode.nickname = existing.nickname ?? existing.displayName
             discoveredNode.models = existing.models
             discoveredNode.runtimeMemory = existing.runtimeMemory
             nodes[existingIndex] = discoveredNode
@@ -2863,10 +2829,11 @@ final class TokenityStore: ObservableObject {
     private func persistNodeEndpointOverrides() {
         let overrides: [String: String] = Dictionary(
             uniqueKeysWithValues: nodes.compactMap { node in
-                guard !unboundPlaceholderNodeIDs.contains(node.id),
-                      Self.normalizedAgentBaseURL(node.agentURL) != nil
+                guard let url = Self.normalizedAgentBaseURL(node.agentURL),
+                      !unboundPlaceholderNodeIDs.contains(node.id),
+                      !Self.isLoopbackAgentURL(url)
                 else { return nil }
-                return (node.id, node.agentURL)
+                return (node.id, url.absoluteString)
             }
         )
         userDefaults.set(overrides, forKey: nodeEndpointOverridesKey)
@@ -2893,7 +2860,10 @@ final class TokenityStore: ObservableObject {
 
     private static func isLoopbackAgentURL(_ url: URL) -> Bool {
         guard let host = url.host?.lowercased() else { return false }
-        return host == "localhost" || host == "127.0.0.1" || host == "::1"
+        return host == "localhost"
+            || host.hasSuffix(".localhost")
+            || host.hasPrefix("127.")
+            || host == "::1"
     }
 
     private func fetchNodeInfo(for node: TokenityNode) async -> NodeInfoResponse? {
@@ -3318,27 +3288,6 @@ final class TokenityStore: ObservableObject {
         modelLoadStates = states
     }
 
-    private func upsert(_ node: TokenityNode) {
-        if let index = nodes.firstIndex(where: {
-            $0.id == node.id
-                || $0.agentURL == node.agentURL
-                || (node.machineID != nil && $0.machineID == node.machineID)
-        }) {
-            var merged = node
-            merged.id = nodes[index].id
-            merged.nickname = nodes[index].nickname ?? nodes[index].displayName
-            if merged.models.isEmpty {
-                merged.models = nodes[index].models
-            }
-            if merged.memory.totalBytes == nil {
-                merged.memory = nodes[index].memory
-            }
-            nodes[index] = merged
-        } else {
-            nodes.append(node)
-        }
-    }
-
     private func keepClusterPrimaryInSelection() {
         if !selectedNodeIDs.contains(coordinatorID) {
             coordinatorID = selectedNodeIDs.sorted().first ?? ""
@@ -3563,10 +3512,6 @@ final class TokenityStore: ObservableObject {
                 detail: detail
             )
         }
-    }
-
-    private var backendRole: String {
-        "distributed-openai"
     }
 
     private func startBackendModel(
@@ -4013,14 +3958,11 @@ final class TokenityStore: ObservableObject {
 
     private func probeModelService(modelName: String) async throws {
         guard let url = modelServiceURL(path: "/v1/chat/completions") else { throw TokenityTransportError.missingModelService }
-        let normalizedModelName = modelName.lowercased()
-            .replacingOccurrences(of: "_", with: "")
-            .replacingOccurrences(of: ".", with: "")
-            .replacingOccurrences(of: "-", with: "")
-        let isQwen35 = modelLibraryRows.first(where: { $0.id == modelName })?.isQwen35
-            ?? normalizedModelName.contains("qwen35")
+        let usesQwen35Sampling = modelLibraryRows
+            .first(where: { $0.id == modelName })?
+            .usesQwen35Sampling == true
         let probeBody: OpenAIChatRequest
-        if isQwen35 {
+        if usesQwen35Sampling {
             probeBody = OpenAIChatRequest(
                 model: modelName,
                 messages: [OpenAIChatRequest.Message(role: "user", content: "Reply with OK.")],
@@ -4614,12 +4556,9 @@ final class TokenityStore: ObservableObject {
         let isAuto = configuration == nil
         let modelID = isAuto ? model : chatSelectedModelID
         let row = modelLibraryRows.first { $0.id == modelID }
-        let normalizedID = modelID.lowercased()
-            .replacingOccurrences(of: "_", with: "")
-            .replacingOccurrences(of: ".", with: "")
-            .replacingOccurrences(of: "-", with: "")
-        let isQwen35 = row?.isQwen35 ?? normalizedID.contains("qwen35")
-        let sampling = configuration?.resolvedSampling(forQwen35: isQwen35)
+        let sampling = configuration?.resolvedSampling(
+            forQwen35: row?.usesQwen35Sampling == true
+        )
         let templateArguments: [String: Bool]?
         switch configuration?.thinkingMode {
         case .automatic:
