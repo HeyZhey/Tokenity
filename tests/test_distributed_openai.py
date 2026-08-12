@@ -1086,10 +1086,9 @@ def _serve_single(self, request):
     patched = _replace_jaccl_sequential_cancel_collective(source)
 
     assert "[int(tokenity_cancelled)] * 10" in patched
-    assert 'stream_generate.__globals__["generation_stream"]' in patched
-    assert "with mx.stream(tokenity_generation_stream)" in patched
-    assert "stream=tokenity_generation_stream" in patched
-    assert "stream=mx.cpu" not in patched
+    assert 'mx.synchronize(stream_generate.__globals__["generation_stream"])' in patched
+    assert "with mx.stream(mx.cpu)" in patched
+    assert "stream=mx.cpu" in patched
     assert "mx.default_stream" not in patched
 
 

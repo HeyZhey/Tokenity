@@ -538,15 +538,15 @@ def _replace_jaccl_sequential_cancel_collective(source: str) -> str:
     replacement = """\
             tokenity_cancelled = ctx._should_stop
             if self._is_distributed:
-                tokenity_generation_stream = stream_generate.__globals__["generation_stream"]
-                with mx.stream(tokenity_generation_stream):
+                mx.synchronize(stream_generate.__globals__["generation_stream"])
+                with mx.stream(mx.cpu):
                     tokenity_cancel_control = mx.array(
                         [int(tokenity_cancelled)] * 10,
                         dtype=mx.uint32,
                     )
                     tokenity_cancel_control = mx.distributed.all_sum(
                         tokenity_cancel_control,
-                        stream=tokenity_generation_stream,
+                        stream=mx.cpu,
                     )
                     tokenity_cancelled = bool(tokenity_cancel_control[0].item())
             if tokenity_cancelled:
