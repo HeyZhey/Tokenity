@@ -23,9 +23,12 @@ Architecture: GlmMoeDsaForCausalLM
 Quantization: mxfp4, 4-bit, group size 32
 Shards:       76
 Size:         368 GB
-Runtime:      MLX 0.31.2, MLX-LM 0.31.3
+Runtime:      MLX 0.32.0, MLX-LM 0.31.3
 ```
 
-The model was loaded successfully on a 512 GB M3 Ultra in Tokenity Single Mac
-mode and completed a short OpenAI-compatible chat request. Memory is expected
-to remain near the machine's wired-memory limit while this model is loaded.
+The model was loaded successfully across two 512 GB Macs with a `2/2`
+JACCL/RDMA quorum. Real hardware tests covered non-streaming and streaming
+generation, multi-turn context, a queued request with an observed positive wait,
+and three stream-cancel/stop/reload cycles. Cancellation retires the distributed
+group before reuse; both ranks then exit normally and release their MLX memory
+before a fresh instance is admitted.

@@ -48,24 +48,30 @@ python -m tokenity --help
 python -m tokenity.benchmarking.minimax_h3_tp2 --help
 ```
 
-The local lean validation baseline is 240 passing Python tests with 8 hardware
+The local lean validation baseline is 258 passing Python tests with 8 hardware
 tests skipped, and 143 passing Swift tests with 1 platform-dependent test
 skipped. The debug app bundle, Node Agent health/info API, single-Mac LLM
 dry-run, two-Mac HTTP launch plan, and single-Mac H3 dry-run also pass.
 
 ## Hardware Validation
 
-Unit tests and dry-runs cannot prove model weights, native binaries, RDMA links,
-or a second Mac. Before a production release, use the current deployment values
-to perform:
+The current two-Mac hardware baseline has also completed the following real
+model checks:
 
-1. A real GLM 5.2 non-streaming response and a streaming response cancelled
-   mid-generation.
-2. A real Qwen/MLX single-Mac response and a two-Mac HTTP Node Agent launch.
-3. A real MiniMax H3 single-Mac generation and TP2/RDMA generation, including
-   cancellation, retry, artifact download, save, and playback.
-4. A Node Agent termination/restart to confirm watchdog recovery and instance
-   journal adoption on each Mac.
+1. GLM 5.2 reached a `2/2` JACCL/RDMA readiness quorum, completed non-streaming,
+   streaming, multi-turn, and queued OpenAI-compatible requests, then stopped
+   both ranks with exit code zero.
+2. Three consecutive 1,024-token GLM streams were disconnected after their
+   first content token. Each runtime failed closed, rejected reuse with HTTP
+   503, stopped both ranks normally, reclaimed memory immediately, and loaded a
+   fresh instance that completed both streaming and non-streaming inference.
+3. MiniMax H3 completed real single-Mac and TP2/RDMA generation through the
+   Agent SSE gateway. Both paths published progress, released their request
+   slot after client cancellation, generated complete RGB8 video plus PCM audio
+   on retry, and stopped without retained reservations or ports.
+4. The standard 512x256, 124-frame, 28-step H3 request completed four times in
+   one TP2 lifecycle with identical video and audio hashes.
 
-Do not mark the hardware baseline complete unless the configured model root,
-native H3 binary, active RDMA devices, and both Node Agents are present.
+The external hardware reports are stored outside the repository under the
+operator's validation-artifact directory. Re-run them after changing MLX,
+MLX-LM, the native H3 binary, model weights, or RDMA topology.
