@@ -32,9 +32,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
 from tokenity import __version__
-from tokenity.control import (
-    AutoRouter,
-    CapabilityRegistry,
+from tokenity.control.instances import (
     GenerationQueueFull,
     GenerationSlotCancelled,
     GenerationSlotScheduler,
@@ -44,15 +42,19 @@ from tokenity.control import (
     InstanceRegistry,
     InstanceRouter,
     MemoryReservationBreakdown,
-    ModelCapabilityProfile,
-    ModelRuntimeState,
     ResourceAdmissionError,
     ResourceLedger,
+    live_system_available_memory_bytes,
+)
+from tokenity.control.routing import (
+    AutoRouter,
+    CapabilityRegistry,
+    ModelCapabilityProfile,
+    ModelRuntimeState,
     RouteContext,
     RouteDecision,
     RoutePolicy,
     RouteReason,
-    live_system_available_memory_bytes,
 )
 from tokenity.inference.native_mtp import scan_native_mtp_capability
 from tokenity.mlx.hostfile import ClusterNode, ConnectionMode, HostfileError, build_hostfile
@@ -144,7 +146,6 @@ MODEL_ROLES = (
     "minimax-h3-video",
     "minimax-h3-video-rank",
     "single-node-openai",
-    "official-mlx-lm",
 )
 NATIVE_ADMIN_STOP_ROLES = frozenset(
     {"distributed-openai", "minimax-h3-video", "single-node-openai"}
@@ -303,7 +304,6 @@ class StopRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     role: Literal[
-        "official-mlx-lm",
         "distributed-openai",
         "distributed-openai-rank",
         "minimax-h3-video",
@@ -2739,17 +2739,6 @@ def create_app(
             f"deadline_{deadline_kind}": deadline,
             "worker_renewals": worker_renewals,
         }
-
-    @app.post("/v1/node/start-official-mlx-lm")
-    def start_official(request: StartRequest) -> dict[str, object]:
-        del request
-        raise HTTPException(
-            status_code=410,
-            detail=(
-                "The legacy mlx.launch backend is disabled because it requires SSH. "
-                "Use /v1/node/start-distributed-openai for HTTP Node Agent orchestration."
-            ),
-        )
 
     @app.post("/v1/node/start-minimax-h3-video")
     def start_minimax_h3_video(
@@ -5452,20 +5441,6 @@ def _estimated_h3_memory_reservation_breakdown(
         runtime_peak_bytes=runtime_peak,
         os_headroom_bytes=os_headroom,
     )
-
-
-def _estimated_memory_reservation(model: str, world_size: int) -> int:
-    """Compatibility estimate for callers that do not provide runtime sizing."""
-
-    return _estimated_memory_reservation_breakdown(
-        model,
-        world_size,
-        max_tokens=32_768,
-        prompt_cache_size=4,
-        prefill_step_size=2_048,
-        decode_concurrency=1,
-        prompt_concurrency=1,
-    ).estimated_total_bytes
 
 
 def _allocate_instance_port(preferred: int, ledger: dict[str, object]) -> int:

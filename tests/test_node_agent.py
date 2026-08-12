@@ -835,25 +835,6 @@ def test_model_scan(tmp_path: Path):
     assert payload["size_bytes"] >= 384
 
 
-def test_legacy_official_backend_is_disabled_because_it_requires_ssh():
-    client = TestClient(create_app(rdma_probe_fn=fake_rdma_probe))
-    response = client.post(
-        "/v1/node/start-official-mlx-lm",
-        json={
-            "model": "/fixtures/tokenity/models/Qwen",
-            "connection_mode": "jaccl",
-            "nodes": [
-                {"id": "mac-a", "agent_url": "http://198.51.100.23:9100", "rdma_ip": "203.0.113.1", "rdma_devices": ["rdma_en4"]},
-                {"id": "mac-b", "agent_url": "http://198.51.100.75:9100", "rdma_ip": "203.0.113.2", "rdma_devices": ["rdma_en5"]},
-            ],
-        },
-    )
-
-    assert response.status_code == 410
-    assert "requires SSH" in response.json()["detail"]
-    assert "start-distributed-openai" in response.json()["detail"]
-
-
 def test_distributed_dry_run_forwards_runtime_configuration():
     client = TestClient(create_app(rdma_probe_fn=fake_rdma_probe))
     response = client.post(
@@ -1003,6 +984,14 @@ def test_cluster_payload_rejects_legacy_ssh_fields():
 
     assert response.status_code == 422
     assert "ssh" in response.text
+
+
+def test_production_python_contains_no_remote_shell_launch_path():
+    root = Path(__file__).parents[1] / "tokenity"
+    source = "\n".join(path.read_text(encoding="utf-8") for path in root.rglob("*.py"))
+
+    assert '["ssh"' not in source
+    assert "TOKENITY_MLX_LAUNCH_VIA_LOCAL_SSH" not in source
 
 
 def test_cluster_payload_rejects_credentials_in_agent_url():
@@ -3595,7 +3584,6 @@ def test_stop_all_stops_every_model_role_and_heartbeat_renews_lease():
         "minimax-h3-video",
         "minimax-h3-video-rank",
         "single-node-openai",
-        "official-mlx-lm",
     }
 
 

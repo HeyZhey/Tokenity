@@ -168,8 +168,6 @@ extension TokenityStore {
             case 1: return "Single Mac"
             default: return "\(selectedNodes.count)-Mac distributed"
             }
-        case .official:
-            return "Official MLX-LM"
         }
     }
 
@@ -256,8 +254,6 @@ extension TokenityStore {
             let expectedRole: String
             if node.id == coordinator?.id {
                 switch backendMode {
-                case .official:
-                    expectedRole = "official-mlx-lm"
                 case .singleNode:
                     expectedRole = "single-node-openai"
                 case .distributed:

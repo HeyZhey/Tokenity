@@ -240,7 +240,7 @@ starts and dry-runs enforce a 2 GiB default free-disk gate.
 The reusable fixed-request harness replaces manual curl bookkeeping:
 
 ```bash
-uv run python scripts/benchmark-minimax-h3-tp2.py \
+python -m tokenity.benchmarking.minimax_h3_tp2 \
   --coordinator-agent "$TOKENITY_H3_COORDINATOR_AGENT" \
   --worker-agent "$TOKENITY_H3_WORKER_AGENT" \
   --nodes-json "$TOKENITY_H3_NODES_JSON" \

@@ -203,29 +203,6 @@ struct MemoryUsageBar: View {
     }
 }
 
-struct CodeBlock: View {
-    let text: String
-
-    @Environment(\.tokenityTheme) private var theme
-
-    var body: some View {
-        ScrollView([.horizontal, .vertical]) {
-            Text(text)
-                .font(.tokenityMono(12))
-                .foregroundStyle(theme.text)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(12)
-        }
-        .frame(minHeight: 120)
-        .background(theme.code, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(theme.border, lineWidth: 0.6)
-        )
-    }
-}
-
 struct OperationLog: View {
     let lines: [String]
 

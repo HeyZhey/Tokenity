@@ -331,7 +331,7 @@ struct ClusterPage: View {
                                 detail: store.backendMode.detail
                             ) {
                                 Picker("Inference backend", selection: $store.backendMode) {
-                                    ForEach(BackendMode.userSelectableCases) { mode in
+                                    ForEach(BackendMode.allCases) { mode in
                                         Text(mode.shortName).tag(mode)
                                     }
                                 }
@@ -1508,15 +1508,6 @@ struct SettingsPage: View {
                         .foregroundStyle(theme.text)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                }
-            }
-
-            InfoGroup(title: "Backend Status") {
-                InfoRow(label: "Official") {
-                    StatusPill(text: "Experimental", tone: .warning)
-                }
-                InfoRow(label: "Tokenity") {
-                    StatusPill(text: "Stable target", tone: .accent)
                 }
             }
 

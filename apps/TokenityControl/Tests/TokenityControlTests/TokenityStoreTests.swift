@@ -539,7 +539,7 @@ final class TokenityStoreTests: XCTestCase {
                 httpVersion: nil,
                 headerFields: nil
             )!
-            let payload = #"{"error":{"message":"Unknown path: /v1/node/start-official-mlx-lm"}}"#
+            let payload = #"{"error":{"message":"Unknown path: /v1/node/start-distributed-openai"}}"#
             return (Data(payload.utf8), response)
         })
         guard let first = store.modelLibraryRows.first else {

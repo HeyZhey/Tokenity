@@ -15,8 +15,8 @@ distributed OpenAI backend. The default remains standard decoding.
 - Standard streaming, maximum-token, EOS/stop-sequence, usage, and
   cancellation behavior.
 
-The MVP does not enable Native MTP for the official preview backend, VLM
-models, external draft models, row-wise batches, adaptive depth, QMM verify
+The MVP does not enable Native MTP for VLM models, external draft models,
+row-wise batches, adaptive depth, QMM verify
 kernels, or per-request MTP selection. Seeded requests use mlx-lm's existing
 sequential generation path and log `seeded_sequential_path`; they do not
 change global readiness.

@@ -50,17 +50,13 @@ enum AppSection: String, CaseIterable, Identifiable {
 }
 
 enum BackendMode: String, CaseIterable, Identifiable {
-    case official = "Official MLX-LM Server (Experimental)"
     case distributed = "Tokenity Distributed Server"
     case singleNode = "Single-Mac Tokenity Server"
 
     var id: String { rawValue }
 
-    static let userSelectableCases: [BackendMode] = [.distributed, .singleNode]
-
     var shortName: String {
         switch self {
-        case .official: return "Official MLX-LM"
         case .distributed: return "Tokenity Distributed"
         case .singleNode: return "Single Mac"
         }
@@ -68,7 +64,6 @@ enum BackendMode: String, CaseIterable, Identifiable {
 
     var detail: String {
         switch self {
-        case .official: return "Upstream MLX-LM server; experimental in Tokenity."
         case .distributed: return "Tokenity-managed inference across the selected Macs."
         case .singleNode: return "Run inference on one selected Mac only."
         }

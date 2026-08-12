@@ -30,9 +30,6 @@ exchange SSH keys, or provide machine passwords.
 6. `POST /v1/node/instances/{instance_id}/stop` unloads only that process group.
    A request lease returns `409` while an inference request is still active.
 
-The legacy `/v1/node/start-official-mlx-lm` endpoint returns HTTP `410` because
-upstream `mlx.launch` uses SSH to create remote ranks.
-
 ## Relevant endpoints
 
 | Method | Path | Purpose |

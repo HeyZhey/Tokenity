@@ -37,7 +37,7 @@ enum TokenityTransportError: LocalizedError {
         case .modelServiceNotReady:
             return "The model service did not become ready."
         case .modelServiceReturnedNoModels(let modelName):
-            return "The model service responded, but did not report \(modelName) as loaded. Official MLX-LM Server may be running without a usable chat model; try Tokenity Distributed Server or Standard Network after confirming the backend runtime."
+            return "The model service responded, but did not report \(modelName) as loaded. Confirm the backend runtime and try Standard Network if the distributed transport is unavailable."
         case .backendExited(let message):
             return message
         case .noChatContent:
@@ -2664,9 +2664,7 @@ final class TokenityStore: ObservableObject {
             LaunchSummaryItem(title: "Native MTP", value: effectiveNativeMTPConfiguration.mode.title),
             LaunchSummaryItem(title: "Readiness", value: readinessText),
         ]
-        var warnings = backendMode == .official
-            ? ["Experimental mode is best for compatibility checks. Use Tokenity Distributed Server as the stable target."]
-            : ["Tokenity Distributed Server verifies readiness with a real chat probe before marking a model loaded."]
+        var warnings = ["Tokenity Distributed Server verifies readiness with a real chat probe before marking a model loaded."]
         if backendMode == .distributed && nativeMTPMode == .auto {
             warnings.append("Native MTP Auto falls back to standard decoding when the model, checkpoint, or runtime is incompatible.")
         }
@@ -3459,7 +3457,6 @@ final class TokenityStore: ObservableObject {
         "distributed-openai",
         "distributed-openai-rank",
         "single-node-openai",
-        "official-mlx-lm",
     ]
 
     private static func isActiveInferenceProcess(_ role: ProcessRole) -> Bool {
@@ -3569,21 +3566,7 @@ final class TokenityStore: ObservableObject {
     }
 
     private var backendRole: String {
-        switch backendMode {
-        case .official:
-            return "official-mlx-lm"
-        case .distributed, .singleNode:
-            return "distributed-openai"
-        }
-    }
-
-    private var backendStartPath: String {
-        switch backendMode {
-        case .official:
-            return "/v1/node/start-official-mlx-lm"
-        case .distributed, .singleNode:
-            return "/v1/node/start-distributed-openai"
-        }
+        "distributed-openai"
     }
 
     private func startBackendModel(
@@ -3627,7 +3610,7 @@ final class TokenityStore: ObservableObject {
         }
 
         func send(_ body: AgentStartModelRequest) async throws -> AgentStartModelResponse? {
-            var request = try jsonRequest(url: baseURL.appendingPathComponent(backendStartPath), body: body)
+            var request = try jsonRequest(url: baseURL.appendingPathComponent("/v1/node/start-distributed-openai"), body: body)
             request.timeoutInterval = 40
             let (data, response) = try await dataTransport(request)
             try validate(response, data: data)
@@ -3836,7 +3819,7 @@ final class TokenityStore: ObservableObject {
     }
 
     private func cleanupAllModelRoles() async throws {
-        let roles = ["distributed-openai", "distributed-openai-rank", "single-node-openai", "official-mlx-lm"]
+        let roles = ["distributed-openai", "distributed-openai-rank", "single-node-openai"]
         var firstError: Error?
         for node in selectedNodes {
             guard let baseURL = URL(string: node.agentURL) else {
