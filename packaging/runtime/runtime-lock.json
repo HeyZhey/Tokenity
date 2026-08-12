@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "runtime_id": "2026.07.26.1",
+  "tokenity_version": "0.1.0",
+  "platform": "macos",
+  "architecture": "arm64",
+  "minimum_macos": "26.2",
+  "python_version": "3.12.13",
+  "backend_name": "mlx-lm-mac-arm64-apple-metal-advsimd-0.31.3",
+  "packages": {
+    "fastapi": "0.139.0",
+    "mlx": "0.32.0",
+    "mlx-lm": "0.31.3",
+    "uvicorn": "0.50.2"
+  },
+  "package_identifier": "ai.tokenity.node-agent.runtime",
+  "artifact_filename": "Tokenity-NodeAgent-Runtime-2026.07.26.1-macos-arm64.pkg",
+  "release_tag": "runtime-2026.07.26.1"
+}
