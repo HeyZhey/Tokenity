@@ -292,6 +292,8 @@ def run_benchmark(
                 raise RuntimeError(f"MiniMax H3 request returned HTTP {status}.")
             prefix = root / f"run-{index + 1:02d}"
             parsed = _parse_sse_and_archive(chunks, prefix.with_suffix(".sse"), prefix)
+            # H3 reports one event per denoiser forward. Prompt plus
+            # video/audio decode add three more progress events.
             expected_progress = int(config.request["steps"]) + 3
             if parsed["progress_events"] != expected_progress:
                 raise RuntimeError(

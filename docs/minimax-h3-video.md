@@ -18,8 +18,9 @@ their original cadence.
 This is block-wise Tensor Parallel rather than two independent full-model
 servers. Startup still fails closed with HTTP `412` when either Agent, native
 protocol v1, checkpoint manifest, shard hash, or model/code revision is absent
-or inconsistent. The target two-Mac hardware passed the 2,800-collective gate,
-the standard 124-frame generation, and coordinated shutdown on 2026-08-09.
+or inconsistent. The target two-Mac hardware passed the then-current
+2,800-collective gate, the standard 124-frame generation, and coordinated
+shutdown on 2026-08-09.
 
 ## TokenityControl Video workspace
 
@@ -170,7 +171,9 @@ API, text encoder, initial latent construction, VAE/audio decode, and muxing.
 Rank 1 owns no public port; it receives conditioning and initial latents, loads
 its TP shard, and participates in the 50 main DiT blocks. Each full baseline
 block executes one attention output-projection all-sum and one MLP FC2 all-sum:
-100 collectives per denoise step, or 2,800 at 28 steps with `"fast": false`.
+100 collectives per denoiser forward. H3's `steps` value counts denoiser
+forwards; the scheduler adds a terminal zero sigma. Therefore `steps=28` runs
+28 forwards and 2,800 collectives with `"fast": false`.
 
 ```bash
 curl -X POST "${TOKENITY_H3_COORDINATOR_AGENT}/v1/node/start-minimax-h3-video" \
@@ -191,11 +194,11 @@ curl -X POST "${TOKENITY_H3_COORDINATOR_AGENT}/v1/node/start-minimax-h3-video" \
 JSON
 ```
 
-The standard first hardware run is `256x512`, `124` frames, `28` steps,
-`"fast": false`, and a fixed seed. Protocol v1 intentionally rejects H3
-keyframes in TP2. If an SSE client disconnects during a distributed generation,
-both ranks finish that in-flight job to preserve collective ordering; subsequent
-jobs remain usable.
+The standard first hardware run is `256x512`, `124` frames, `28` denoiser
+forwards (29 sigma grid points), `"fast": false`, and a fixed seed. Protocol v1
+intentionally rejects H3 keyframes in TP2. If an SSE client disconnects during
+a distributed generation, both ranks finish that in-flight job to preserve
+collective ordering; subsequent jobs remain usable.
 
 ## Validated hardware result
 
