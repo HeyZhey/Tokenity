@@ -70,7 +70,7 @@ than a fixed two-machine topology.
 ## Requirements
 
 - Apple-silicon Macs on the same trusted network.
-- macOS 14+ and Swift 5.9+ for TokenityControl development.
+- macOS 26.2+ and Swift 5.9+ for Tokenity app development.
 - Python 3.10+ for backend development.
 - A compatible MLX/MLX-LM runtime on every inference Mac.
 - The same model path on every participating Mac for a distributed workload.

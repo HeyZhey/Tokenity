@@ -1973,15 +1973,11 @@ class TokenityDistributedRuntime:
         }
 
     def _configure_distributed_generation_mode(self) -> None:
-        if (
-            self._provider is not None
-            and (self.state.connection_mode or "").lower() in {"jaccl", "jaccl-ring"}
-        ):
+        if self._provider is not None and self.execution_mode == "distributed":
             # MLX-LM 0.31.x keeps BatchGenerator collectives and prompt-cache
-            # state alive between requests. On JACCL this can let a worker
-            # enter the next request-control collective while rank 0 is still
-            # finishing the previous model collective. The next control frame
-            # then consumes model data (or ibv_post_recv reaches ENOMEM).
+            # state alive between requests. Only rank 0 replaces the readiness
+            # warmup cache, so retaining it on workers can give ranks different
+            # prefill lengths and deadlock the next request on any transport.
             # Tokenity configures one decode at a time, so the sequential
             # engine preserves the supported concurrency without carrying
             # cross-request collective state.
@@ -2002,13 +1998,9 @@ class TokenityDistributedRuntime:
             )
 
     def _prepare_distributed_generation_mode(self) -> None:
-        """Install JACCL invariants before ResponseGenerator starts its thread."""
+        """Install distributed invariants before ResponseGenerator starts its thread."""
 
-        if (
-            self._provider is None
-            or (self.state.connection_mode or "").lower()
-            not in {"jaccl", "jaccl-ring"}
-        ):
+        if self._provider is None or self.execution_mode != "distributed":
             return
         provider = self._provider
         self._distributed_prompt_cache_size = 0

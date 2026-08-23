@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import getpass
 import hashlib
 import http.client
@@ -159,6 +160,9 @@ NATIVE_ADMIN_STOP_ROLES = frozenset(
 COORDINATED_WORKER_ROLES = frozenset(
     {"distributed-openai-rank", "minimax-h3-video-rank"}
 )
+VIDEO_MODEL_ROLES = frozenset(
+    {"minimax-h3-video", "minimax-h3-video-rank"}
+)
 
 
 class _LaunchCancelled(RuntimeError):
@@ -168,9 +172,10 @@ class _LaunchCancelled(RuntimeError):
 class _GatewayStreamingResponse(StreamingResponse):
     """Streaming response whose cleanup covers the complete ASGI lifecycle."""
 
-    def __init__(self, *args, on_close, **kwargs) -> None:
+    def __init__(self, *args, on_close, on_disconnect=None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._on_close = on_close
+        self._on_disconnect = on_disconnect or on_close
 
     async def __call__(self, scope, receive, send) -> None:
         try:
@@ -182,7 +187,7 @@ class _GatewayStreamingResponse(StreamingResponse):
         while True:
             message = await receive()
             if message["type"] == "http.disconnect":
-                self._on_close()
+                self._on_disconnect()
                 return
 
 
@@ -307,6 +312,7 @@ class H3VideoRankStartRequest(BaseModel):
     memory_reservation_bytes: Optional[int] = Field(default=None, ge=0)
     optimization_profile: Literal["baseline", "block-fusions", "stock-qmm"] = "stock-qmm"
     minimum_free_disk_bytes: int = Field(default=2 * 1024**3, ge=0)
+    dry_run: bool = False
     runtime_contract_sha256: Optional[str] = Field(
         default=None,
         pattern=r"^[0-9a-f]{64}$",
@@ -699,7 +705,11 @@ def create_app(
             if assessment.runtime is not None:
                 advance_recovered_instance(instance, assessment.runtime)
             adopted_pids.add(pid)
-        return adopted_pids
+        # Fenced cleanup records are already owned by startup recovery.  Treat
+        # them as known here so the broad unjournaled scan cannot register a
+        # duplicate orphan that remains degraded after the fenced copy is
+        # cleaned.
+        return adopted_pids | set(startup_orphan_records)
 
     def orphan_process_identity_matches(record: dict[str, object]) -> bool:
         instance_payload = record.get("instance")
@@ -1853,6 +1863,8 @@ def create_app(
     ]:
         grouped: dict[tuple[str, str], list[dict[str, object]]] = {}
         for snapshot in instances.snapshots():
+            if instance_roles.get(str(snapshot["instance_id"])) in VIDEO_MODEL_ROLES:
+                continue
             if (
                 allowed_instance_ids is not None
                 and str(snapshot["instance_id"]) not in allowed_instance_ids
@@ -2101,6 +2113,27 @@ def create_app(
                 )
             return decision, selected, profile
 
+        video_target = next(
+            (
+                snapshot
+                for snapshot in instances.snapshots()
+                if requested_model
+                in {
+                    str(snapshot["instance_id"]),
+                    str(snapshot["requested_model_id"]),
+                }
+                and instance_roles.get(str(snapshot["instance_id"])) in VIDEO_MODEL_ROLES
+            ),
+            None,
+        )
+        if video_target is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "MiniMax H3 is a video runtime. "
+                    "Use /v1/video/generations instead of the chat gateway."
+                ),
+            )
         started = time.perf_counter()
         parsed["effective_default_model_id"] = None
         parsed["effective_default_revision"] = None
@@ -2196,6 +2229,8 @@ def create_app(
         scheduler_snapshot = generation_scheduler.snapshot()
         queued_by_instance = scheduler_snapshot["queued_by_instance"]
         for snapshot in instances.snapshots():
+            if instance_roles.get(str(snapshot["instance_id"])) in VIDEO_MODEL_ROLES:
+                continue
             if (
                 snapshot.get("state") not in {"ready", "busy"}
                 or snapshot.get("health_ready") is False
@@ -2239,6 +2274,8 @@ def create_app(
         now = int(time.time())
         ready_models: dict[str, dict[str, object]] = {}
         for snapshot in instances.snapshots():
+            if instance_roles.get(str(snapshot["instance_id"])) in VIDEO_MODEL_ROLES:
+                continue
             if (
                 snapshot.get("state") not in {"ready", "busy"}
                 or snapshot.get("health_ready") is False
@@ -2466,9 +2503,12 @@ def create_app(
                             }
                         )
                         stream_close_lock = threading.Lock()
+                        stream_read_lock = threading.Lock()
                         stream_closed = False
+                        drain_started = False
+                        client_disconnected = threading.Event()
 
-                        def close_gateway_stream() -> None:
+                        def finish_gateway_stream() -> None:
                             nonlocal stream_closed
                             with stream_close_lock:
                                 if stream_closed:
@@ -2477,13 +2517,59 @@ def create_app(
                             connection.close()
                             release_gateway_resources()
 
+                        def drain_gateway_stream() -> None:
+                            try:
+                                _drain_gateway_response(upstream, stream_read_lock)
+                            except Exception:
+                                logging.exception(
+                                    "Tokenity could not finish draining a disconnected "
+                                    "distributed chat stream."
+                                )
+                            finally:
+                                finish_gateway_stream()
+
+                        def close_gateway_stream() -> None:
+                            nonlocal drain_started
+                            with stream_close_lock:
+                                if stream_closed:
+                                    return
+                                if client_disconnected.is_set():
+                                    if drain_started:
+                                        return
+                                    drain_started = True
+                                    drain_thread = threading.Thread(
+                                        target=drain_gateway_stream,
+                                        name=f"tokenity-stream-drain-{selected_instance_id}",
+                                        daemon=True,
+                                    )
+                                    drain_thread.start()
+                                    return
+                            finish_gateway_stream()
+
+                        preserve_collective = (
+                            selected.world_size > 1
+                            and str(selected.connection_mode).lower()
+                            in {"jaccl", "jaccl-ring"}
+                        )
+
+                        def disconnect_gateway_stream() -> None:
+                            if preserve_collective:
+                                # A client disconnect is rank-local. Keep reading the
+                                # upstream response to its synchronized terminal frame
+                                # so JACCL remains reusable for the next chat request.
+                                client_disconnected.set()
+                            else:
+                                close_gateway_stream()
+
                         return _GatewayStreamingResponse(
                             _gateway_body_chunks(
                                 connection,
                                 upstream,
                                 on_close=close_gateway_stream,
+                                read_lock=stream_read_lock,
                             ),
                             on_close=close_gateway_stream,
+                            on_disconnect=disconnect_gateway_stream,
                             status_code=upstream.status,
                             headers=response_headers,
                             media_type=None,
@@ -2790,17 +2876,6 @@ def create_app(
             optimization_profile=request.optimization_profile,
             tokenity_code_revision=_tokenity_code_revision(),
         )
-        if request.dry_run:
-            return {
-                "dry_run": True,
-                "instance_id": instance_id,
-                "operation_id": operation_id,
-                "execution_mode": "single" if len(nodes) == 1 else "tp2",
-                "model_revision": model_revision,
-                "runtime_fingerprint": runtime_fingerprint,
-                "launch_plan": plan,
-            }
-
         disk = _disk_stats(request.model)
         if int(disk["free_bytes"]) < request.minimum_free_disk_bytes:
             raise HTTPException(
@@ -2829,6 +2904,36 @@ def create_app(
                     "backend": _h3_capabilities_payload(capabilities),
                 },
             )
+        if request.dry_run:
+            if len(nodes) > 1:
+                require_managed_instance_capabilities(
+                    nodes,
+                    additional=frozenset({"minimax_h3_video"}),
+                )
+                try:
+                    for node, rank_request in zip(nodes[1:], rank_requests[1:]):
+                        post_json(
+                            f"{_agent_url(node)}/v1/node/start-minimax-h3-video-rank",
+                            rank_request.model_dump(mode="json"),
+                            120.0,
+                        )
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=412,
+                        detail={
+                            "stage": "minimax_h3_preflight",
+                            "issues": [f"The second Mac failed video preflight: {exc}"],
+                        },
+                    ) from exc
+            return {
+                "dry_run": True,
+                "instance_id": instance_id,
+                "operation_id": operation_id,
+                "execution_mode": "single" if len(nodes) == 1 else "tp2",
+                "model_revision": model_revision,
+                "runtime_fingerprint": runtime_fingerprint,
+                "launch_plan": plan,
+            }
         if len(nodes) > 1:
             require_managed_instance_capabilities(
                 nodes,
@@ -3270,6 +3375,14 @@ def create_app(
                     "fingerprint": local_runtime_fingerprint,
                 },
             )
+        if request.dry_run:
+            return {
+                "dry_run": True,
+                "instance_id": instance_id,
+                "rank": request.rank,
+                "model_revision": local_revision,
+                "runtime_fingerprint": local_runtime_fingerprint,
+            }
         try:
             command, env = _h3_rank_command_and_environment(
                 request,
@@ -3818,12 +3931,19 @@ def create_app(
             pass
 
         worker_results: list[dict[str, object]] = []
+        worker_stop_timeout = request.timeout + (
+            11
+            if role_before_stop in VIDEO_MODEL_ROLES
+            and instance.world_size > 1
+            and _requires_coordinated_rank_stop(instance.connection_mode)
+            else 3
+        )
         for agent_url in instance_workers.get(instance_id, []):
             try:
                 result = post_json(
                     f"{agent_url}/v1/node/instances/{instance_id}/stop",
                     {"timeout": request.timeout},
-                    request.timeout + 3,
+                    worker_stop_timeout,
                 )
                 worker_results.append({"agent_url": agent_url, "result": result})
             except Exception as exc:
@@ -3880,6 +4000,12 @@ def create_app(
                 )
             if getattr(status, "pid", None) is not None:
                 status = supervisor_stop(role, min(2.0, request.timeout), instance_id)
+        if (
+            role in VIDEO_MODEL_ROLES
+            and instance.world_size > 1
+            and _requires_coordinated_rank_stop(instance.connection_mode)
+        ):
+            _request_rdma_link_reset()
         resource_ledger.release(instance_id)
         instance_workers.pop(instance_id, None)
         instance_roles.pop(instance_id, None)
@@ -4074,13 +4200,18 @@ def _gateway_body_chunks(
     upstream: http.client.HTTPResponse,
     *,
     on_close,
+    read_lock: threading.Lock | None = None,
 ):
     del connection
     try:
         while True:
             # read1 returns currently available bytes instead of waiting to fill
             # a large buffer, preserving the runtime's SSE chunk cadence.
-            chunk = upstream.read1(64 * 1024)
+            if read_lock is None:
+                chunk = upstream.read1(64 * 1024)
+            else:
+                with read_lock:
+                    chunk = upstream.read1(64 * 1024)
             if not chunk:
                 break
             yield chunk
@@ -4089,6 +4220,17 @@ def _gateway_body_chunks(
             on_close()
         except InstanceConflict:
             pass
+
+
+def _drain_gateway_response(
+    upstream: http.client.HTTPResponse,
+    read_lock: threading.Lock,
+) -> None:
+    while True:
+        with read_lock:
+            chunk = upstream.read1(64 * 1024)
+        if not chunk:
+            return
 
 
 def _routing_revision(value: object) -> str:
@@ -4183,7 +4325,11 @@ def _infer_gateway_model_profile(
     if isinstance(configured_template_defaults, dict):
         chat_template_defaults = dict(configured_template_defaults)
     elif "qwen3" in identity:
-        chat_template_defaults = {"enable_thinking": True}
+        # Qwen 3.x can spend the entire (often very large) output budget in
+        # reasoning when the private switch is left to the tokenizer default.
+        # Keep normal chat finite; callers that want reasoning can still
+        # explicitly send enable_thinking=true.
+        chat_template_defaults = {"enable_thinking": False}
     else:
         # GLM and other reasoning families keep their own template behavior;
         # never inject Qwen's private enable_thinking switch into them.
@@ -4481,14 +4627,15 @@ def scan_models(root: Path) -> list[dict[str, object]]:
     for child in sorted(root.iterdir(), key=lambda item: item.name.lower()):
         if child.name.startswith("."):
             continue
-        if not child.is_dir():
+        model_path = child if child.is_dir() else _resolve_macos_alias(child)
+        if model_path is None or not model_path.is_dir():
             continue
-        config = _read_model_config(child / "config.json")
-        safetensors = list(child.glob("*.safetensors"))
-        gguf_files = list(child.glob("*.gguf"))
+        config = _read_model_config(model_path / "config.json")
+        safetensors = list(model_path.glob("*.safetensors"))
+        gguf_files = list(model_path.glob("*.gguf"))
         markers = {
-            "config": (child / "config.json").exists(),
-            "tokenizer": (child / "tokenizer.json").exists() or (child / "tokenizer.model").exists(),
+            "config": (model_path / "config.json").exists(),
+            "tokenizer": (model_path / "tokenizer.json").exists() or (model_path / "tokenizer.model").exists(),
             "safetensors": bool(safetensors),
             "gguf": bool(gguf_files),
         }
@@ -4502,19 +4649,109 @@ def scan_models(root: Path) -> list[dict[str, object]]:
             models.append(
                 {
                     "id": child.name,
-                    "path": str(child),
+                    "path": str(model_path),
                     "markers": markers,
                     "format": "GGUF" if gguf_files else "MLX" if safetensors else "Transformers",
-                    "quantization": _quantization_description(config, child),
-                    "size_bytes": _directory_size(child),
+                    "quantization": _quantization_description(config, model_path),
+                    "size_bytes": _directory_size(model_path),
                     "architecture": architecture,
                     "shard_count": len(gguf_files) + len(safetensors),
-                    "revision": _model_revision(str(child)),
-                    "native_mtp": scan_native_mtp_capability(child).to_dict(),
+                    "revision": _model_revision(str(model_path)),
+                    "native_mtp": scan_native_mtp_capability(model_path).to_dict(),
                     **model_usage_metadata(config),
                 }
             )
     return models
+
+
+def _resolve_macos_alias(path: Path) -> Path | None:
+    if sys.platform != "darwin" or not path.is_file():
+        return None
+    try:
+        with path.open("rb") as alias_file:
+            if alias_file.read(4) != b"book":
+                return None
+        core_foundation = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        )
+        pointer = ctypes.c_void_p
+        core_foundation.CFURLCreateFromFileSystemRepresentation.argtypes = [
+            pointer,
+            ctypes.c_char_p,
+            ctypes.c_long,
+            ctypes.c_bool,
+        ]
+        core_foundation.CFURLCreateFromFileSystemRepresentation.restype = pointer
+        core_foundation.CFURLCreateBookmarkDataFromFile.argtypes = [
+            pointer,
+            pointer,
+            ctypes.POINTER(pointer),
+        ]
+        core_foundation.CFURLCreateBookmarkDataFromFile.restype = pointer
+        core_foundation.CFURLCreateByResolvingBookmarkData.argtypes = [
+            pointer,
+            pointer,
+            ctypes.c_ulong,
+            pointer,
+            pointer,
+            ctypes.POINTER(ctypes.c_bool),
+            ctypes.POINTER(pointer),
+        ]
+        core_foundation.CFURLCreateByResolvingBookmarkData.restype = pointer
+        core_foundation.CFURLGetFileSystemRepresentation.argtypes = [
+            pointer,
+            ctypes.c_bool,
+            ctypes.c_char_p,
+            ctypes.c_long,
+        ]
+        core_foundation.CFURLGetFileSystemRepresentation.restype = ctypes.c_bool
+        core_foundation.CFRelease.argtypes = [pointer]
+    except (AttributeError, OSError):
+        return None
+
+    references: list[int] = []
+    try:
+        encoded = os.fsencode(path)
+        source = core_foundation.CFURLCreateFromFileSystemRepresentation(
+            None, encoded, len(encoded), False
+        )
+        if not source:
+            return None
+        references.append(source)
+        error = pointer()
+        bookmark = core_foundation.CFURLCreateBookmarkDataFromFile(
+            None, source, ctypes.byref(error)
+        )
+        if error.value:
+            references.append(error.value)
+        if not bookmark:
+            return None
+        references.append(bookmark)
+        stale = ctypes.c_bool()
+        error = pointer()
+        resolved = core_foundation.CFURLCreateByResolvingBookmarkData(
+            None,
+            bookmark,
+            (1 << 8) | (1 << 9),
+            None,
+            None,
+            ctypes.byref(stale),
+            ctypes.byref(error),
+        )
+        if error.value:
+            references.append(error.value)
+        if not resolved:
+            return None
+        references.append(resolved)
+        buffer = ctypes.create_string_buffer(4096)
+        if not core_foundation.CFURLGetFileSystemRepresentation(
+            resolved, True, buffer, len(buffer)
+        ):
+            return None
+        return Path(os.fsdecode(buffer.value))
+    finally:
+        for reference in reversed(references):
+            core_foundation.CFRelease(reference)
 
 
 def _read_model_config(path: Path) -> dict[str, object]:
@@ -4545,6 +4782,30 @@ def _requires_coordinated_rank_stop(
     connection_mode: str,
 ) -> bool:
     return str(connection_mode).lower() in {"jaccl", "jaccl-ring"}
+
+
+def _request_rdma_link_reset(timeout: float = 12.0) -> bool:
+    interface = os.environ.get("TOKENITY_TB_INTERFACE", "").strip()
+    raw_path = os.environ.get("TOKENITY_RDMA_RESET_REQUEST_PATH", "").strip()
+    if not interface or not raw_path:
+        return False
+
+    request_path = Path(raw_path)
+    try:
+        request_path.parent.mkdir(parents=True, exist_ok=True)
+        request_path.write_text(f"{time.time()}\n", encoding="utf-8")
+    except OSError:
+        logging.exception("Could not request an RDMA link reset on %s.", interface)
+        return False
+
+    deadline = time.monotonic() + timeout
+    while request_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if request_path.exists():
+        logging.warning("Timed out waiting for the RDMA link reset on %s.", interface)
+        return False
+    logging.info("Completed the RDMA link reset on %s.", interface)
+    return True
 
 
 def _quantization_description(config: dict[str, object], model_path: Path) -> str | None:
@@ -4768,6 +5029,7 @@ def _h3_rank_requests(
             optimization_profile=request.optimization_profile,
             minimum_free_disk_bytes=request.minimum_free_disk_bytes,
             runtime_contract_sha256=str(runtime_contract["contract_sha256"]),
+            dry_run=request.dry_run,
         )
         for rank in range(world_size)
     ]

@@ -161,8 +161,10 @@ struct OverviewPage: View {
                         VStack(alignment: .leading, spacing: 6) {
                             HStack {
                                 StatusPill(text: node.agentHealthState.rawValue, tone: agentHealthTone(node.agentHealthState))
-                                Text(node.identityDetail)
-                                    .lineLimit(1)
+                                if !node.identityDetail.isEmpty {
+                                    Text(node.identityDetail).lineLimit(1)
+                                }
+                                StatusPill(text: node.source.rawValue, tone: .neutral)
                                 Spacer()
                                 Text(node.rdma.rdmaEnabled ? "Thunderbolt ready" : "Standard network")
                                     .foregroundStyle(.secondary)
@@ -201,6 +203,7 @@ struct OverviewPage: View {
     private func tone(for phase: ClusterPhase) -> StatusPill.Tone {
         switch phase {
         case .running: return .good
+        case .readyToLoad: return .accent
         case .failed: return .danger
         case .launching, .distributedInit, .loadingModel, .compiling, .firstTokenPending, .stopping: return .warning
         case .stopped: return .neutral
@@ -220,14 +223,13 @@ struct OverviewPage: View {
 struct ClusterPage: View {
     @EnvironmentObject private var store: TokenityStore
     @Environment(\.tokenityTheme) private var theme
-    @State private var showsAdvancedSetup = false
     @State private var manualAgentURL = ""
 
     var body: some View {
         PageScaffold(title: "Cluster") {
             InfoGroup(title: "Cluster Builder") {
                 ClusterNodeCanvas(
-                    nodes: store.nodes,
+                    nodes: store.clusterBuilderNodes,
                     selectedNodeIDs: store.selectedNodeIDs,
                     coordinatorID: store.coordinatorID,
                     canEdit: store.canEditCluster,
@@ -238,13 +240,33 @@ struct ClusterPage: View {
             InfoGroup(title: "Cluster Setup") {
                 InfoRow(label: "Runtime") {
                     HStack(spacing: 10) {
-                        Label(store.backendMode.shortName, systemImage: "server.rack")
+                        Label(store.effectiveBackendMode == .singleNode ? "Single Mac" : "Multiple Macs", systemImage: "server.rack")
                             .lineLimit(1)
                         Image(systemName: "chevron.right")
                             .font(.system(size: 9, weight: .semibold))
                             .foregroundStyle(theme.tertiaryText)
-                        Label(store.connectionMode.shortName, systemImage: connectionSymbol)
-                            .lineLimit(1)
+                        if store.effectiveBackendMode == .singleNode {
+                            Label("Single Mac", systemImage: connectionSymbol)
+                                .lineLimit(1)
+                        } else {
+                            HStack(spacing: 4) {
+                                Image(systemName: connectionSymbol)
+                                Picker("Connection", selection: $store.connectionMode) {
+                                    Text("Automatic").tag(ConnectionMode.jacclRing)
+                                    Text("Standard Network").tag(ConnectionMode.ring)
+                                    Text("Thunderbolt RDMA").tag(ConnectionMode.jaccl)
+                                }
+                                .labelsHidden()
+                                .pickerStyle(.menu)
+                                .fixedSize()
+                            }
+                            .disabled(!store.canEditCluster)
+
+                            Text(store.connectionPreferenceDetail)
+                                .font(.tokenityText(11))
+                                .foregroundStyle(theme.secondaryText)
+                                .lineLimit(2)
+                        }
                         Spacer(minLength: 0)
                     }
                 }
@@ -281,7 +303,7 @@ struct ClusterPage: View {
                         .disabled(
                             manualAgentURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                                 || store.isConnectingNode
-                                || store.phase != .stopped
+                                || !store.canEditCluster
                         )
                     }
                     .help("Connect directly when automatic LAN discovery is unavailable. The verified endpoint is saved by node identity.")
@@ -289,24 +311,35 @@ struct ClusterPage: View {
                 InfoRow(label: "Actions") {
                     HStack(spacing: 10) {
                         Button {
-                            store.phase == .running ? store.restart() : store.createCluster()
+                            if store.phase == .readyToLoad {
+                                store.selectedSection = .models
+                            } else {
+                                store.createCluster()
+                            }
                         } label: {
-                            Label(store.phase == .running ? "Restart Cluster" : "Create Cluster", systemImage: store.phase == .running ? "arrow.clockwise" : "play.fill")
+                            Label(
+                                store.phase == .readyToLoad ? "Open Models" : "Create Cluster",
+                                systemImage: store.phase == .readyToLoad ? "cube.transparent" : "play.fill"
+                            )
                         }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.large)
                         .tint(theme.controlAccent)
-                        .disabled(!store.launchPreview.readinessIssues.isEmpty || store.selectedNodes.isEmpty)
+                        .disabled(
+                            !store.launchPreview.readinessIssues.isEmpty
+                                || store.selectedNodes.isEmpty
+                                || (!store.canEditCluster && store.phase != .readyToLoad)
+                        )
 
                         Button {
                             store.stop()
                         } label: {
-                            Label("Stop Cluster", systemImage: "stop.fill")
+                            Label(store.phase == .readyToLoad ? "Close Cluster" : "Stop Cluster", systemImage: "stop.fill")
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.large)
                         .tint(theme.danger)
-                        .disabled(store.phase == .stopped)
+                        .disabled(!store.canStopCluster)
 
                         Button {
                             Task {
@@ -323,61 +356,15 @@ struct ClusterPage: View {
                         Spacer(minLength: 0)
                     }
                 }
-                InfoRow(label: "Advanced") {
-                    DisclosureGroup(isExpanded: $showsAdvancedSetup) {
-                        VStack(alignment: .leading, spacing: 14) {
-                            advancedPicker(
-                                title: "Inference backend",
-                                detail: store.backendMode.detail
-                            ) {
-                                Picker("Inference backend", selection: $store.backendMode) {
-                                    ForEach(BackendMode.allCases) { mode in
-                                        Text(mode.shortName).tag(mode)
-                                    }
-                                }
-                                .labelsHidden()
-                                .pickerStyle(.menu)
-                            }
-
-                            advancedPicker(
-                                title: "Mac-to-Mac connection",
-                                detail: store.connectionMode.detail
-                            ) {
-                                Picker("Mac-to-Mac connection", selection: $store.connectionMode) {
-                                    ForEach(ConnectionMode.allCases) { mode in
-                                        Text(mode.shortName).tag(mode)
-                                    }
-                                }
-                                .labelsHidden()
-                                .pickerStyle(.menu)
-                            }
-                        }
-                        .padding(.top, 12)
-                    } label: {
-                        Text("Backend and connection options")
-                            .foregroundStyle(theme.secondaryText)
-                    }
-                }
             }
 
             InfoGroup(title: "Inference Acceleration") {
                 InfoRow(label: "Native MTP") {
                     HStack(spacing: 10) {
-                        Picker("Native MTP", selection: $store.nativeMTPMode) {
-                            ForEach(NativeMTPMode.allCases) { mode in
-                                Text(mode.title).tag(mode)
-                            }
-                        }
-                        .labelsHidden()
-                        .pickerStyle(.segmented)
-                        .frame(maxWidth: 300)
-                        .disabled(!store.canEditNativeMTP)
+                        StatusPill(text: "Automatic", tone: .accent)
+                        Text("Tokenity enables compatible acceleration and safely falls back when needed.")
+                            .foregroundStyle(theme.secondaryText)
                         Spacer(minLength: 0)
-                        if !store.canEditNativeMTP {
-                            Text(store.backendMode == .distributed ? "Stop cluster to edit" : "Distributed backend only")
-                                .font(.tokenityText(11))
-                                .foregroundStyle(theme.tertiaryText)
-                        }
                     }
                 }
                 InfoRow(label: "Capability") {
@@ -396,27 +383,17 @@ struct ClusterPage: View {
                             .foregroundStyle(theme.secondaryText)
                     }
                 }
-                InfoRow(label: "MVP boundary") {
-                    Text("Depth 1 · Replicated head · Singleton decode")
-                        .foregroundStyle(theme.secondaryText)
-                }
-                if store.nativeMTPMode == .auto {
-                    InfoRow(label: "Auto fallback") {
-                        Text("The server uses standard decoding if model weights, runtime shape, or topology are incompatible.")
-                            .foregroundStyle(theme.warning)
-                    }
-                }
                 if let runtime = store.nativeMTPRuntime {
                     InfoRow(label: "Runtime") {
                         HStack(spacing: 8) {
                             StatusPill(text: runtime.enabled ? "Enabled" : "Standard decode", tone: runtime.enabled ? .good : .neutral)
-                            Text("Requested \(runtime.requestedMode) · Effective \(runtime.effectiveMode ?? (runtime.enabled ? "native_mtp" : "standard"))")
+                            Text(runtime.enabled ? "Acceleration is active" : "Standard decoding is active")
                                 .foregroundStyle(theme.secondaryText)
                         }
                     }
-                    if let reason = runtime.fallbackReason {
+                    if runtime.fallbackReason != nil {
                         InfoRow(label: "Fallback reason") {
-                            Text("\(reason) · \(runtime.message ?? "Server declined Native MTP")")
+                            Text(runtime.message ?? "Tokenity selected the compatible decoding path.")
                                 .foregroundStyle(theme.warning)
                         }
                     }
@@ -475,31 +452,13 @@ struct ClusterPage: View {
     }
 
     private var connectionSymbol: String {
-        switch store.connectionMode {
+        switch store.effectiveConnectionMode {
         case .ring: return "network"
         case .jaccl: return "bolt.horizontal.fill"
         case .jacclRing: return "arrow.triangle.branch"
         }
     }
 
-    private func advancedPicker<PickerContent: View>(
-        title: String,
-        detail: String,
-        @ViewBuilder picker: () -> PickerContent
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack {
-                Text(title)
-                    .font(.tokenityText(12, weight: .medium))
-                Spacer(minLength: 12)
-                picker()
-            }
-            Text(detail)
-                .font(.tokenityText(11))
-                .foregroundStyle(theme.tertiaryText)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
 }
 
 private struct ClusterNodeCanvas: View {
@@ -625,12 +584,14 @@ private struct ClusterNodeCard: View {
             }
 
             HStack(spacing: 7) {
-                Text(node.identityDetail)
-                    .font(.tokenityText(10))
-                    .foregroundStyle(theme.tertiaryText)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .help(node.identityDetail)
+                if !node.identityDetail.isEmpty {
+                    Text(node.identityDetail)
+                        .font(.tokenityText(10))
+                        .foregroundStyle(theme.tertiaryText)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(node.identityDetail)
+                }
                 Spacer(minLength: 0)
                 StatusPill(text: role, tone: isSelected ? .accent : .neutral)
                     .fixedSize(horizontal: true, vertical: false)
@@ -638,7 +599,10 @@ private struct ClusterNodeCard: View {
 
             VStack(alignment: .leading, spacing: 5) {
                 nodeSignal(label: "Runtime", value: node.displayRuntime)
-                nodeSignal(label: "IP", value: node.primaryIP)
+                if !node.displayName.contains(node.primaryIP) {
+                    nodeSignal(label: "IP", value: node.primaryIP)
+                }
+                nodeSignal(label: "Source", value: node.source.rawValue)
                 nodeSignal(label: "Memory", value: node.memoryPercentText)
                 MemoryUsageBar(memory: node.memory)
             }
@@ -696,9 +660,11 @@ struct NetworkPage: View {
                     InfoRow(label: node.displayName) {
                         VStack(alignment: .leading, spacing: 8) {
                             HStack(spacing: 12) {
-                                Text(node.identityDetail)
-                                    .font(.tokenityMono(11))
-                                    .lineLimit(1)
+                                if !node.identityDetail.isEmpty {
+                                    Text(node.identityDetail)
+                                        .font(.tokenityMono(11))
+                                        .lineLimit(1)
+                                }
                                 Text(node.agentURL)
                                     .font(.tokenityMono(11))
                                     .foregroundStyle(.secondary)
@@ -748,8 +714,8 @@ struct ModelsPage: View {
                 }
                 InfoRow(label: "Cluster") {
                     HStack {
-                        StatusPill(text: store.phase == .running ? "Created" : "Create first", tone: store.phase == .running ? .good : .warning)
-                        Text(store.phase == .running ? "Models can be loaded now" : "Create a cluster before loading a model")
+                        StatusPill(text: store.phase.rawValue, tone: clusterStatusTone)
+                        Text(clusterStatusDetail)
                             .foregroundStyle(theme.secondaryText)
                             .lineLimit(1)
                     }
@@ -806,14 +772,29 @@ struct ModelsPage: View {
                 }
             }
 
-            InfoGroup(title: "Available Models") {
-                if store.modelLibraryRows.isEmpty {
+            InfoGroup(title: "Language Models") {
+                let languageModels = store.modelLibraryRows.filter { $0.modality == .language }
+                if languageModels.isEmpty {
                     InfoRow(label: "Status") {
-                        Text("No model inventory yet. Scan selected Macs to load the list.")
+                        Text("No language model found. Choose the model folder above, then scan again.")
                             .foregroundStyle(theme.secondaryText)
                     }
                 } else {
-                    ForEach(store.modelLibraryRows) { row in
+                    ForEach(languageModels) { row in
+                        modelLoadRow(for: row)
+                    }
+                }
+            }
+
+            InfoGroup(title: "Video Models") {
+                let videoModels = store.modelLibraryRows.filter { $0.modality == .video }
+                if videoModels.isEmpty {
+                    InfoRow(label: "MiniMax H3") {
+                        Text("Video model not found. Open Video to choose its folder and scan again.")
+                            .foregroundStyle(theme.secondaryText)
+                    }
+                } else {
+                    ForEach(videoModels) { row in
                         modelLoadRow(for: row)
                     }
                 }
@@ -829,21 +810,19 @@ struct ModelsPage: View {
             )
         }
         .task {
-            if store.modelScanSummary == "Not scanned" {
-                await store.scanModels()
-            }
+            await store.scanModels()
         }
     }
 
     private func modelLoadRow(for row: ModelLibraryRow) -> some View {
-        let loadingProgress = row.loadState == .loading && row.modality == .language
-            ? store.modelLoadProgress
+        let loadingProgress = row.loadState == .loading
+            ? (row.modality == .video ? store.videoRuntimeLoadProgress : store.modelLoadProgress)
             : nil
         return ModelLoadRow(
             row: row,
             selectedNodeCount: store.modelLoadRequiredNodeCount,
             loadTargetSummary: store.modelLoadTargetSummary(for: row),
-            clusterIsReady: store.phase == .running && !store.isModelTransitioning,
+            clusterIsReady: store.isClusterConfigured && !store.isModelTransitioning,
             loadEnabled: store.canLoadModel(row),
             loadButtonHelp: store.modelLoadHelp(for: row),
             loadingProgress: loadingProgress,
@@ -860,6 +839,31 @@ struct ModelsPage: View {
             store.selectedSection = .video
         } else {
             configurationTarget = row
+        }
+    }
+
+    private var clusterStatusDetail: String {
+        switch store.phase {
+        case .stopped:
+            return "Create the cluster before loading a model"
+        case .readyToLoad:
+            return "Models can be loaded now"
+        case .running:
+            return "The cluster is serving a loaded model"
+        case .failed:
+            return "Review the cluster status before loading a model"
+        case .launching, .distributedInit, .loadingModel, .compiling, .firstTokenPending, .stopping:
+            return "A cluster operation is in progress"
+        }
+    }
+
+    private var clusterStatusTone: StatusPill.Tone {
+        switch store.phase {
+        case .running: return .good
+        case .readyToLoad: return .accent
+        case .failed: return .danger
+        case .launching, .distributedInit, .loadingModel, .compiling, .firstTokenPending, .stopping: return .warning
+        case .stopped: return .neutral
         }
     }
 }
@@ -1381,6 +1385,7 @@ private struct ModelConfigurationSheet: View {
             }
         }
     }
+
 }
 
 struct APIAccessPage: View {

@@ -53,6 +53,32 @@ enum VideoRuntimeState: Equatable {
     }
 }
 
+enum VideoRecoveryAction: String, Hashable {
+    case installOrRepair = "Install or Repair"
+    case chooseFolder = "Choose Folder"
+    case scanAgain = "Scan Again"
+    case retry = "Retry"
+    case useOneMac = "Use One Mac"
+    case openNodeDetails = "Open Mac Details"
+}
+
+struct VideoReadinessIssue: Identifiable, Hashable {
+    enum State: String, Hashable {
+        case componentsNeedUpdate
+        case modelNotFound
+        case runtimeMissing
+        case secondMacUnavailable
+        case highSpeedConnectionUnavailable
+        case runtimeInterrupted
+    }
+
+    var state: State
+    var message: String
+    var action: VideoRecoveryAction
+
+    var id: String { "\(state.rawValue):\(message):\(action.rawValue)" }
+}
+
 struct AgentStartH3VideoRequest: Encodable {
     var model: String
     var binary: String
@@ -95,7 +121,7 @@ struct H3VideoGenerationRequest: Encodable, Equatable {
     var stream: Bool
 
     static let `default` = H3VideoGenerationRequest(
-        prompt: "A cinematic tracking shot of a paper boat crossing a rainy neon street",
+        prompt: "A cinematic tracking shot follows a weathered paper boat through a rain-soaked neon night market; the camera begins at water level, glides past steaming food stalls and pedestrians beneath translucent umbrellas, then rises into a wide overhead reveal as reflections ripple across the street, with realistic lighting, shallow depth of field, and natural motion.",
         width: 512,
         height: 256,
         numFrames: 124,
@@ -283,6 +309,11 @@ struct GeneratedVideoArtifact: Identifiable, Equatable {
     var hasMuxedAudio: Bool
 }
 
+struct VideoArtifactHistory {
+    var completed: [GeneratedVideoArtifact]
+    var interruptedCount: Int
+}
+
 enum H3VideoArtifactWriter {
     static func write(
         payload: H3VideoCompletePayload,
@@ -366,7 +397,7 @@ enum H3VideoArtifactWriter {
         )
     }
 
-    private struct ArtifactMetadata: Encodable {
+    private struct ArtifactMetadata: Codable {
         var prompt: String
         var seed: Int
         var steps: Int
@@ -383,7 +414,67 @@ enum H3VideoArtifactWriter {
         }
     }
 
-    private static func defaultRootDirectory() -> URL {
+    static func loadHistory(
+        rootDirectory: URL? = nil,
+        limit: Int = 20
+    ) -> VideoArtifactHistory {
+        let root = rootDirectory ?? defaultRootDirectory()
+        guard let directories = try? FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return VideoArtifactHistory(completed: [], interruptedCount: 0)
+        }
+
+        var completed: [(Date, GeneratedVideoArtifact)] = []
+        var interruptedCount = 0
+        for directory in directories {
+            guard let id = UUID(uuidString: directory.lastPathComponent) else { continue }
+            let metadataURL = directory.appendingPathComponent("metadata.json")
+            let movieURL = directory.appendingPathComponent("generation.mov")
+            guard FileManager.default.fileExists(atPath: movieURL.path),
+                  let data = try? Data(contentsOf: metadataURL),
+                  let metadata = try? JSONDecoder().decode(ArtifactMetadata.self, from: data)
+            else {
+                if FileManager.default.fileExists(
+                    atPath: directory.appendingPathComponent("video.rgb").path
+                ) {
+                    interruptedCount += 1
+                }
+                continue
+            }
+            let waveURL = directory.appendingPathComponent("audio.wav")
+            let rawVideoURL = directory.appendingPathComponent("video.rgb")
+            let rawAudioURL = directory.appendingPathComponent("audio.pcm")
+            let modified = (try? directory.resourceValues(
+                forKeys: [.contentModificationDateKey]
+            ).contentModificationDate) ?? .distantPast
+            completed.append((
+                modified,
+                GeneratedVideoArtifact(
+                    id: id,
+                    directoryURL: directory,
+                    movieURL: movieURL,
+                    waveURL: FileManager.default.fileExists(atPath: waveURL.path) ? waveURL : nil,
+                    rawVideoURL: rawVideoURL,
+                    rawAudioURL: FileManager.default.fileExists(atPath: rawAudioURL.path) ? rawAudioURL : nil,
+                    frames: metadata.frames,
+                    width: metadata.width,
+                    height: metadata.height,
+                    fps: metadata.fps,
+                    durationSeconds: Double(metadata.frames) / Double(max(metadata.fps, 1)),
+                    hasMuxedAudio: metadata.hasMuxedAudio
+                )
+            ))
+        }
+        return VideoArtifactHistory(
+            completed: completed.sorted { $0.0 > $1.0 }.prefix(max(0, limit)).map { $0.1 },
+            interruptedCount: interruptedCount
+        )
+    }
+
+    static func defaultRootDirectory() -> URL {
         let applicationSupport = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask

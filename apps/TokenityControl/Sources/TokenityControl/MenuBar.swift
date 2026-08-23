@@ -89,7 +89,7 @@ struct TokenityMenuBarSnapshot: Equatable {
 extension TokenityStore {
     var menuBarSnapshot: TokenityMenuBarSnapshot {
         let requiredNodes: [TokenityNode]
-        if backendMode == .singleNode {
+        if effectiveBackendMode == .singleNode {
             requiredNodes = coordinator.map { [$0] } ?? []
         } else {
             requiredNodes = selectedNodes
@@ -107,7 +107,7 @@ extension TokenityStore {
             level = .warning
         } else if transitionPhase || isModelTransitioning {
             level = .busy
-        } else if phase == .stopped && !hasActiveService && loadedModelName == nil {
+        } else if (phase == .stopped || phase == .readyToLoad) && !hasActiveService && loadedModelName == nil {
             level = .stopped
         } else if hasServiceIntent && !clusterIssues.isEmpty {
             level = .warning
@@ -130,7 +130,7 @@ extension TokenityStore {
         let firstIssue = serverHealth.detail ?? clusterIssues.first
         let compatibilityNotice = menuBarCompatibilityNotice(requiredNodes: requiredNodes)
         let startBlockReason = menuBarStartBlockReason(requiredNodes: requiredNodes)
-        let canStop = phase != .stopped || hasActiveService || loadedModelName != nil || isChatRunning
+        let canStop = canStopCluster
         let stopBlockReason = phase == .stopping
             ? "A stop operation is already in progress."
             : (canStop ? nil : "No Server or generation task is running.")
@@ -159,7 +159,7 @@ extension TokenityStore {
     }
 
     private var menuBarInferenceMode: String {
-        switch backendMode {
+        switch effectiveBackendMode {
         case .singleNode:
             return "Single Mac"
         case .distributed:
@@ -185,6 +185,9 @@ extension TokenityStore {
     private func menuBarStartBlockReason(requiredNodes: [TokenityNode]) -> String? {
         if Self.isTransitionPhase(phase) || isModelTransitioning {
             return "A Server transition is already in progress."
+        }
+        if phase == .readyToLoad {
+            return "Macs are selected. Open Models to scan and load a model."
         }
         if phase == .running || loadedModelName != nil || selectedNodes.contains(where: {
             inferenceRolesForActiveModel(on: $0).contains(where: Self.isActiveInferenceRole)
@@ -216,7 +219,7 @@ extension TokenityStore {
             return ["Network is partially available, but the distributed service is unavailable."] + issues
         }
 
-        let expectedConnection = backendMode == .singleNode ? ConnectionMode.ring.cliValue : connectionMode.cliValue
+        let expectedConnection = effectiveBackendMode == .singleNode ? ConnectionMode.ring.cliValue : effectiveConnectionMode.cliValue
         let runtimeNodes = requiredNodes.compactMap { clusterRuntimeForActiveModel(on: $0) }
         let isProbeVerifiedLegacyService = activeModelInstanceID == nil
             && loadedModelName != nil
@@ -236,7 +239,7 @@ extension TokenityStore {
                 issues.append("The reported world size does not match the selected Mac count.")
             }
             if runtimeNodes.contains(where: { $0.connectionMode != expectedConnection }) {
-                issues.append("The running connection mode does not match \(connectionMode.shortName).")
+                issues.append("The running connection mode does not match \(effectiveConnectionMode.shortName).")
             }
             if Set(runtimeNodes.map(\.clusterID)).count != 1 {
                 issues.append("Selected Macs report different distributed cluster identities.")
@@ -253,7 +256,7 @@ extension TokenityStore {
         for node in requiredNodes {
             let expectedRole: String
             if node.id == coordinator?.id {
-                switch backendMode {
+                switch effectiveBackendMode {
                 case .singleNode:
                     expectedRole = "single-node-openai"
                 case .distributed:
@@ -273,7 +276,7 @@ extension TokenityStore {
             }
         }
 
-        if connectionMode != .ring && backendMode != .singleNode {
+        if effectiveConnectionMode != .ring && effectiveBackendMode != .singleNode {
             issues.append(contentsOf: launchPreview.readinessIssues)
         }
         return issues
@@ -300,7 +303,7 @@ extension TokenityStore {
         let process = roles.first(where: Self.isActiveInferenceRole)
             ?? roles.first
         let connectionText: String
-        let effectiveConnection = backendMode == .singleNode ? ConnectionMode.ring : connectionMode
+        let effectiveConnection = effectiveBackendMode == .singleNode ? ConnectionMode.ring : effectiveConnectionMode
         switch effectiveConnection {
         case .ring:
             connectionText = "Standard network"
@@ -327,7 +330,7 @@ extension TokenityStore {
         if issue == nil, let process, process.state.lowercased() == "failed" {
             issue = process.message ?? "The inference process failed."
         }
-        if issue == nil, connectionMode != .ring, !node.rdma.rdmaEnabled {
+        if issue == nil, effectiveConnectionMode != .ring, !node.rdma.rdmaEnabled {
             issue = node.rdma.rdmaErrors.first ?? "Thunderbolt/RDMA is unavailable."
         }
 
@@ -346,7 +349,7 @@ extension TokenityStore {
         )
     }
 
-    private static func isActiveInferenceRole(_ role: ProcessRole) -> Bool {
+    static func isActiveInferenceRole(_ role: ProcessRole) -> Bool {
         guard inferenceRoleNames.contains(role.role), role.pid != nil else { return false }
         let state = role.state.lowercased()
         return state != "stopped" && state != "failed"
@@ -356,7 +359,7 @@ extension TokenityStore {
         switch phase {
         case .launching, .distributedInit, .loadingModel, .compiling, .firstTokenPending, .stopping:
             return true
-        case .stopped, .running, .failed:
+        case .stopped, .readyToLoad, .running, .failed:
             return false
         }
     }

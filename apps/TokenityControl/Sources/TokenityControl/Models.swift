@@ -104,6 +104,7 @@ enum ConnectionMode: String, CaseIterable, Identifiable {
 
 enum ClusterPhase: String, CaseIterable {
     case stopped = "Stopped"
+    case readyToLoad = "Ready to load"
     case launching = "Launching"
     case distributedInit = "Distributed init"
     case loadingModel = "Loading model"
@@ -111,7 +112,14 @@ enum ClusterPhase: String, CaseIterable {
     case firstTokenPending = "First token pending"
     case running = "Running"
     case stopping = "Stopping"
-    case failed = "Failed"
+    case failed = "Needs attention"
+}
+
+enum NodeSource: String, Hashable {
+    case automatic = "Discovered"
+    case saved = "Saved"
+    case manual = "Added manually"
+    case configured = "Configured"
 }
 
 enum ModelLoadState: String, Hashable {
@@ -721,6 +729,7 @@ struct TokenityNode: Identifiable, Hashable {
     var mlxLMVersion: String?
     var tokenityVersion: String
     var machineID: String? = nil
+    var machineIdentityVerified: Bool = false
     var tokenityCodeRevision: String? = nil
     var agentContract: AgentContractInfo? = nil
     var rdma: RDMAStatus
@@ -740,8 +749,13 @@ struct TokenityNode: Identifiable, Hashable {
     var agentHealthDetail: String? = nil
     var watchdogRestartCount: Int = 0
     var lastAutomaticRecoveryAt: Date? = nil
+    var source: NodeSource = .configured
     var displayName: String {
-        hostname.isEmpty ? id : hostname
+        let candidate = hostname.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !candidate.isEmpty, !Self.looksLikeIPAddress(candidate) {
+            return candidate
+        }
+        return primaryIP == "unknown" ? "Mac" : "Mac at \(primaryIP)"
     }
 
     var primaryIP: String {
@@ -749,7 +763,7 @@ struct TokenityNode: Identifiable, Hashable {
     }
 
     var identityDetail: String {
-        "\(hostname) · \(primaryIP)"
+        displayName.contains(primaryIP) ? "" : primaryIP
     }
 
     var memoryPercentText: String {
@@ -793,6 +807,15 @@ struct TokenityNode: Identifiable, Hashable {
             return String(format: "%.0f GB", gib)
         }
         return String(format: "%.1f GB", gib)
+    }
+
+    private static func looksLikeIPAddress(_ value: String) -> Bool {
+        if value.contains(":") { return true }
+        let pieces = value.split(separator: ".", omittingEmptySubsequences: false)
+        return pieces.count == 4 && pieces.allSatisfy {
+            guard let octet = Int($0) else { return false }
+            return (0...255).contains(octet)
+        }
     }
 
     static var samples: [TokenityNode] {

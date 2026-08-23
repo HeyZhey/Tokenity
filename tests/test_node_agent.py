@@ -4,6 +4,7 @@ import asyncio
 import platform
 import subprocess
 import sys
+import threading
 import time
 import json
 import hashlib
@@ -835,6 +836,31 @@ def test_model_scan(tmp_path: Path):
     assert payload["size_bytes"] >= 384
 
 
+def test_model_scan_resolves_finder_alias_to_model_directory(tmp_path: Path, monkeypatch):
+    root = tmp_path / "models"
+    root.mkdir()
+    alias = root / "GLM-5.2-mxfp4"
+    alias.write_bytes(b"book-alias-placeholder")
+    target = tmp_path / "shared" / "GLM-5.2-mxfp4"
+    target.mkdir(parents=True)
+    (target / "config.json").write_text(
+        '{"architectures":["GlmMoeDsaForCausalLM"]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        agent_module,
+        "_resolve_macos_alias",
+        lambda path: target if path == alias else None,
+    )
+
+    scanned = scan_models(root)
+
+    assert [(model["id"], model["path"]) for model in scanned] == [
+        ("GLM-5.2-mxfp4", str(target))
+    ]
+    assert scanned[0]["architecture"] == "GlmMoeDsaForCausalLM"
+
+
 def test_distributed_dry_run_forwards_runtime_configuration():
     client = TestClient(create_app(rdma_probe_fn=fake_rdma_probe))
     response = client.post(
@@ -1232,6 +1258,94 @@ def test_h3_dry_run_returns_shell_free_native_launch_plan(tmp_path: Path):
     assert command[command.index("--model") + 1] == str(model)
 
 
+def test_h3_dry_run_rejects_a_missing_native_binary(tmp_path: Path):
+    model, binary = _create_h3_fixture(tmp_path)
+    binary.unlink()
+    client = TestClient(create_app(rdma_probe_fn=fake_rdma_probe))
+
+    response = client.post(
+        "/v1/node/start-minimax-h3-video",
+        json={
+            "model": str(model),
+            "binary": str(binary),
+            "dry_run": True,
+        },
+    )
+
+    assert response.status_code == 412
+    detail = response.json()["detail"]
+    assert detail["stage"] == "minimax_h3_preflight"
+    assert any("binary" in issue.lower() for issue in detail["issues"])
+
+
+def test_h3_two_mac_dry_run_preflights_the_remote_rank_without_launching(
+    tmp_path: Path,
+):
+    model, binary = _create_h3_fixture(tmp_path)
+    _add_h3_tp2_fixture(model)
+    remote_requests = []
+    supervisor = _FakeSupervisor()
+
+    def post_json(url, payload, timeout):
+        remote_requests.append((url, payload, timeout))
+        return {"dry_run": True, "rank": 1, "preflight": {"status": "ready"}}
+
+    client = TestClient(
+        create_app(
+            rdma_probe_fn=fake_rdma_probe,
+            supervisor=supervisor,
+            post_json_fn=post_json,
+            get_json_fn=lambda url, timeout: {
+                "agent_contract": {
+                    "capabilities": [
+                        "cluster_runtime",
+                        "instance_quorum",
+                        "instance_runtimes",
+                        "managed_instances",
+                        "minimax_h3_video",
+                    ]
+                }
+            },
+            h3_runtime_preflight_fn=lambda **kwargs: (
+                [],
+                _h3_distributed_capabilities(binary),
+            ),
+        )
+    )
+
+    response = client.post(
+        "/v1/node/start-minimax-h3-video",
+        json={
+            "model": str(model),
+            "binary": str(binary),
+            "dry_run": True,
+            "nodes": [
+                {
+                    "id": "mac-a",
+                    "agent_url": "http://198.51.100.23:9100",
+                    "lan_ip": "198.51.100.23",
+                    "rdma_ip": "203.0.113.1",
+                    "rdma_devices": ["rdma_en4"],
+                },
+                {
+                    "id": "mac-b",
+                    "agent_url": "http://198.51.100.75:9100",
+                    "lan_ip": "198.51.100.75",
+                    "rdma_ip": "203.0.113.2",
+                    "rdma_devices": ["rdma_en5"],
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["launch_plan"]["execution_mode"] == "tp2"
+    assert len(remote_requests) == 1
+    assert remote_requests[0][0].endswith("/v1/node/start-minimax-h3-video-rank")
+    assert remote_requests[0][1]["dry_run"] is True
+    assert supervisor.starts == []
+
+
 def test_h3_two_mac_start_fails_closed_without_native_tp_protocol(tmp_path: Path):
     model, binary = _create_h3_fixture(tmp_path)
     client = TestClient(
@@ -1390,6 +1504,16 @@ def test_h3_two_mac_start_launches_worker_then_reports_tp2_ready(
     assert worker_requests[0][0].endswith("/v1/node/start-minimax-h3-video-rank")
     assert worker_requests[0][1]["rank"] == 1
     assert worker_requests[0][1]["coordinator"] is False
+
+    stopped = client.post(
+        "/v1/node/instances/h3-tp2-live-instance/stop",
+        json={"timeout": 5},
+    )
+    assert stopped.status_code == 200, stopped.text
+    assert worker_requests[-1][0].endswith(
+        "/v1/node/instances/h3-tp2-live-instance/stop"
+    )
+    assert worker_requests[-1][2] == 16
 
 
 def test_h3_two_mac_start_requires_remote_h3_agent_capability(
@@ -1621,7 +1745,7 @@ def test_h3_remote_rank_fails_closed_on_runtime_contract_mismatch(
     assert detail["local"] == "b" * 64
 
 
-def test_h3_worker_stop_waits_for_tp2_control_sentinel(tmp_path: Path):
+def test_h3_worker_stop_waits_for_tp2_control_sentinel(tmp_path: Path, monkeypatch):
     model, binary = _create_h3_fixture(tmp_path)
     _add_h3_tp2_fixture(model)
     events = []
@@ -1665,6 +1789,11 @@ def test_h3_worker_stop_waits_for_tp2_control_sentinel(tmp_path: Path):
             return self.status(role, instance_id)
 
     supervisor = NaturalWorkerExitSupervisor()
+    monkeypatch.setattr(
+        agent_module,
+        "_request_rdma_link_reset",
+        lambda: events.append(("reset",)),
+    )
     client = TestClient(
         create_app(
             rdma_probe_fn=fake_rdma_probe,
@@ -1705,8 +1834,26 @@ def test_h3_worker_stop_waits_for_tp2_control_sentinel(tmp_path: Path):
 
     assert stopped.status_code == 200, stopped.text
     assert events == [
-        ("wait", "minimax-h3-video-rank", "h3-worker-stop-instance")
+        ("wait", "minimax-h3-video-rank", "h3-worker-stop-instance"),
+        ("reset",),
     ]
+
+
+def test_rdma_link_reset_waits_for_keepalive_acknowledgement(tmp_path: Path, monkeypatch):
+    request_path = tmp_path / "rdma-reset-request"
+    monkeypatch.setenv("TOKENITY_TB_INTERFACE", "en5")
+    monkeypatch.setenv("TOKENITY_RDMA_RESET_REQUEST_PATH", str(request_path))
+
+    def acknowledge() -> None:
+        while not request_path.exists():
+            time.sleep(0.01)
+        request_path.unlink()
+
+    thread = threading.Thread(target=acknowledge)
+    thread.start()
+    assert agent_module._request_rdma_link_reset(timeout=1.0) is True
+    thread.join(timeout=1.0)
+    assert not thread.is_alive()
 
 
 def test_h3_single_node_start_becomes_ready_and_reports_video_api(
@@ -1736,6 +1883,7 @@ def test_h3_single_node_start_becomes_ready_and_reports_video_api(
         json={
             "model": str(model),
             "binary": str(binary),
+            "api_identifier": "MiniMax-H3",
             "dry_run": False,
             "instance_id": "h3-single-instance",
             "operation_id": "h3-single-operation",
@@ -1753,6 +1901,16 @@ def test_h3_single_node_start_becomes_ready_and_reports_video_api(
     assert journal["role"] == "minimax-h3-video"
     assert journal["recovery_policy"] == "cleanup"
     assert journal["status_path"] is None
+    assert client.get("/v1/gateway/routes").json()["data"] == []
+    assert [
+        model["id"] for model in client.get("/v1/models").json()["data"]
+    ] == ["tokenity-auto"]
+    chat = client.post(
+        "/v1/chat/completions",
+        json={"model": "MiniMax-H3", "messages": [], "stream": False},
+    )
+    assert chat.status_code == 409
+    assert "video runtime" in chat.json()["detail"]
 
     stopped = client.post(
         "/v1/node/instances/h3-single-instance/stop",
@@ -3326,6 +3484,36 @@ def test_gateway_stream_response_closes_upstream_on_client_disconnect():
     assert cleanup_calls == ["closed"]
 
 
+def test_gateway_stream_response_can_defer_close_for_collective_drain():
+    cleanup_calls = []
+    disconnect_calls = []
+    response = agent_module._GatewayStreamingResponse(
+        iter([b"data: ignored\n\n"]),
+        on_close=lambda: cleanup_calls.append("closed"),
+        on_disconnect=lambda: disconnect_calls.append("disconnected"),
+        media_type="text/event-stream",
+    )
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    asyncio.run(response.listen_for_disconnect(receive))
+
+    assert disconnect_calls == ["disconnected"]
+    assert cleanup_calls == []
+
+
+def test_gateway_response_drain_consumes_upstream_to_eof():
+    upstream = _FakeGatewayResponse(
+        b"data: first\n\ndata: [DONE]\n\n",
+        content_type="text/event-stream",
+    )
+
+    agent_module._drain_gateway_response(upstream, threading.Lock())
+
+    assert upstream.read() == b""
+
+
 def test_gateway_base_exception_during_open_releases_slot_and_request_lease(
     tmp_path: Path,
     monkeypatch,
@@ -3500,6 +3688,28 @@ def test_inferred_four_billion_parameter_model_is_a_fast_route_candidate():
 
     assert qwen.warm_ttft_p95_ms == 120.0
     assert qwen.task_quality["general"] == 0.72
+    assert qwen.chat_template_defaults == {"enable_thinking": False}
+
+    class Selected:
+        requested_model_id = qwen.model_id
+
+    default_payload = agent_module._gateway_upstream_payload(
+        {"model": qwen.model_id, "messages": []},
+        Selected(),
+        qwen,
+    )
+    explicit_payload = agent_module._gateway_upstream_payload(
+        {
+            "model": qwen.model_id,
+            "messages": [],
+            "chat_template_kwargs": {"enable_thinking": True},
+        },
+        Selected(),
+        qwen,
+    )
+
+    assert default_payload["chat_template_kwargs"] == {"enable_thinking": False}
+    assert explicit_payload["chat_template_kwargs"] == {"enable_thinking": True}
 
 
 def test_inferred_qwen_profile_reads_nested_text_context_capacity(tmp_path: Path):

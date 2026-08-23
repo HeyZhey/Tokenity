@@ -97,6 +97,67 @@ final class RuntimeBootstrapTests: XCTestCase {
         )
     }
 
+    func testInstalledComponentsRequireHealthyLocalService() async throws {
+        let temporary = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let runtime = temporary.appendingPathComponent("Runtime")
+        let python = runtime.appendingPathComponent("current/.venv/bin/python")
+        let h3 = runtime.appendingPathComponent("current/bin/mlx-serve")
+        try FileManager.default.createDirectory(
+            at: python.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: h3.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("{}".utf8).write(to: runtime.appendingPathComponent("runtime-manifest.json"))
+        try "#!/bin/sh\nprintf '%s\\n' '{\"mlx\":\"0.32.0\",\"mlx-lm\":\"0.31.3\"}'\n"
+            .write(to: python, atomically: true, encoding: .utf8)
+        try "#!/bin/sh\nprintf '%s\\n' '--h3-distributed-rank --h3-distributed-world-size --h3-distributed-protocol'\n"
+            .write(to: h3, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: python.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: h3.path)
+        let catalog = TokenityRuntimeCatalog(
+            schemaVersion: 1,
+            runtimeID: "runtime-test",
+            tokenityVersion: "0.1.0",
+            platform: "macos",
+            architecture: "arm64",
+            minimumMacOS: "14.0",
+            pythonVersion: "3.12.13",
+            packages: ["mlx": "0.32.0", "mlx-lm": "0.31.3"],
+            runtimePayloadSHA256: String(repeating: "a", count: 64),
+            artifact: .init(
+                filename: "Runtime.pkg",
+                packageIdentifier: "ai.tokenity.runtime.test",
+                sizeBytes: 1,
+                sha256: String(repeating: "b", count: 64),
+                urls: []
+            )
+        )
+        let service = TokenityRuntimeBootstrapService(
+            cachesDirectory: temporary.appendingPathComponent("cache"),
+            installedPythonPath: python.path,
+            localServiceIsHealthy: { false }
+        )
+
+        let issues = await service.installedComponentIssues(catalog: catalog)
+
+        XCTAssertEqual(
+            issues,
+            ["The Tokenity background service is not running. Install or repair Tokenity components."]
+        )
+
+        let healthyService = TokenityRuntimeBootstrapService(
+            cachesDirectory: temporary.appendingPathComponent("cache"),
+            installedPythonPath: python.path,
+            localServiceIsHealthy: { true }
+        )
+        let healthyIssues = await healthyService.installedComponentIssues(catalog: catalog)
+        XCTAssertTrue(healthyIssues.isEmpty)
+    }
+
     private func catalog(for artifact: URL) -> TokenityRuntimeCatalog {
         let data = try! Data(contentsOf: artifact)
         let checksum = SHA256.hash(data: data)

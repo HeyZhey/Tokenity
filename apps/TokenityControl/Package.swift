@@ -4,7 +4,7 @@ import PackageDescription
 
 let package = Package(
     name: "TokenityControl",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS("26.2")],
     products: [
         .executable(name: "TokenityControl", targets: ["TokenityControl"])
     ],

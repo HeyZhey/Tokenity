@@ -71,7 +71,7 @@ final class MenuBarTests: XCTestCase {
         XCTAssertTrue(store.menuBarSnapshot.overallIssue?.contains("connection mode") == true)
     }
 
-    func testProbeVerifiedLegacyDistributedServiceIsReadyWithoutClusterRuntimeMetadata() async throws {
+    func testProbeVerifiedServiceWithoutClusterRuntimeMetadataRemainsWarning() async throws {
         let store = try await makeReadyStore(backendMode: .distributed)
 
         for node in store.selectedNodes {
@@ -92,8 +92,8 @@ final class MenuBarTests: XCTestCase {
                 $0.role == "distributed-openai-rank" && $0.state == "running" && $0.pid != nil
             } == true
         )
-        XCTAssertEqual(store.menuBarSnapshot.level, .ready)
-        XCTAssertNil(store.menuBarSnapshot.overallIssue)
+        XCTAssertEqual(store.menuBarSnapshot.level, .warning)
+        XCTAssertTrue(store.menuBarSnapshot.overallIssue?.contains("runtime metadata") == true)
     }
 
     func testModernAgentMissingDeclaredClusterRuntimeRemainsWarning() async throws {
@@ -293,6 +293,12 @@ final class MenuBarTests: XCTestCase {
         var requestCount = 0
         let store = TokenityStore(dataTransport: { request in
             requestCount += 1
+            if request.url?.path == "/v1/node/info" {
+                return Self.response(
+                    for: request,
+                    payload: TokenityTestFixtures.basicNodeInfoPayload(for: request)
+                )
+            }
             return try await Self.successfulTransport(request)
         })
         store.connectionMode = .ring
@@ -340,7 +346,7 @@ final class MenuBarTests: XCTestCase {
         await store.refreshSelectedNodeStatus()
 
         XCTAssertNil(store.loadedModelName)
-        XCTAssertEqual(store.phase, .stopped)
+        XCTAssertEqual(store.phase, .readyToLoad)
         XCTAssertEqual(store.menuBarSnapshot.level, .stopped)
         XCTAssertTrue(store.modelLoadMessage.contains("outside Tokenity"))
     }
@@ -409,7 +415,7 @@ final class MenuBarTests: XCTestCase {
                 clusterID: "cluster-test",
                 rank: rank,
                 worldSize: requiredCount,
-                connectionMode: "ring",
+                connectionMode: store.effectiveConnectionMode.cliValue,
                 role: isController ? "controller" : "worker"
             )
         }
@@ -425,7 +431,7 @@ final class MenuBarTests: XCTestCase {
         } else if path == "/v1/readiness" {
             payload = #"{"phase":"ready"}"#
         } else if path == "/v1/node/info" {
-            payload = TokenityTestFixtures.basicNodeInfoPayload(for: request)
+            payload = TokenityTestFixtures.modernNodeInfoPayload(for: request)
         } else if path == "/v1/node/status" {
             throw URLError(.cannotConnectToHost)
         } else {

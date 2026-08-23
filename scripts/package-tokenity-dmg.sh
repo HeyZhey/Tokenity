@@ -67,7 +67,11 @@ PKG_CHECKSUM_PATH="$PKG_PATH.sha256"
 RUNTIME_CATALOG_PATH="$DIST_DIR/Tokenity-RuntimeCatalog-${RUNTIME_ID}.json"
 DMG_PATH="$DIST_DIR/Tokenity-${VERSION}.dmg"
 DMG_CHECKSUM_PATH="$DMG_PATH.sha256"
-APP_BUNDLE="$DMG_ROOT/TokenityControl.app"
+APP_BUNDLE="$WORK_DIR/app/Tokenity.app"
+APP_SCRIPTS_DIR="$WORK_DIR/app-scripts"
+APP_COMPONENT_PKG="$DIST_DIR/Tokenity-App-${VERSION}-macos-arm64.pkg"
+INSTALLER_PKG="$DIST_DIR/Tokenity-${VERSION}-macos-arm64.pkg"
+INSTALLER_CHECKSUM_PATH="$INSTALLER_PKG.sha256"
 BACKEND_SOURCE="$ROOT/tokenity/serving/distributed_openai.py"
 
 if [[ "$VERSION" != "$LOCK_TOKENITY_VERSION" ]]; then
@@ -168,14 +172,18 @@ rm -f \
   "$PKG_PATH" \
   "$PKG_CHECKSUM_PATH" \
   "$RUNTIME_CATALOG_PATH" \
+  "$APP_COMPONENT_PKG" \
+  "$INSTALLER_PKG" \
+  "$INSTALLER_CHECKSUM_PATH" \
   "$DMG_PATH" \
   "$DMG_CHECKSUM_PATH"
-mkdir -p "$SCRIPTS_DIR" "$DMG_ROOT" "$DIST_DIR"
+mkdir -p "$SCRIPTS_DIR" "$APP_SCRIPTS_DIR" "$DMG_ROOT" "$DIST_DIR" "$(dirname "$APP_BUNDLE")"
 
 echo "Building TokenityControl.app..."
 TOKENITY_BUILD_CONFIGURATION=release \
 TOKENITY_APP_BUNDLE_PATH="$APP_BUNDLE" \
 TOKENITY_BUNDLE_IDENTIFIER=ai.tokenity.control \
+TOKENITY_BUNDLE_NAME=Tokenity \
 "$ROOT/scripts/build-tokenity-control-app.sh" >/dev/null
 
 cat > "$APP_BUNDLE/Contents/Resources/DeploymentConfiguration.json" <<JSON
@@ -191,7 +199,6 @@ cat > "$APP_BUNDLE/Contents/Resources/DeploymentConfiguration.json" <<JSON
 JSON
 codesign --force --deep --sign - "$APP_BUNDLE" >/dev/null
 codesign --verify --deep --strict "$APP_BUNDLE"
-ln -s /Applications "$DMG_ROOT/Applications"
 
 if [[ "$BUILD_NODE_AGENT_PACKAGE" == "1" ]]; then
 mkdir -p "$PAYLOAD_DIR$CODE_ROOT" \
@@ -265,6 +272,8 @@ cat > "$PAYLOAD_DIR/Library/LaunchDaemons/ai.tokenity.node-agent.plist" <<PLIST
     <string>$RUNTIME_ROOT/current/.venv/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>PYTHONPATH</key>
     <string>$CODE_ROOT</string>
+    <key>PYTHONDONTWRITEBYTECODE</key>
+    <string>1</string>
     <key>TOKENITY_INSTANCE_STATE_ROOT</key>
     <string>$STATE_ROOT/instances</string>
     <key>TOKENITY_DATA_ROOT</key>
@@ -281,6 +290,10 @@ cat > "$PAYLOAD_DIR/Library/LaunchDaemons/ai.tokenity.node-agent.plist" <<PLIST
     <string>$STATE_ROOT</string>
     <key>TOKENITY_LOG_ROOT</key>
     <string>$LOG_ROOT</string>
+    <key>TOKENITY_TB_INTERFACE</key>
+    <string>$TB_INTERFACE</string>
+    <key>TOKENITY_RDMA_RESET_REQUEST_PATH</key>
+    <string>$STATE_ROOT/rdma-reset-request</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -317,6 +330,8 @@ cat > "$PAYLOAD_DIR/Library/LaunchDaemons/ai.tokenity.node-agent-watchdog.plist"
     <string>$RUNTIME_ROOT/current/.venv/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>PYTHONPATH</key>
     <string>$CODE_ROOT</string>
+    <key>PYTHONDONTWRITEBYTECODE</key>
+    <string>1</string>
     <key>TOKENITY_DATA_ROOT</key>
     <string>$INSTALL_ROOT</string>
     <key>TOKENITY_STATE_ROOT</key>
@@ -356,17 +371,18 @@ MAINTENANCE_PATH="$STATE_ROOT/maintenance.json"
 AGENT_URL="http://127.0.0.1:9100"
 
 remove_legacy_user_agents() {
-  local home_directory legacy_plist legacy_uid
+  local home_directory legacy_plist legacy_uid legacy_label
   while IFS= read -r home_directory; do
-    legacy_plist="$home_directory/Library/LaunchAgents/local.tokenity.node-agent.plist"
-    [[ -f "$legacy_plist" ]] || continue
-    legacy_uid="$(/usr/bin/stat -f '%u' "$legacy_plist" 2>/dev/null || true)"
-    if [[ -n "$legacy_uid" ]]; then
-      /bin/launchctl bootout \
-        "gui/$legacy_uid/local.tokenity.node-agent" 2>/dev/null || \
-        /bin/launchctl bootout "gui/$legacy_uid" "$legacy_plist" 2>/dev/null || true
-    fi
-    /bin/rm -f "$legacy_plist"
+    for legacy_label in local.tokenity.node-agent dev.tokenity.dns-sd; do
+      legacy_plist="$home_directory/Library/LaunchAgents/$legacy_label.plist"
+      [[ -f "$legacy_plist" ]] || continue
+      legacy_uid="$(/usr/bin/stat -f '%u' "$legacy_plist" 2>/dev/null || true)"
+      if [[ -n "$legacy_uid" ]]; then
+        /bin/launchctl bootout "gui/$legacy_uid/$legacy_label" 2>/dev/null || \
+          /bin/launchctl bootout "gui/$legacy_uid" "$legacy_plist" 2>/dev/null || true
+      fi
+      /bin/rm -f "$legacy_plist"
+    done
   done < <(/usr/bin/dscacheutil -q user | /usr/bin/awk '/^dir: / {sub(/^dir: /, ""); print}')
 }
 
@@ -375,9 +391,9 @@ version_at_least() {
     observed_count = split(observed, observed_parts, ".")
     required_count = split(required, required_parts, ".")
     count = observed_count > required_count ? observed_count : required_count
-    for (index = 1; index <= count; index++) {
-      observed_value = observed_parts[index] + 0
-      required_value = required_parts[index] + 0
+    for (part_index = 1; part_index <= count; part_index++) {
+      observed_value = observed_parts[part_index] + 0
+      required_value = required_parts[part_index] + 0
       if (observed_value > required_value) exit 0
       if (observed_value < required_value) exit 1
     }
@@ -449,10 +465,15 @@ RUNTIME_EXPECTED_MLX_LM="$(
   /usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["packages"]["mlx-lm"])' \
     "$RUNTIME_LOCK"
 )"
+RUNTIME_EXPECTED_H3_PROTOCOL="$(
+  /usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["native_h3"]["distributed_protocol"])' \
+    "$RUNTIME_LOCK"
+)"
 {
   printf '#!/bin/zsh\nset -eu\n'
   printf 'EXPECTED_MLX="%s"\n' "$RUNTIME_EXPECTED_MLX"
   printf 'EXPECTED_MLX_LM="%s"\n' "$RUNTIME_EXPECTED_MLX_LM"
+  printf 'EXPECTED_H3_PROTOCOL="%s"\n' "$RUNTIME_EXPECTED_H3_PROTOCOL"
   printf 'INSTALL_ROOT=%q\n' "$INSTALL_ROOT"
   printf 'CODE_ROOT=%q\n' "$CODE_ROOT"
   printf 'RUNTIME_ROOT=%q\n' "$RUNTIME_ROOT"
@@ -471,6 +492,8 @@ MAINTENANCE_PATH="$STATE_ROOT/maintenance.json"
 TB_PLIST="/Library/LaunchDaemons/ai.tokenity.thunderbolt-keepalive.plist"
 TB_SCRIPT="/usr/local/bin/tokenity-tb-keepalive"
 PYTHON="$RUNTIME_PYTHON"
+H3_BINARY="$RUNTIME_ROOT/current/bin/mlx-serve"
+export PYTHONDONTWRITEBYTECODE=1
 AGENT_USER="$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || true)"
 
 if [[ -n "$AGENT_USER" && "$AGENT_USER" != "root" && "$AGENT_USER" != "loginwindow" ]]; then
@@ -497,6 +520,8 @@ iface="$1"
 local_ip="$2"
 peer_ip="$3"
 log_root="$4"
+state_root="$5"
+reset_request="$state_root/rdma-reset-request"
 failures=0
 reset_link() {
   /bin/date "+%Y-%m-%d %H:%M:%S resetting $iface ($1)" >> "$log_root/thunderbolt-keepalive.log"
@@ -507,6 +532,11 @@ reset_link() {
   failures=0
 }
 while true; do
+  if [[ -f "$reset_request" ]]; then
+    reset_link workload-transition
+    /bin/rm -f "$reset_request"
+    continue
+  fi
   if ! /sbin/ifconfig "$iface" | /usr/bin/grep -q "inet $local_ip"; then
     /sbin/ifconfig "$iface" inet "$local_ip" netmask 255.255.255.252 up
   fi
@@ -549,6 +579,7 @@ configure_thunderbolt_keepalive() {
     <string>$local_ip</string>
     <string>$peer_ip</string>
     <string>$LOG_ROOT</string>
+    <string>$STATE_ROOT</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -571,6 +602,11 @@ PLIST
 if [[ -n "$TB_INTERFACE" ]]; then
   configure_thunderbolt_keepalive "$TB_INTERFACE" "$TB_LOCAL_IP" "$TB_PEER_IP"
 fi
+
+/usr/bin/python3 "$CODE_ROOT/scripts/tokenity-runtime-manifest.py" verify \
+  "$RUNTIME_ROOT" \
+  --lock "$CODE_ROOT/packaging/runtime/runtime-lock.json" \
+  --manifest "$RUNTIME_ROOT/runtime-manifest.json"
 
 if [[ -x "$PYTHON" ]]; then
   TOKENITY_EXPECTED_MLX="$EXPECTED_MLX" \
@@ -597,6 +633,19 @@ if observed != required:
 mx.eval(mx.array([1], dtype=mx.int32))
 print(f"Validated installed Tokenity Runtime: {observed}")
 PY
+  h3_help="$("$H3_BINARY" --help 2>&1)" || {
+    echo "The installed MiniMax H3 runtime could not be started." >&2
+    exit 1
+  }
+  for marker in \
+    --h3-distributed-rank \
+    --h3-distributed-world-size \
+    "--h3-distributed-protocol $EXPECTED_H3_PROTOCOL"; do
+    if ! /usr/bin/grep -Fq -- "$marker" <<<"$h3_help"; then
+      echo "The installed MiniMax H3 runtime does not match protocol $EXPECTED_H3_PROTOCOL." >&2
+      exit 1
+    fi
+  done
   /usr/bin/pkill -f "$RUNTIME_PYTHON -u -m tokenity node-agent" 2>/dev/null || true
   /bin/launchctl bootout system "$NODE_AGENT_PLIST" 2>/dev/null || true
   /bin/launchctl bootstrap system "$NODE_AGENT_PLIST" 2>/dev/null || true
@@ -669,11 +718,6 @@ cp "$RUNTIME_CATALOG_PATH" "$APP_BUNDLE/Contents/Resources/RuntimeCatalog.json"
 codesign --force --deep --sign - "$APP_BUNDLE" >/dev/null
 codesign --verify --deep --strict "$APP_BUNDLE"
 
-ln -s \
-  "TokenityControl.app/Contents/Resources/$RUNTIME_ARTIFACT_NAME" \
-  "$DMG_ROOT/Install Tokenity Node Agent.pkg"
-cp "$PKG_CHECKSUM_PATH" "$DMG_ROOT/Runtime Installer.sha256"
-cp "$RUNTIME_CATALOG_PATH" "$DMG_ROOT/Runtime Catalog.json"
 else
   if [[ "$NODE_AGENT_PACKAGE_MODE" == "required" ]]; then
     echo "Tokenity runtime not found. Set TOKENITY_RUNTIME_SOURCE to a local directory." >&2
@@ -683,12 +727,63 @@ else
   echo "Set TOKENITY_NODE_AGENT_PACKAGE=required and TOKENITY_RUNTIME_SOURCE to include the Node Agent installer."
 fi
 
+echo "Building the single Tokenity installer..."
+cat > "$APP_SCRIPTS_DIR/preinstall" <<'SCRIPT'
+#!/bin/zsh
+set -eu
+
+LEGACY_APP="/Applications/TokenityControl.app"
+/usr/bin/pkill -f '^/Applications/Tokenity\.app/Contents/MacOS/TokenityControl($| )' \
+  2>/dev/null || true
+if [[ -d "$LEGACY_APP" ]]; then
+  legacy_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+    "$LEGACY_APP/Contents/Info.plist" 2>/dev/null || true)"
+  if [[ "$legacy_bundle_id" == "ai.tokenity.control" ]]; then
+    /usr/bin/pkill -f '^/Applications/TokenityControl\.app/Contents/MacOS/TokenityControl($| )' \
+      2>/dev/null || true
+    /bin/rm -rf "$LEGACY_APP"
+  fi
+fi
+SCRIPT
+/bin/chmod 755 "$APP_SCRIPTS_DIR/preinstall"
+
+pkgbuild \
+  --component "$APP_BUNDLE" \
+  --install-location /Applications \
+  --scripts "$APP_SCRIPTS_DIR" \
+  --identifier ai.tokenity.app \
+  --version "$VERSION" \
+  "$APP_COMPONENT_PKG"
+if [[ "$BUILD_NODE_AGENT_PACKAGE" == "1" ]]; then
+  DISTRIBUTION_XML="$WORK_DIR/Distribution.xml"
+  productbuild --synthesize \
+    --package "$APP_COMPONENT_PKG" \
+    --package "$PKG_PATH" \
+    "$DISTRIBUTION_XML"
+  productbuild \
+    --distribution "$DISTRIBUTION_XML" \
+    --package-path "$DIST_DIR" \
+    "$INSTALLER_PKG"
+else
+  productbuild --package "$APP_COMPONENT_PKG" "$INSTALLER_PKG"
+fi
+(
+  cd "$DIST_DIR"
+  shasum -a 256 "$(basename "$INSTALLER_PKG")" > "$(basename "$INSTALLER_CHECKSUM_PATH")"
+)
+cp "$INSTALLER_PKG" "$DMG_ROOT/Install Tokenity.pkg"
+cp "$INSTALLER_CHECKSUM_PATH" "$DMG_ROOT/Tokenity Installer.sha256"
+if [[ "$BUILD_NODE_AGENT_PACKAGE" == "1" ]]; then
+  cp "$RUNTIME_CATALOG_PATH" "$DMG_ROOT/Runtime Catalog.json"
+fi
+
 if [[ "$BUILD_NODE_AGENT_PACKAGE" == "1" ]]; then
 cat > "$DMG_ROOT/README.txt" <<README
 Tokenity ${VERSION}
 
-1. Drag TokenityControl.app onto the Applications folder.
-2. Run "Install Tokenity Node Agent.pkg" on every Mac that will execute models.
+Open "Install Tokenity.pkg" on every Mac you want to use with Tokenity.
+
+This single installer installs Tokenity.app and all required local components.
 
 The Node Agent package installs:
 - ${CODE_ROOT}
@@ -696,8 +791,8 @@ The Node Agent package installs:
 - NodeAgent LaunchDaemon on port 9100
 
 This Runtime is validated for Apple silicon and requires macOS
-${RUNTIME_MINIMUM_MACOS} or newer. The same verified installer remains embedded
-inside TokenityControl.app after the app is copied to Applications.
+${RUNTIME_MINIMUM_MACOS} or newer. The verified component repair package remains
+embedded inside Tokenity.app.
 
 Model weights are not included by default because they are very large.
 Place compatible MLX models under:
@@ -710,8 +805,7 @@ else
 cat > "$DMG_ROOT/README.txt" <<README
 Tokenity ${VERSION}
 
-Drag TokenityControl.app onto the Applications folder, then open it from
-Applications.
+Open "Install Tokenity.pkg", then launch Tokenity from Applications.
 
 This controller-only DMG does not contain the privileged Node Agent runtime.
 Before running models, install a compatible Tokenity Node Agent on every Mac
@@ -743,5 +837,7 @@ if [[ "$BUILD_NODE_AGENT_PACKAGE" == "1" ]]; then
   echo "$PKG_CHECKSUM_PATH"
   echo "$RUNTIME_CATALOG_PATH"
 fi
+echo "$INSTALLER_PKG"
+echo "$INSTALLER_CHECKSUM_PATH"
 echo "$DMG_PATH"
 echo "$DMG_CHECKSUM_PATH"

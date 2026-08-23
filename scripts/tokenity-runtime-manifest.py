@@ -254,6 +254,57 @@ def inspect_mlx_binaries(root: Path) -> dict[str, Any]:
     }
 
 
+def inspect_native_h3(root: Path, lock: dict[str, Any]) -> dict[str, Any]:
+    expected = lock.get("native_h3")
+    if not isinstance(expected, dict):
+        raise RuntimeValidationError("the Runtime lock must pin native_h3")
+    relative = str(expected.get("binary", ""))
+    binary = root / relative
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise RuntimeValidationError(
+            f"native MiniMax H3 runtime is missing or not executable: {binary}"
+        )
+    file_output = subprocess.run(
+        ["/usr/bin/file", str(binary)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    if "Mach-O" not in file_output or "arm64" not in file_output:
+        raise RuntimeValidationError(f"{binary} is not an arm64 Mach-O binary")
+    completed = subprocess.run(
+        [str(binary), "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, "DYLD_LIBRARY_PATH": os.pathsep.join([
+            str(binary.parent.parent / "lib"),
+            str(binary.parent.parent / "lib" / "llama" / "lib"),
+            str(binary.parent.parent / "lib" / "mlx" / "lib"),
+        ])},
+    )
+    help_text = f"{completed.stdout}\n{completed.stderr}"
+    protocol = int(expected.get("distributed_protocol", 0))
+    markers = (
+        "--h3-distributed-rank",
+        "--h3-distributed-world-size",
+        f"--h3-distributed-protocol {protocol}",
+    )
+    if completed.returncode != 0 or not all(marker in help_text for marker in markers):
+        raise RuntimeValidationError(
+            f"native MiniMax H3 runtime does not advertise distributed protocol {protocol}"
+        )
+    return {
+        "runtime_id": str(expected["runtime_id"]),
+        "binary": relative,
+        "distributed_protocol": protocol,
+        "size_bytes": binary.stat().st_size,
+        "sha256": sha256_file(binary),
+        "minimum_macos": macho_minimum_macos(binary),
+    }
+
+
 def tree_identity(root: Path) -> dict[str, Any]:
     digest = hashlib.sha256()
     file_count = 0
@@ -324,6 +375,15 @@ def build_runtime_manifest(root: Path, lock: dict[str, Any]) -> dict[str, Any]:
             f"{mlx_binaries['minimum_macos']}, above lock {lock['minimum_macos']}"
         )
 
+    native_h3 = inspect_native_h3(root, lock)
+    if version_tuple(native_h3["minimum_macos"]) > version_tuple(
+        str(lock["minimum_macos"])
+    ):
+        raise RuntimeValidationError(
+            "native MiniMax H3 runtime requires macOS "
+            f"{native_h3['minimum_macos']}, above lock {lock['minimum_macos']}"
+        )
+
     return {
         "schema_version": 1,
         "runtime_id": lock["runtime_id"],
@@ -335,6 +395,7 @@ def build_runtime_manifest(root: Path, lock: dict[str, Any]) -> dict[str, Any]:
         "python_version": observed["python_version"],
         "backend_name": lock["backend_name"],
         "packages": observed["packages"],
+        "native_h3": native_h3,
         "payload": tree_identity(root),
     }
 

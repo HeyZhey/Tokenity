@@ -867,6 +867,25 @@ def test_qwen_jaccl_uses_sequential_generation_engine(tmp_path):
     assert cache_sizes == [0]
 
 
+def test_ring_uses_synchronized_sequential_generation_engine(tmp_path):
+    model = tmp_path / "Qwen3.5-4B-MLX-4bit"
+    model.mkdir()
+    state = ReadinessState(model=str(model), connection_mode="ring")
+    runtime = TokenityDistributedRuntime(model=str(model), state=state)
+    runtime._provider = SimpleNamespace(is_batchable=True)  # noqa: SLF001
+    runtime._generator = SimpleNamespace(prompt_cache=object())  # noqa: SLF001
+    cache_sizes = []
+    runtime._symbols = SimpleNamespace(  # noqa: SLF001
+        LRUPromptCache=lambda size: cache_sizes.append(size) or object(),
+    )
+
+    runtime._configure_distributed_generation_mode()  # noqa: SLF001
+
+    assert runtime._provider.is_batchable is False  # noqa: SLF001
+    assert runtime._distributed_prompt_cache_size == 0  # noqa: SLF001
+    assert cache_sizes == [0]
+
+
 def test_qwen_jaccl_prepares_sequential_mode_before_generation_thread_starts(tmp_path):
     model = tmp_path / "Qwen3.5-122B-A10B-4bit"
     model.mkdir()

@@ -4,7 +4,178 @@ import XCTest
 
 final class NodeDiscoveryTests: XCTestCase {
     @MainActor
-    func testDiscoveryRebindsNodeByRDMAIdentityAndPersistsTheNewEndpoint() async throws {
+    func testClusterBuilderExcludesSavedOfflineMacsAfterDiscovery() async throws {
+        let suite = "TokenityNodeDiscoveryOfflineSavedTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(
+            [
+                "mac-b": "http://192.0.2.11:9100",
+                "mac-c": "http://192.0.2.12:9100",
+            ],
+            forKey: "TokenityNodeAgentEndpoints.v1"
+        )
+        defaults.set(
+            [
+                "mac-b": "machine-b",
+                "mac-c": "machine-c",
+            ],
+            forKey: "TokenityNodeMachineIdentities.v1"
+        )
+        let local = try Self.endpoint(
+            agentURL: "http://127.0.0.1:9100",
+            machineID: "machine-local",
+            hostname: "local-mac",
+            user: "local-user",
+            lanIP: "127.0.0.1",
+            rdmaIP: "tokenity-rdma-local.invalid",
+            rdmaDevice: "rdma_en4"
+        )
+        let store = TokenityStore(
+            nodeDiscoveryTransport: { _ in [local] },
+            userDefaults: defaults
+        )
+
+        await store.discoverNodes()
+
+        XCTAssertEqual(store.nodeDiscoverySummary, "Found 1 Mac(s) automatically")
+        XCTAssertEqual(store.clusterBuilderNodes.map(\.id), ["mac-a"])
+        XCTAssertEqual(store.selectedNodeIDs, ["mac-a"])
+        XCTAssertEqual(store.nodes.first { $0.id == "mac-a" }?.source, .automatic)
+        XCTAssertEqual(store.nodes.first { $0.id == "mac-b" }?.source, .saved)
+        XCTAssertFalse(store.nodes.first { $0.id == "mac-b" }?.isOnline ?? true)
+        XCTAssertFalse(store.nodes.first { $0.id == "mac-c" }?.isOnline ?? true)
+    }
+
+    @MainActor
+    func testDiscoverySummaryCountsMacsInsteadOfDuplicateLegacyEndpoints() async throws {
+        let suite = "TokenityNodeDiscoverySummaryTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let modern = try Self.endpoint(
+            agentURL: "http://192.0.2.10:19100",
+            machineID: "machine-a",
+            hostname: "192.0.2.10",
+            user: "service-user",
+            lanIP: "192.0.2.10",
+            rdmaIP: "tokenity-rdma-a.invalid",
+            rdmaDevice: "rdma_en4"
+        )
+        let legacy = try Self.endpoint(
+            agentURL: "http://192.0.2.10:9100",
+            machineID: nil,
+            hostname: "192.0.2.10",
+            user: "service-user",
+            lanIP: "192.0.2.10",
+            rdmaIP: "tokenity-rdma-a.invalid",
+            rdmaDevice: "rdma_en4"
+        )
+        let worker = try Self.endpoint(
+            agentURL: "http://192.0.2.11:9100",
+            machineID: "machine-b",
+            hostname: "192.0.2.11",
+            user: "service-user",
+            lanIP: "192.0.2.11",
+            rdmaIP: "tokenity-rdma-b.invalid",
+            rdmaDevice: "rdma_en5"
+        )
+        let store = TokenityStore(
+            nodeDiscoveryTransport: { _ in [modern, legacy, worker] },
+            userDefaults: defaults
+        )
+
+        await store.discoverNodes()
+
+        XCTAssertEqual(store.nodeDiscoverySummary, "Found 2 Mac(s) automatically")
+    }
+
+    @MainActor
+    func testLegacyAgentAtKnownModernMacAddressCannotCreateADuplicate() async throws {
+        let legacy = try Self.endpoint(
+            agentURL: "http://192.0.2.10:9100",
+            machineID: nil,
+            hostname: "192.0.2.10",
+            user: "service-user",
+            lanIP: "192.0.2.10",
+            rdmaIP: "tokenity-rdma-a.invalid",
+            rdmaDevice: "rdma_en4"
+        )
+        let store = TokenityStore(nodeDiscoveryTransport: { _ in [legacy] })
+        store.nodes[0].ips = ["192.0.2.10"]
+        store.nodes[0].machineID = "modern-machine-a"
+        store.nodes[0].agentContract = AgentContractInfo(version: 1, capabilities: ["managed_instances"])
+        let originalCount = store.nodes.count
+
+        await store.discoverNodes()
+
+        XCTAssertEqual(store.nodes.count, originalCount)
+        XCTAssertEqual(store.nodes.filter { $0.primaryIP == "192.0.2.10" }.count, 1)
+        XCTAssertEqual(store.nodes[0].machineID, "modern-machine-a")
+    }
+
+    @MainActor
+    func testSavedEndpointNeverChangesToADifferentMachineIdentity() async throws {
+        let suite = "TokenityNodeDiscoveryConflictTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+        var response = try Self.endpoint(
+            agentURL: "http://node-b.local:9100",
+            machineID: "machine-b-original",
+            hostname: "node-b.local",
+            user: "service-user",
+            lanIP: "node-b.local",
+            rdmaIP: "tokenity-rdma-b.invalid",
+            rdmaDevice: "rdma_en5"
+        )
+        let store = TokenityStore(
+            dataTransport: { request in
+                let data = try JSONEncoder().encode(response.info)
+                return (
+                    data,
+                    HTTPURLResponse(
+                        url: try XCTUnwrap(request.url),
+                        statusCode: 200,
+                        httpVersion: nil,
+                        headerFields: nil
+                    )!
+                )
+            },
+            nodeDiscoveryTransport: { _ in [] },
+            userDefaults: defaults
+        )
+
+        let firstConnection = await store.connectNode(agentURL: response.agentURL)
+        XCTAssertTrue(firstConnection)
+        response.info.machineID = "machine-b-replacement"
+        let restored = TokenityStore(
+            dataTransport: { request in
+                let data = try JSONEncoder().encode(response.info)
+                return (
+                    data,
+                    HTTPURLResponse(
+                        url: try XCTUnwrap(request.url),
+                        statusCode: 200,
+                        httpVersion: nil,
+                        headerFields: nil
+                    )!
+                )
+            },
+            nodeDiscoveryTransport: { _ in [] },
+            userDefaults: defaults
+        )
+
+        XCTAssertEqual(restored.nodes.first { $0.id == "mac-b" }?.machineID, "machine-b-original")
+        let replacementConnection = await restored.connectNode(agentURL: response.agentURL)
+        XCTAssertFalse(replacementConnection)
+        XCTAssertEqual(restored.nodes.first { $0.id == "mac-b" }?.machineID, "machine-b-original")
+        XCTAssertTrue(restored.nodeDiscoverySummary.contains("another Mac"))
+    }
+
+    @MainActor
+    func testDiscoveryRebindsNodeByMachineIdentityAndPersistsTheNewEndpoint() async throws {
         let suite = "TokenityNodeDiscoveryTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defaults.removePersistentDomain(forName: suite)
@@ -29,6 +200,7 @@ final class NodeDiscoveryTests: XCTestCase {
             thunderboltIP: "tokenity-rdma-a.invalid",
             rdmaErrors: []
         )
+        store.nodes[0].machineID = "machine-node-a"
         XCTAssertEqual(store.nodes.first { $0.id == "mac-a" }?.agentURL, "http://127.0.0.1:9100")
 
         await store.discoverNodes()
@@ -135,6 +307,7 @@ final class NodeDiscoveryTests: XCTestCase {
         XCTAssertEqual(worker.agentURL, "http://node-b.local:9100")
         XCTAssertEqual(worker.hostname, "node-b.local")
         XCTAssertTrue(worker.isOnline)
+        XCTAssertTrue(worker.models.isEmpty)
         XCTAssertTrue(store.selectedNodeIDs.contains("mac-b"))
         let persisted = defaults.dictionary(forKey: "TokenityNodeAgentEndpoints.v1")
             as? [String: String]

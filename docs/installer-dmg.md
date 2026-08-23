@@ -1,10 +1,10 @@
 # Tokenity Installer and Runtime Distribution
 
-Tokenity ships two components:
-
-- `TokenityControl.app`, installed by dragging it to Applications.
-- A privileged Node Agent and MLX Runtime package, installed locally with
-  Installer.app on every Mac that will execute model ranks.
+Tokenity ships one user-facing installer, `Install Tokenity.pkg`. It installs
+`Tokenity.app`, the privileged Node Agent and watchdog, the pinned Python/MLX
+Runtime, JACCL, and the native MiniMax H3 runtime. The component package is
+also embedded in the app so **Install or Repair** can reopen the same verified
+payload later. Model weights remain separate.
 
 The application never uses SSH to install software on another Mac. A new Mac
 does not yet have a trusted Node Agent, so its first privileged installation
@@ -29,6 +29,7 @@ Runtime `2026.07.26.1` pins:
 | MLX-LM | 0.31.3 |
 | FastAPI | 0.139.0 |
 | Uvicorn | 0.50.2 |
+| Native MiniMax H3 protocol | 1 |
 
 The macOS requirement is not an arbitrary app setting. The validated
 `mlx/core`, `libmlx.dylib`, and `libjaccl.dylib` binaries report `minos 26.2`.
@@ -59,8 +60,11 @@ dist/runtime-cache/TokenityRuntime
 ```
 
 Mac A and Mac B are verification peers; their directories are never merged.
-The normalized Runtime contains `runtime-manifest.json`, including its
-deterministic tree SHA-256. The manifest excludes itself from the tree digest.
+The normalized Runtime must also contain the arm64 native H3 executable at
+`current/bin/mlx-serve` and its relocatable libraries below `current/lib`.
+`runtime-manifest.json` pins its SHA-256, minimum macOS, and distributed
+protocol in addition to the deterministic whole-tree SHA-256. The manifest
+excludes itself from the tree digest.
 
 ## Building the full offline DMG
 
@@ -78,6 +82,8 @@ Outputs:
 ```text
 dist/Tokenity-0.1.0.dmg
 dist/Tokenity-0.1.0.dmg.sha256
+dist/Tokenity-0.1.0-macos-arm64.pkg
+dist/Tokenity-0.1.0-macos-arm64.pkg.sha256
 dist/Tokenity-NodeAgent-Runtime-2026.07.26.1-macos-arm64.pkg
 dist/Tokenity-NodeAgent-Runtime-2026.07.26.1-macos-arm64.pkg.sha256
 dist/Tokenity-RuntimeCatalog-2026.07.26.1.json
@@ -86,29 +92,26 @@ dist/Tokenity-RuntimeCatalog-2026.07.26.1.json
 Mounted layout:
 
 ```text
-TokenityControl.app
-Applications -> /Applications
-Install Tokenity Node Agent.pkg
+Install Tokenity.pkg
 Runtime Catalog.json
-Runtime Installer.sha256
+Tokenity Installer.sha256
 README.txt
 ```
 
-The visible pkg is a relative symlink to the exact same pkg embedded under the
-app's `Contents/Resources`. This avoids duplicate payload bytes and means the
-installer is still available after the app is copied to Applications.
+`Install Tokenity.pkg` is a distribution package containing both the app and
+the system Runtime component. Users do not need to drag an app or locate a
+second installer.
 
 ## First installation
 
 On every Mac that will execute models:
 
 1. Open the full DMG.
-2. Drag `TokenityControl.app` to Applications on the controller Mac.
-3. Open `Install Tokenity Node Agent.pkg`.
-4. Approve the installation in Installer.app.
-5. Place compatible MLX model folders under
+2. Open `Install Tokenity.pkg`.
+3. Approve the installation in Installer.app.
+4. Place compatible MLX model folders under
    `${TOKENITY_MODEL_ROOT}`.
-6. Open Tokenity and confirm each Node Agent is reachable on port `9100`.
+5. Open Tokenity and confirm the component readiness checks pass.
 
 The first-launch guide locates and verifies the embedded package. It never
 invokes `sudo` or bypasses Installer.app.
@@ -181,6 +184,7 @@ The postinstall script:
 - makes the model directory writable by the console user
 - imports MLX, MLX-LM and Tokenity
 - initializes a small MLX array
+- executes the native H3 binary and verifies distributed protocol 1
 - starts the launchd-managed Node Agent on port `9100`
 - verifies `/v1/node/health`, then starts the independent watchdog on `9101`
 
@@ -237,7 +241,7 @@ hdiutil verify dist/Tokenity-0.1.0.dmg
   --catalog dist/Tokenity-RuntimeCatalog-2026.07.26.1.json \
   --artifact dist/Tokenity-NodeAgent-Runtime-2026.07.26.1-macos-arm64.pkg
 pkgutil --check-signature \
-  dist/Tokenity-NodeAgent-Runtime-2026.07.26.1-macos-arm64.pkg
+  dist/Tokenity-0.1.0-macos-arm64.pkg
 pkgutil --payload-files \
   dist/Tokenity-NodeAgent-Runtime-2026.07.26.1-macos-arm64.pkg
 ```

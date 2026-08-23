@@ -193,6 +193,37 @@ final class ResidentModelRecoveryTests: XCTestCase {
         XCTAssertEqual(stopAllRequests, 0)
     }
 
+    func testRefreshNeverRecoversMiniMaxH3AsAResidentLanguageModel() async throws {
+        let instances = [
+            Self.instanceJSON(
+                id: "h3-video-instance",
+                model: "MiniMax-H3",
+                state: "ready",
+                port: 24_200
+            )
+        ]
+        let store = TokenityStore(dataTransport: { request in
+            let path = request.url?.path ?? ""
+            if path == "/v1/node/info" {
+                return Self.response(
+                    for: request,
+                    payload: Self.nodeInfoPayload(for: request, instances: instances)
+                )
+            }
+            if path == "/v1/gateway/routes" {
+                return Self.response(for: request, payload: Self.routesPayload(instances: instances))
+            }
+            return Self.response(for: request, payload: #"{}"#)
+        }, userDefaults: Self.freshDefaults())
+        store.connectionMode = .ring
+
+        await store.refreshSelectedNodeStatus()
+
+        XCTAssertTrue(store.residentModelInstances.isEmpty)
+        XCTAssertNil(store.loadedModelName)
+        XCTAssertTrue(store.managedModelInstanceIDs(for: "MiniMax-H3").isEmpty)
+    }
+
     func testBackgroundRefreshPreservesLongLoadingInstanceIdentityAndLease() async throws {
         var instanceID = ""
         var started = false
@@ -877,10 +908,55 @@ final class ResidentModelRecoveryTests: XCTestCase {
         await store.refreshSelectedNodeStatus()
 
         await store.stopResidentModelInstance("stop-b")
+        // A successful stop may be followed by one or more stale Agent
+        // snapshots. They must not resurrect the explicitly stopped replica.
+        await store.refreshSelectedNodeStatus()
 
         XCTAssertEqual(stoppedPaths, ["/v1/node/instances/stop-b/stop"])
         XCTAssertEqual(store.managedModelInstanceIDs(for: "Qwen3.5-122B-A10B-4bit"), Set(["stop-a"]))
         XCTAssertTrue(store.managedModelInstanceIDs(for: "SecondModel").isEmpty)
+    }
+
+    func testPreciseResidentStopPublishesStoppingStateBeforeNetworkCompletes() async throws {
+        let instanceID = "slow-stop"
+        let instances = [
+            Self.instanceJSON(id: instanceID, model: "Qwen3.5-122B-A10B-4bit", state: "ready", port: 18_000)
+        ]
+        let stopStarted = expectation(description: "resident stop request started")
+        let store = TokenityStore(dataTransport: { request in
+            let path = request.url?.path ?? ""
+            if path == "/v1/node/info" {
+                return Self.response(for: request, payload: Self.nodeInfoPayload(for: request, instances: instances))
+            }
+            if path == "/v1/gateway/routes" {
+                return Self.response(for: request, payload: Self.routesPayload(instances: instances))
+            }
+            if path.hasSuffix("/quorum") {
+                return Self.response(
+                    for: request,
+                    payload: Self.quorumPayload(instanceID: instanceID, ready: true)
+                )
+            }
+            if path == "/v1/node/instances/\(instanceID)/stop" {
+                stopStarted.fulfill()
+                try await Task.sleep(for: .milliseconds(200))
+            }
+            return Self.response(for: request, payload: #"{}"#)
+        }, userDefaults: Self.freshDefaults())
+        store.connectionMode = .ring
+        await store.refreshSelectedNodeStatus()
+
+        let stopTask = Task { await store.stopResidentModelInstance(instanceID) }
+        await fulfillment(of: [stopStarted], timeout: 1)
+
+        XCTAssertEqual(store.modelLoadStates["Qwen3.5-122B-A10B-4bit"], .unloading)
+        XCTAssertEqual(store.phase, .stopping)
+        XCTAssertNil(store.loadedModelName)
+        XCTAssertTrue(store.modelLoadMessage.hasPrefix("Stopping Qwen3.5-122B-A10B-4bit"))
+
+        await stopTask.value
+        XCTAssertEqual(store.phase, .readyToLoad)
+        XCTAssertEqual(store.modelLoadMessage, "No model loaded")
     }
 
     func testPreciseResidentStopTreatsMissingInstanceAsAlreadyStopped() async throws {
@@ -920,6 +996,9 @@ final class ResidentModelRecoveryTests: XCTestCase {
         await store.stopResidentModelInstance("missing-stop")
 
         XCTAssertTrue(store.residentModelInstances.isEmpty)
+        XCTAssertNil(store.loadedModelName)
+        XCTAssertEqual(store.modelLoadMessage, "No model loaded")
+        XCTAssertEqual(store.phase, .readyToLoad)
         XCTAssertEqual(stopAllCount, 0)
     }
 

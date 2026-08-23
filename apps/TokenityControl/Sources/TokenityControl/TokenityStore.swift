@@ -214,6 +214,7 @@ private enum DiscoveryMergeResult: Equatable {
     case unchanged
     case rebound
     case added
+    case conflict
 }
 
 @MainActor
@@ -237,10 +238,10 @@ final class TokenityStore: ObservableObject {
     @Published var backendMode: BackendMode = .distributed {
         didSet { rebuildLaunchPreview() }
     }
-    @Published var connectionMode: ConnectionMode = .jaccl {
+    @Published var connectionMode: ConnectionMode = .jacclRing {
         didSet { rebuildLaunchPreview() }
     }
-    @Published var nativeMTPMode: NativeMTPMode = .off {
+    @Published var nativeMTPMode: NativeMTPMode = .auto {
         didSet { rebuildLaunchPreview() }
     }
     @Published var phase: ClusterPhase = .stopped
@@ -288,16 +289,21 @@ final class TokenityStore: ObservableObject {
     @Published private(set) var videoNodes: [TokenityNode] = []
     @Published private(set) var videoRuntimeState: VideoRuntimeState = .stopped
     @Published private(set) var videoRuntimeInstanceID: String?
+    @Published private(set) var videoRuntimeLoadProgress: Double?
     @Published private(set) var isVideoGenerating = false
     @Published private(set) var videoProgress: Double = 0
     @Published private(set) var videoProgressStage = "Waiting for a MiniMax H3 runtime"
     @Published private(set) var videoGenerationError: String?
+    @Published private(set) var isVideoPreflightRunning = false
+    @Published private(set) var videoPreflightIssue: VideoReadinessIssue?
     @Published private(set) var generatedVideoArtifact: GeneratedVideoArtifact?
+    @Published private(set) var recentVideoArtifacts: [GeneratedVideoArtifact] = []
+    @Published private(set) var interruptedVideoCount = 0
     @Published private(set) var apiAccessStatus = "Not checked"
     @Published private(set) var modelConfigurations: [String: ModelRuntimeConfiguration] = [:]
     @Published private(set) var isOnboardingPresented = false
     @Published var logs: [String] = [
-        "Tokenity Control opened.",
+        "Tokenity opened.",
         "No cluster is running."
     ]
 
@@ -311,7 +317,8 @@ final class TokenityStore: ObservableObject {
     private let chatSessionsKey = "TokenityChatSessions.v1"
     private let onboardingRevisionKey = "TokenityOnboarding.completedRevision"
     private let nodeEndpointOverridesKey = "TokenityNodeAgentEndpoints.v1"
-    private static let currentOnboardingRevision = 2
+    private let nodeMachineIdentitiesKey = "TokenityNodeMachineIdentities.v1"
+    private static let currentOnboardingRevision = 3
     private let chatHistoryQueue = DispatchQueue(label: "ai.tokenity.chat-history", qos: .utility)
     private let writesChatHistorySynchronously: Bool
     private var chatHistoryRevision = 0
@@ -340,6 +347,9 @@ final class TokenityStore: ObservableObject {
     // is only a routing alias and may legitimately have multiple ready replicas.
     private var managedModelInstances: [String: ManagedModelInstance] = [:]
     private(set) var activeModelInstanceID: String?
+    // Agent snapshots can lag a successful stop by one or more polls. Keep
+    // explicitly stopped UUIDs from being re-adopted as resident services.
+    private var locallyStoppedModelInstanceIDs: Set<String> = []
     private var activeModelServiceBaseURL: String?
     private var legacyNativeMTPFallback: NativeMTPReadiness?
     private var activeModelLoadID: UUID?
@@ -384,6 +394,15 @@ final class TokenityStore: ObservableObject {
         self.nodeDiscoveryTransport = nodeDiscoveryTransport
         self.userDefaults = userDefaults
         writesChatHistorySynchronously = loadsChatHistorySynchronously
+        let videoHistory = H3VideoArtifactWriter.loadHistory()
+        recentVideoArtifacts = videoHistory.completed
+        generatedVideoArtifact = videoHistory.completed.first
+        interruptedVideoCount = videoHistory.interruptedCount
+        if interruptedVideoCount > 0 {
+            videoProgressStage = interruptedVideoCount == 1
+                ? "Previous video task interrupted"
+                : "\(interruptedVideoCount) previous video tasks interrupted"
+        }
         let environment = ProcessInfo.processInfo.environment
         h3CoordinatorAgentURL = environment["TOKENITY_H3_COORDINATOR_AGENT"]
             ?? h3CoordinatorAgentURL
@@ -403,11 +422,14 @@ final class TokenityStore: ObservableObject {
         )
         if let overrides = userDefaults.dictionary(forKey: nodeEndpointOverridesKey) as? [String: String] {
             var retainedOverrides = overrides
+            var retainedIdentities = userDefaults.dictionary(forKey: nodeMachineIdentitiesKey)
+                as? [String: String] ?? [:]
             let configuredEndpointCount = TokenityDeploymentConfiguration.nodeAgentURLs.count
             for index in nodes.indices {
                 if TokenityDeploymentConfiguration.hasExplicitNodeAgentURLs,
                    index < configuredEndpointCount {
                     retainedOverrides.removeValue(forKey: nodes[index].id)
+                    retainedIdentities.removeValue(forKey: nodes[index].id)
                     continue
                 }
                 guard let endpoint = overrides[nodes[index].id],
@@ -420,15 +442,19 @@ final class TokenityStore: ObservableObject {
                     // no verified machine and prevented LAN discovery from
                     // claiming the selected worker slot.
                     retainedOverrides.removeValue(forKey: nodes[index].id)
+                    retainedIdentities.removeValue(forKey: nodes[index].id)
                     continue
                 }
                 nodes[index].agentURL = url.absoluteString
                 nodes[index].ips = [url.host!]
+                nodes[index].machineID = retainedIdentities[nodes[index].id]
+                nodes[index].source = .saved
                 unboundPlaceholderNodeIDs.remove(nodes[index].id)
             }
             if retainedOverrides != overrides {
                 userDefaults.set(retainedOverrides, forKey: nodeEndpointOverridesKey)
             }
+            userDefaults.set(retainedIdentities, forKey: nodeMachineIdentitiesKey)
         }
         // Explicit isolated-test settings override persisted LAN discovery.
         if let isolatedAgentPort = Int(
@@ -443,7 +469,6 @@ final class TokenityStore: ObservableObject {
                 return configured
             }
             agentBaseURL = "http://127.0.0.1:\(isolatedAgentPort)"
-            unboundPlaceholderNodeIDs.removeAll()
         }
         selectedNodeIDs.subtract(unboundPlaceholderNodeIDs)
         if let data = userDefaults.data(forKey: modelConfigurationsKey),
@@ -511,6 +536,74 @@ final class TokenityStore: ObservableObject {
 
     var selectedNodes: [TokenityNode] {
         nodes.filter { selectedNodeIDs.contains($0.id) }
+    }
+
+    var clusterBuilderNodes: [TokenityNode] {
+        if canEditCluster {
+            return nodes.filter(\.isOnline)
+        }
+        return nodes.filter { $0.isOnline || selectedNodeIDs.contains($0.id) }
+    }
+
+    var effectiveBackendMode: BackendMode {
+        backendMode == .singleNode || selectedNodes.count <= 1 ? .singleNode : .distributed
+    }
+
+    var effectiveConnectionMode: ConnectionMode {
+        guard effectiveBackendMode == .distributed else { return .ring }
+        guard connectionMode != .ring else { return .ring }
+        return rdmaConnectionAvailable ? .jacclRing : .ring
+    }
+
+    var rdmaConnectionAvailable: Bool {
+        Self.nodesHaveCompatibleRDMA(selectedNodes)
+    }
+
+    var connectionPreferenceTitle: String {
+        switch connectionMode {
+        case .ring: return "Standard Network"
+        case .jaccl: return "Thunderbolt RDMA"
+        case .jacclRing: return "Automatic"
+        }
+    }
+
+    var connectionPreferenceDetail: String {
+        guard effectiveBackendMode == .distributed else {
+            return "Single-Mac workloads do not use a network collective."
+        }
+        switch connectionMode {
+        case .ring:
+            return "Standard Network is selected."
+        case .jaccl where rdmaConnectionAvailable:
+            return "Thunderbolt RDMA is selected and ready."
+        case .jaccl:
+            return "Thunderbolt RDMA is selected, but the chosen Macs do not have a compatible active link."
+        case .jacclRing where rdmaConnectionAvailable:
+            return "Automatic is using Thunderbolt RDMA."
+        case .jacclRing:
+            return "Automatic is using Standard Network until a compatible Thunderbolt RDMA link is available."
+        }
+    }
+
+    private static func nodesHaveCompatibleRDMA(_ nodes: [TokenityNode]) -> Bool {
+        let online = nodes.filter(\.isOnline)
+        guard online.count == nodes.count, online.count > 1,
+              online.allSatisfy({ $0.rdma.rdmaEnabled && $0.rdma.thunderboltIP != nil })
+        else { return false }
+
+        let scopes = Set(online.compactMap(\.rdma.thunderboltIP).map(rdmaAddressScope))
+        return scopes.count == 1
+    }
+
+    private static func rdmaAddressScope(_ address: String) -> String {
+        if address.hasPrefix("169.254.") { return "link-local" }
+        let parts = address.split(separator: ".")
+        if parts.count == 4 { return parts.prefix(3).joined(separator: ".") }
+        return "named"
+    }
+
+    var isClusterConfigured: Bool {
+        phase == .readyToLoad || phase == .running || phase == .failed
     }
 
     private var plannedNodes: [TokenityNode] {
@@ -641,9 +734,7 @@ final class TokenityStore: ObservableObject {
 
     var activeBackendDisplayName: String {
         guard let active = activeResidentTopology else {
-            return backendMode == .singleNode
-                ? "Tokenity Single-Mac Server"
-                : backendMode.rawValue
+            return effectiveBackendMode == .singleNode ? "Single Mac" : "Multiple Macs"
         }
         return active.executionMode?.lowercased() == "single"
             ? "Tokenity Single-Mac Server"
@@ -652,7 +743,7 @@ final class TokenityStore: ObservableObject {
 
     var activeConnectionDisplayName: String {
         guard let active = activeResidentTopology else {
-            return backendMode == .singleNode ? "Single Mac" : connectionMode.rawValue
+            return effectiveBackendMode == .singleNode ? "Single Mac" : effectiveConnectionMode.rawValue
         }
         if active.executionMode?.lowercased() == "single"
             || active.selectedNodes.count <= 1 {
@@ -662,7 +753,7 @@ final class TokenityStore: ObservableObject {
         case "jaccl", "jaccl-ring": return "Thunderbolt RDMA"
         case "ring": return "Standard Network"
         case let value?: return value.replacingOccurrences(of: "_", with: " ").capitalized
-        case nil: return connectionMode.rawValue
+        case nil: return effectiveConnectionMode.rawValue
         }
     }
 
@@ -700,55 +791,96 @@ final class TokenityStore: ObservableObject {
     }
 
     var canEditCluster: Bool {
-        phase == .stopped || phase == .failed
+        phase == .stopped || phase == .readyToLoad || phase == .failed
+    }
+
+    var canStopCluster: Bool {
+        guard phase != .stopping else { return false }
+        return phase != .stopped
+            || loadedModelName != nil
+            || isChatRunning
+            || selectedNodes.contains { node in
+                inferenceRolesForActiveModel(on: node).contains(where: Self.isActiveInferenceRole)
+            }
     }
 
     var canEditNativeMTP: Bool {
-        backendMode == .distributed && canEditCluster
+        effectiveBackendMode == .distributed && canEditCluster
     }
 
     var isVideoRuntimeReady: Bool {
         videoRuntimeState == .ready && videoRuntimeInstanceID != nil
     }
 
-    var videoRuntimeReadinessIssues: [String] {
-        var issues: [String] = []
+    var canStopVideoRuntime: Bool {
+        videoRuntimeState == .starting || videoRuntimeInstanceID != nil
+    }
+
+    var videoReadiness: [VideoReadinessIssue] {
+        var issues: [VideoReadinessIssue] = []
         if videoNodes.isEmpty {
-            let hasConfiguredEndpoint = !h3CoordinatorAgentURL
-                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                || !h3WorkerAgentURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             issues.append(
-                hasConfiguredEndpoint
-                    ? "Refresh the MiniMax H3 Node Agents to validate the topology."
-                    : "Configure at least one MiniMax H3 Node Agent endpoint."
+                VideoReadinessIssue(
+                    state: .secondMacUnavailable,
+                    message: !videoEndpoints.isEmpty
+                        ? "The selected Mac has not been checked yet."
+                        : "No Mac is selected for video generation.",
+                    action: .scanAgain
+                )
             )
         }
         if h3ModelPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            issues.append("MiniMax H3 model path is required.")
+            issues.append(.init(
+                state: .modelNotFound,
+                message: "Video model not found.",
+                action: .chooseFolder
+            ))
         }
         if h3BinaryPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            issues.append("MiniMax H3 native binary path is required.")
+            issues.append(.init(
+                state: .runtimeMissing,
+                message: "Video runtime missing.",
+                action: .installOrRepair
+            ))
         }
         if videoNodes.count == 2,
            Set(videoNodes.compactMap(\.machineID)).count != videoNodes.count {
-            issues.append("MiniMax H3 TP2 endpoints must resolve to two different Macs.")
+            issues.append(.init(
+                state: .componentsNeedUpdate,
+                message: "Tokenity components need an update before these two Macs can be used safely.",
+                action: .installOrRepair
+            ))
         }
         for node in videoNodes {
             if !node.isOnline {
-                issues.append("\(node.displayName) Node Agent is offline.")
+                issues.append(.init(
+                    state: .secondMacUnavailable,
+                    message: "\(node.displayName) is unavailable.",
+                    action: videoNodes.count == 2 ? .useOneMac : .scanAgain
+                ))
             } else if node.agentContract?.supports("minimax_h3_video") != true {
-                issues.append("\(node.displayName) does not advertise the minimax_h3_video capability.")
+                issues.append(.init(
+                    state: .componentsNeedUpdate,
+                    message: "Tokenity components on \(node.displayName) need an update.",
+                    action: .installOrRepair
+                ))
             }
         }
-        if videoNodes.count == 2 {
-            if connectionMode == .ring {
-                issues.append("MiniMax H3 TP2 requires Thunderbolt RDMA; Standard Network is not supported.")
-            }
-            for node in videoNodes where !node.rdma.rdmaEnabled {
-                issues.append("\(node.displayName) has no active Thunderbolt RDMA device.")
-            }
+        if videoNodes.count == 2, !Self.nodesHaveCompatibleRDMA(videoNodes) {
+            issues.append(.init(
+                state: .highSpeedConnectionUnavailable,
+                message: "The selected Macs do not have a compatible active Thunderbolt RDMA link.",
+                action: .useOneMac
+            ))
         }
-        return Array(Set(issues)).sorted()
+        if let videoPreflightIssue {
+            issues.append(videoPreflightIssue)
+        }
+        return Array(Set(issues)).sorted { $0.message < $1.message }
+    }
+
+    var videoRuntimeReadinessIssues: [String] {
+        videoReadiness.map(\.message)
     }
 
     var videoTopologySummary: String {
@@ -758,9 +890,7 @@ final class TokenityStore: ObservableObject {
         case 1:
             return "Single Mac · \(videoNodes[0].displayName)"
         default:
-            let configuredCount = [h3CoordinatorAgentURL, h3WorkerAgentURL]
-                .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-                .count
+            let configuredCount = videoEndpoints.count
             return configuredCount == 2
                 ? "TP2 endpoints awaiting refresh"
                 : "No video nodes configured"
@@ -772,17 +902,20 @@ final class TokenityStore: ObservableObject {
         let runtimeOperationID = UUID()
         activeVideoRuntimeOperationID = runtimeOperationID
         videoRuntimeState = .starting
+        videoRuntimeLoadProgress = 0.02
         videoGenerationError = nil
         videoProgressStage = "Validating MiniMax H3 topology"
         appendLog("Validating MiniMax H3 video topology.")
         await refreshVideoNodes()
         guard activeVideoRuntimeOperationID == runtimeOperationID else { return }
+        videoRuntimeLoadProgress = 0.08
 
         let issues = videoRuntimeReadinessIssues
         guard issues.isEmpty else {
             let message = issues.joined(separator: " ")
             activeVideoRuntimeOperationID = nil
             videoRuntimeState = .failed(message)
+            videoRuntimeLoadProgress = nil
             videoProgressStage = "Runtime blocked"
             videoGenerationError = message
             appendLog("MiniMax H3 start blocked: \(message)")
@@ -792,17 +925,18 @@ final class TokenityStore: ObservableObject {
             let message = TokenityTransportError.missingClusterControl.errorDescription ?? "Cluster unavailable."
             activeVideoRuntimeOperationID = nil
             videoRuntimeState = .failed(message)
+            videoRuntimeLoadProgress = nil
             videoGenerationError = message
             return
         }
 
         let instanceID = "h3-ui-" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24)
         let operationID = "h3-ui-op-" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(21)
-        let requestBody = AgentStartH3VideoRequest(
+        var requestBody = AgentStartH3VideoRequest(
             model: h3ModelPath.trimmingCharacters(in: .whitespacesAndNewlines),
             binary: h3BinaryPath.trimmingCharacters(in: .whitespacesAndNewlines),
             nodes: videoNodes.map(agentNodePayload(for:)),
-            connectionMode: videoNodes.count == 1 ? ConnectionMode.ring.cliValue : connectionMode.cliValue,
+            connectionMode: videoNodes.count == 1 ? ConnectionMode.ring.cliValue : ConnectionMode.jacclRing.cliValue,
             startingPort: h3StartingPort,
             host: "0.0.0.0",
             port: 11_242,
@@ -814,8 +948,25 @@ final class TokenityStore: ObservableObject {
             optimizationProfile: h3OptimizationProfile
         )
 
-        videoRuntimeInstanceID = String(instanceID)
+        var didSubmitLaunch = false
         do {
+            requestBody.dryRun = true
+            videoRuntimeLoadProgress = 0.15
+            var preflight = try jsonRequest(
+                url: baseURL.appendingPathComponent("/v1/node/start-minimax-h3-video"),
+                body: requestBody
+            )
+            preflight.timeoutInterval = 120
+            let (preflightData, preflightResponse) = try await dataTransport(preflight)
+            try validate(preflightResponse, data: preflightData)
+            guard activeVideoRuntimeOperationID == runtimeOperationID else { return }
+            videoRuntimeLoadProgress = 0.3
+
+            requestBody.dryRun = false
+            videoProgressStage = "Starting MiniMax H3"
+            videoRuntimeInstanceID = String(instanceID)
+            didSubmitLaunch = true
+            videoRuntimeLoadProgress = 0.4
             var request = try jsonRequest(
                 url: baseURL.appendingPathComponent("/v1/node/start-minimax-h3-video"),
                 body: requestBody
@@ -832,17 +983,23 @@ final class TokenityStore: ObservableObject {
                 return
             }
             videoRuntimeInstanceID = startedID
+            videoRuntimeLoadProgress = 1
             videoRuntimeState = .ready
             activeVideoRuntimeOperationID = nil
             videoProgressStage = "MiniMax H3 ready"
             appendLog("MiniMax H3 video runtime ready: \(videoTopologySummary) · \(h3OptimizationProfile.rawValue).")
         } catch {
-            let diagnostic = await fetchVideoRuntimeFailure(instanceID: String(instanceID))
-            try? await stopVideoInstance(String(instanceID))
+            let diagnostic = didSubmitLaunch
+                ? await fetchVideoRuntimeFailure(instanceID: String(instanceID))
+                : nil
+            if didSubmitLaunch {
+                try? await stopVideoInstance(String(instanceID))
+            }
             guard activeVideoRuntimeOperationID == runtimeOperationID else { return }
             activeVideoRuntimeOperationID = nil
             videoRuntimeInstanceID = nil
-            let message = diagnostic ?? userFacingMessage(for: error)
+            videoRuntimeLoadProgress = nil
+            let message = userFacingVideoMessage(diagnostic ?? userFacingMessage(for: error))
             videoRuntimeState = .failed(message)
             videoGenerationError = message
             videoProgressStage = "Runtime failed"
@@ -866,10 +1023,14 @@ final class TokenityStore: ObservableObject {
             appendLog("MiniMax H3 video runtime stopped.")
             videoRuntimeInstanceID = nil
             videoRuntimeState = .stopped
+            videoRuntimeLoadProgress = nil
+            videoProgress = 0
             videoProgressStage = "Waiting for a MiniMax H3 runtime"
+            videoGenerationError = nil
         } catch {
             let message = userFacingMessage(for: error)
             videoRuntimeState = .failed(message)
+            videoRuntimeLoadProgress = nil
             videoGenerationError = message
             appendLog("MiniMax H3 stop failed: \(message)")
         }
@@ -924,7 +1085,6 @@ final class TokenityStore: ObservableObject {
         videoProgress = 0
         videoProgressStage = "Submitting request"
         videoGenerationError = nil
-        generatedVideoArtifact = nil
         appendLog("Generating MiniMax H3 video on \(videoTopologySummary).")
         var didComplete = false
         defer { isVideoGenerating = false }
@@ -957,7 +1117,10 @@ final class TokenityStore: ObservableObject {
                 case .complete(let payload):
                     videoProgressStage = "Saving video"
                     videoProgress = 0.99
-                    generatedVideoArtifact = try await videoArtifactTransport(payload, generation)
+                    let artifact = try await videoArtifactTransport(payload, generation)
+                    generatedVideoArtifact = artifact
+                    recentVideoArtifacts.removeAll { $0.id == artifact.id }
+                    recentVideoArtifacts.insert(artifact, at: 0)
                     videoProgress = 1
                     videoProgressStage = "Complete"
                     didComplete = true
@@ -969,11 +1132,14 @@ final class TokenityStore: ObservableObject {
             guard didComplete else { throw H3VideoContractError.invalidEvent }
         } catch {
             if Task.isCancelled {
+                videoProgress = 0
                 videoProgressStage = "Cancelled"
+                videoGenerationError = nil
                 appendLog("MiniMax H3 video generation cancelled.")
                 return
             }
-            let message = userFacingMessage(for: error)
+            let message = userFacingVideoMessage(userFacingMessage(for: error))
+            videoProgress = 0
             videoGenerationError = message
             videoProgressStage = "Failed"
             appendLog("MiniMax H3 video generation failed: \(message)")
@@ -990,7 +1156,7 @@ final class TokenityStore: ObservableObject {
 
     var effectiveNativeMTPConfiguration: NativeMTPConfiguration {
         NativeMTPConfiguration(
-            mode: backendMode == .distributed ? nativeMTPMode : .off,
+            mode: effectiveBackendMode == .distributed ? nativeMTPMode : .off,
             maxDepth: 1,
             headPlacement: "replicated"
         )
@@ -1053,6 +1219,23 @@ final class TokenityStore: ObservableObject {
 
     func stopResidentModelInstance(_ instanceID: String) async {
         guard let managed = managedModelInstances[instanceID] else { return }
+        modelOperationEpoch &+= 1
+        locallyStoppedModelInstanceIDs.insert(instanceID)
+        let previousModelState = modelLoadStates[managed.modelID]
+        let previousPhase = phase
+        let previousServerHealth = serverHealth
+        let previousMessage = modelLoadMessage
+        let hasSibling = managedModelInstances.values.contains {
+            $0.instanceID != instanceID && $0.modelID == managed.modelID
+        }
+        if !hasSibling {
+            modelLoadStates[managed.modelID] = .unloading
+        }
+        modelLoadMessage = "Stopping \(managed.modelID) and releasing its reserved memory..."
+        if managedModelInstances.count == 1 {
+            phase = .stopping
+            serverHealth = .starting("Stopping the resident model instance")
+        }
         if activeChatRoutedInstanceID == instanceID {
             let cancelled = cancelActiveChat(
                 message: "Generation stopped because its model instance was stopped.",
@@ -1072,8 +1255,25 @@ final class TokenityStore: ObservableObject {
             if activeModelInstanceID == instanceID {
                 restoreActiveManagedInstance()
             }
+            modelLoadMessage = loadedModelName.map { "\($0) remains loaded." } ?? "No model loaded"
+            if loadedModelName == nil {
+                phase = .readyToLoad
+                serverHealth = .stopped
+            } else {
+                phase = .running
+                serverHealth = .ready
+            }
             appendLog("Stopped resident model instance \(managed.modelID) (\(instanceID)).")
         } catch {
+            locallyStoppedModelInstanceIDs.remove(instanceID)
+            if let previousModelState {
+                modelLoadStates[managed.modelID] = previousModelState
+            } else {
+                modelLoadStates.removeValue(forKey: managed.modelID)
+            }
+            phase = previousPhase
+            serverHealth = previousServerHealth
+            modelLoadMessage = previousMessage
             appendLog("Could not stop resident model instance \(instanceID): \(userFacingMessage(for: error))")
         }
     }
@@ -1231,7 +1431,9 @@ final class TokenityStore: ObservableObject {
 
     var modelLibraryRows: [ModelLibraryRow] {
         let grouped = Dictionary(grouping: selectedNodes.flatMap { node in
-            node.models.map { (node, $0) }
+            node.models
+                .filter { $0.modelType?.lowercased() != "minimax_h3" }
+                .map { (node, $0) }
         }, by: { $0.1.id })
 
         var rows = grouped.keys.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }.map { modelID in
@@ -1274,9 +1476,7 @@ final class TokenityStore: ObservableObject {
                     ?? (distributedBlockedEntry == nil ? nil : "The current Tokenity runtime does not support this model in two-Mac mode. Choose Load on one Mac instead.")
             )
         }
-        let configuredVideoNodeCount = [h3CoordinatorAgentURL, h3WorkerAgentURL]
-            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            .count
+        let configuredVideoNodeCount = videoEndpoints.count
         let onlineVideoNodes = videoNodes.filter(\.isOnline)
         rows.append(
             ModelLibraryRow(
@@ -1316,9 +1516,9 @@ final class TokenityStore: ObservableObject {
     func canLoadModel(_ row: ModelLibraryRow) -> Bool {
         guard row.standaloneLoadable, !isModelTransitioning else { return false }
         if row.modality == .video {
-            return videoRuntimeReadinessIssues.isEmpty
+            return !isVideoPreflightRunning && videoRuntimeReadinessIssues.isEmpty
         }
-        return phase == .running && row.nodes.count >= selectedNodes.count
+        return isClusterConfigured && row.nodes.count >= modelLoadRequiredNodeCount
     }
 
     func modelLoadHelp(for row: ModelLibraryRow) -> String {
@@ -1326,20 +1526,21 @@ final class TokenityStore: ObservableObject {
             return row.loadBlockReason ?? "This checkpoint cannot be loaded independently."
         }
         if row.modality == .video {
+            if isVideoPreflightRunning { return "Checking video readiness" }
             let issues = videoRuntimeReadinessIssues
             return issues.isEmpty
                 ? "Start the MiniMax H3 video runtime"
                 : issues.joined(separator: " ")
         }
-        if phase != .running { return "Create a text cluster before loading this model" }
-        if row.nodes.count < selectedNodes.count {
+        if !isClusterConfigured { return "Create the cluster before loading this model" }
+        if row.nodes.count < modelLoadRequiredNodeCount {
             return "The model must be available on every selected Mac"
         }
         return "Load model"
     }
 
     var modelLoadRequiredNodeCount: Int {
-        backendMode == .singleNode ? 1 : selectedNodes.count
+        effectiveBackendMode == .singleNode ? 1 : selectedNodes.count
     }
 
     func modelLoadTargetSummary(for row: ModelLibraryRow) -> String {
@@ -1351,7 +1552,7 @@ final class TokenityStore: ObservableObject {
             let names = resident.selectedNodes.map(nodeDisplayName(for:))
             return "\(names.count)/\(names.count) load target\(names.count == 1 ? "" : "s") · \(names.joined(separator: ", "))"
         }
-        if backendMode == .singleNode, let target = plannedNodes.first {
+        if effectiveBackendMode == .singleNode, let target = plannedNodes.first {
             return "1/1 load target · \(target.displayName)"
         }
         return "\(row.availability) · \(row.nodes.joined(separator: ", "))"
@@ -1359,7 +1560,7 @@ final class TokenityStore: ObservableObject {
 
     func topologyIssue(for row: ModelLibraryRow) -> String? {
         guard row.modality == .language,
-              backendMode == .distributed,
+              effectiveBackendMode == .distributed,
               selectedNodes.count > 1,
               !row.distributedLoadable
         else { return nil }
@@ -1373,21 +1574,17 @@ final class TokenityStore: ObservableObject {
         beginLoadingModel(row)
     }
 
-    func refreshVideoNodes() async {
-        let endpoints = [
-            H3VideoEndpoint(
-                id: "h3-mac-a",
-                hostname: "Mac A",
-                user: "unknown",
-                agentURL: h3CoordinatorAgentURL.trimmingCharacters(in: .whitespacesAndNewlines)
-            ),
-            H3VideoEndpoint(
-                id: "h3-mac-b",
-                hostname: "Mac B",
-                user: "unknown",
-                agentURL: h3WorkerAgentURL.trimmingCharacters(in: .whitespacesAndNewlines)
-            ),
-        ].filter { !$0.agentURL.isEmpty }
+    func refreshVideoNodes(validateRuntime: Bool = false) async {
+        if validateRuntime {
+            isVideoPreflightRunning = true
+            videoPreflightIssue = nil
+        }
+        defer {
+            if validateRuntime {
+                isVideoPreflightRunning = false
+            }
+        }
+        let endpoints = videoEndpoints
 
         var sampledNodes: [TokenityNode] = []
         for endpoint in endpoints {
@@ -1446,6 +1643,86 @@ final class TokenityStore: ObservableObject {
         videoNodes = sampledNodes
         synchronizeVideoRuntime(from: sampledNodes)
         await refreshVideoRuntimeQuorumIfNeeded()
+        if validateRuntime, videoRuntimeState != .ready, videoReadiness.isEmpty {
+            await refreshVideoPreflight()
+        }
+    }
+
+    private func refreshVideoPreflight() async {
+        guard let baseURL = videoControlBaseURL() else { return }
+        let instanceID = "h3-check-" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(20)
+        let operationID = "h3-check-op-" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(17)
+        let body = AgentStartH3VideoRequest(
+            model: h3ModelPath.trimmingCharacters(in: .whitespacesAndNewlines),
+            binary: h3BinaryPath.trimmingCharacters(in: .whitespacesAndNewlines),
+            nodes: videoNodes.map(agentNodePayload(for:)),
+            connectionMode: videoNodes.count == 1 ? ConnectionMode.ring.cliValue : ConnectionMode.jacclRing.cliValue,
+            startingPort: h3StartingPort,
+            host: "0.0.0.0",
+            port: 11_242,
+            dryRun: true,
+            apiIdentifier: "MiniMax-H3",
+            leaseSeconds: appRestartLeaseGraceSeconds,
+            instanceID: String(instanceID),
+            operationID: String(operationID),
+            optimizationProfile: h3OptimizationProfile
+        )
+        do {
+            var request = try jsonRequest(
+                url: baseURL.appendingPathComponent("/v1/node/start-minimax-h3-video"),
+                body: body
+            )
+            request.timeoutInterval = 120
+            let (data, response) = try await dataTransport(request)
+            try validate(response, data: data)
+        } catch {
+            let message = userFacingVideoMessage(userFacingMessage(for: error))
+            videoPreflightIssue = videoReadinessIssue(for: message)
+        }
+    }
+
+    func useOneMacForVideo() {
+        guard let target = videoNodes.first ?? plannedNodes.first else { return }
+        selectedNodeIDs = [target.id]
+        coordinatorID = target.id
+        backendMode = .singleNode
+        h3WorkerAgentURL = ""
+        phase = .stopped
+        rebuildLaunchPreview()
+    }
+
+    private var videoEndpoints: [H3VideoEndpoint] {
+        let configuredWorker = h3WorkerAgentURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if configuredWorker.isEmpty {
+            let selected = plannedNodes.filter {
+                !$0.agentURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+            if !selected.isEmpty {
+                return selected.prefix(2).map {
+                    H3VideoEndpoint(
+                        id: $0.id,
+                        hostname: $0.hostname,
+                        user: $0.user,
+                        agentURL: $0.agentURL
+                    )
+                }
+            }
+        }
+
+        return [
+            H3VideoEndpoint(
+                id: "h3-mac-a",
+                hostname: "Mac A",
+                user: "unknown",
+                agentURL: h3CoordinatorAgentURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            ),
+            H3VideoEndpoint(
+                id: "h3-mac-b",
+                hostname: "Mac B",
+                user: "unknown",
+                agentURL: configuredWorker
+            ),
+        ].filter { !$0.agentURL.isEmpty }
     }
 
     func scanModels() async {
@@ -1455,28 +1732,41 @@ final class TokenityStore: ObservableObject {
 
         var updatedNodes = nodes
         var scanned = 0
-        var found = 0
+        var foundModelIDs: Set<String> = []
+        var discoveredRoots: Set<String> = []
 
         for node in selectedNodes {
             guard let index = updatedNodes.firstIndex(where: { $0.id == node.id }) else { continue }
-            let fetched = await fetchModels(for: node)
-            if let fetched {
-                updatedNodes[index].models = fetched
+            let inventory = await fetchModels(for: node)
+            if let inventory {
+                updatedNodes[index].models = inventory.models
                 updatedNodes[index].isOnline = true
+                discoveredRoots.insert(inventory.root)
                 scanned += 1
-                found += fetched.count
+                foundModelIDs.formUnion(
+                    inventory.models
+                        .filter { $0.modelType?.lowercased() != "minimax_h3" }
+                        .map(\.id)
+                )
             } else if !updatedNodes[index].models.isEmpty {
                 scanned += 1
-                found += updatedNodes[index].models.count
+                foundModelIDs.formUnion(
+                    updatedNodes[index].models
+                        .filter { $0.modelType?.lowercased() != "minimax_h3" }
+                        .map(\.id)
+                )
             }
         }
 
         nodes = updatedNodes
-        await refreshVideoNodes()
+        if !foundModelIDs.isEmpty, discoveredRoots.count == 1, let discoveredRoot = discoveredRoots.first {
+            modelRoot = discoveredRoot
+        }
+        await refreshVideoNodes(validateRuntime: true)
         let videoOnline = videoNodes.filter(\.isOnline).count
         let textSummary = scanned == 0
             ? "Using saved text inventory"
-            : "\(found) text model(s) across \(scanned) selected Mac(s)"
+            : "\(foundModelIDs.count) text model(s) across \(scanned) selected Mac(s)"
         modelScanSummary = "\(textSummary) · MiniMax H3 \(videoOnline)/\(videoNodes.count)"
         appendLog("Model library refreshed.")
         rebuildLaunchPreview()
@@ -1522,23 +1812,44 @@ final class TokenityStore: ObservableObject {
         let discoveries = await nodeDiscoveryTransport(seedOrigins)
         let preferred = preferredControlDiscoveries(from: discoveries)
         guard !preferred.isEmpty else {
-            nodeDiscoverySummary = "No Node Agents found; saved endpoints were kept"
+            pruneUnavailableSelectionIfEditable()
+            rebuildLaunchPreview()
+            nodeDiscoverySummary = "No running Node Agents found; saved addresses remain available for reconnect"
             return
         }
 
         var reboundCount = 0
         var addedCount = 0
+        var conflictCount = 0
         for discovery in preferred {
             switch mergeDiscoveredNode(discovery) {
             case .rebound: reboundCount += 1
             case .added: addedCount += 1
+            case .conflict: conflictCount += 1
             case .unchanged: break
             }
         }
+        pruneUnavailableSelectionIfEditable()
         nodeTopologyRevision += 1
         persistNodeEndpointOverrides()
         rebuildLaunchPreview()
-        nodeDiscoverySummary = "Found \(preferred.count) Mac(s) automatically"
+        let modernAddresses = Set(preferred.compactMap { discovery -> [String]? in
+            guard discovery.info.machineID?.isEmpty == false else { return nil }
+            return discovery.info.ips + [URL(string: discovery.agentURL)?.host].compactMap { $0 }
+        }.flatMap { $0 })
+        let modernMachineIDs = Set(preferred.compactMap { discovery -> String? in
+            guard let machineID = discovery.info.machineID, !machineID.isEmpty else { return nil }
+            return machineID
+        })
+        let distinctLegacyEndpoints = Set(preferred.compactMap { discovery -> String? in
+            guard discovery.info.machineID?.isEmpty != false else { return nil }
+            let addresses = Set(discovery.info.ips + [URL(string: discovery.agentURL)?.host].compactMap { $0 })
+            return addresses.isDisjoint(with: modernAddresses) ? discovery.agentURL : nil
+        })
+        let discoveredMacCount = modernMachineIDs.count + distinctLegacyEndpoints.count
+        nodeDiscoverySummary = conflictCount == 0
+            ? "Found \(discoveredMacCount) Mac(s) automatically"
+            : "Found \(discoveredMacCount) Mac(s); \(conflictCount) saved address(es) now point to another Mac"
         if reboundCount > 0 || addedCount > 0 {
             appendLog(
                 "LAN discovery updated \(reboundCount) saved endpoint(s) and added \(addedCount) Mac(s)."
@@ -1548,8 +1859,8 @@ final class TokenityStore: ObservableObject {
 
     @discardableResult
     func connectNode(agentURL rawValue: String) async -> Bool {
-        guard phase == .stopped else {
-            nodeDiscoverySummary = "Stop the cluster before changing a Node Agent endpoint"
+        guard canEditCluster else {
+            nodeDiscoverySummary = "Stop the running model before changing a Mac address"
             return false
         }
         guard !isConnectingNode else { return false }
@@ -1575,7 +1886,11 @@ final class TokenityStore: ObservableObject {
                 agentURL: baseURL.absoluteString,
                 info: info
             )
-            let result = mergeDiscoveredNode(discovery)
+            let result = mergeDiscoveredNode(discovery, source: .manual)
+            guard result != .conflict else {
+                nodeDiscoverySummary = "That address now points to another Mac. Remove the saved Mac before adding it."
+                return false
+            }
             nodeTopologyRevision += 1
             persistNodeEndpointOverrides()
             rebuildLaunchPreview()
@@ -1648,6 +1963,18 @@ final class TokenityStore: ObservableObject {
                 || telemetryAge >= telemetryInterval
             let startedAt = Date()
             if let info = await fetchNodeInfo(for: node) {
+                if let expected = previousNode.machineID,
+                   !expected.isEmpty,
+                   let observed = info.machineID,
+                   !observed.isEmpty,
+                   expected != observed {
+                    updatedNodes[index].machineIdentityVerified = false
+                    updatedNodes[index].isOnline = false
+                    updatedNodes[index].agentError = "This address now points to another Mac. Remove it and add the intended Mac again."
+                    updatedNodes[index].agentHealthState = .degraded
+                    updatedNodes[index].agentHealthDetail = updatedNodes[index].agentError
+                    continue
+                }
                 updatedNodes[index].hostname = info.hostname
                 updatedNodes[index].user = info.user
                 updatedNodes[index].ips = info.ips
@@ -1656,7 +1983,8 @@ final class TokenityStore: ObservableObject {
                 updatedNodes[index].mlxVersion = info.mlxVersion
                 updatedNodes[index].mlxLMVersion = info.mlxLMVersion
                 updatedNodes[index].tokenityVersion = info.tokenityVersion
-                updatedNodes[index].machineID = info.machineID
+                updatedNodes[index].machineID = info.machineID ?? previousNode.machineID
+                updatedNodes[index].machineIdentityVerified = info.machineID?.isEmpty == false
                 updatedNodes[index].tokenityCodeRevision = info.tokenityCodeRevision
                 updatedNodes[index].agentContract = info.agentContract
                 updatedNodes[index].roles = stableRoles(
@@ -1732,6 +2060,7 @@ final class TokenityStore: ObservableObject {
         }
         if nodeTopologyRevision == topologyRevisionAtStart, nodes != updatedNodes {
             nodes = updatedNodes
+            pruneUnavailableSelectionIfEditable()
         }
         guard refreshModelEpoch == modelOperationEpoch else {
             rebuildLaunchPreview()
@@ -1852,6 +2181,7 @@ final class TokenityStore: ObservableObject {
               loadedModelName == nil,
               let controller = coordinator,
               let activeRole = controller.roles.first(where: Self.isActiveInferenceProcess),
+              activeRole.instanceID.map({ !locallyStoppedModelInstanceIDs.contains($0) }) ?? true,
               let command = activeRole.command,
               let modelFlag = command.firstIndex(of: "--model"),
               command.indices.contains(modelFlag + 1)
@@ -1957,6 +2287,7 @@ final class TokenityStore: ObservableObject {
             selection.insert(node.id)
         }
         selectedNodeIDs = selection
+        modelScanSummary = "Selection changed · Scan Models to refresh inventory"
         appendLog("\(node.displayName) \(selection.contains(node.id) ? "added to" : "removed from") the cluster selection.")
     }
 
@@ -1990,7 +2321,7 @@ final class TokenityStore: ObservableObject {
             await startVideoRuntime()
             return
         }
-        guard phase == .running else {
+        guard isClusterConfigured else {
             pendingModelLoadID = nil
             modelLoadTask = nil
             appendLog("Create a cluster before loading a model.")
@@ -2012,7 +2343,7 @@ final class TokenityStore: ObservableObject {
             return
         }
         if nativeMTPMode == .required,
-           backendMode == .distributed,
+           effectiveBackendMode == .distributed,
            let capability = row.nativeMTP,
            capability.status != "supported",
            capability.status != "unknown" {
@@ -2034,12 +2365,12 @@ final class TokenityStore: ObservableObject {
         activeModelLoadID = operationID
         pendingModelLoadID = nil
         await refreshSelectedNodeStatus()
-        let targetNodes = backendMode == .singleNode
+        let targetNodes = effectiveBackendMode == .singleNode
             ? Array(plannedNodes.prefix(1))
             : selectedNodes
         let issues = readinessIssues(for: targetNodes)
         guard issues.isEmpty else {
-            let prefix = connectionMode == .ring
+            let prefix = effectiveConnectionMode == .ring
                 ? "The selected cluster is not ready"
                 : "Thunderbolt RDMA is not ready"
             let message = "\(prefix): \(issues.joined(separator: " "))"
@@ -2066,6 +2397,9 @@ final class TokenityStore: ObservableObject {
         modelPath = row.representativePath
         modelLoadMessage = "Loading \(row.displayName)..."
         modelLoadProgress = 0
+        if loadedModelName == nil {
+            phase = .launching
+        }
         serverHealth = .starting("Loading \(row.displayName)")
         nativeMTPRuntime = nil
         legacyNativeMTPFallback = nil
@@ -2108,6 +2442,9 @@ final class TokenityStore: ObservableObject {
             try ensureActiveModelLoad(operationID)
             modelLoadProgress = max(modelLoadProgress ?? 0, 0.98)
             modelLoadMessage = "Verifying inference for \(row.displayName)..."
+            if loadedModelName == nil {
+                phase = .firstTokenPending
+            }
             try await probeModelService(modelName: serviceModelName)
             try ensureActiveModelLoad(operationID)
             if let quorum = try await fetchInstanceQuorum() {
@@ -2126,7 +2463,7 @@ final class TokenityStore: ObservableObject {
             loadedServiceModelName = serviceModelName
             activeLoadedModelID = row.id
             if let instanceID = startResponse?.instanceID {
-                let launchNodes = backendMode == .singleNode
+                let launchNodes = effectiveBackendMode == .singleNode
                     ? Array(plannedNodes.prefix(1))
                     : plannedNodes
                 managedModelInstances[instanceID] = ManagedModelInstance(
@@ -2136,8 +2473,8 @@ final class TokenityStore: ObservableObject {
                     apiBaseURL: startResponse?.apiBaseURL,
                     backendRole: role,
                     selectedNodes: launchNodes.map(\.id),
-                    executionMode: backendMode == .singleNode ? "single" : "distributed",
-                    connectionMode: backendMode == .singleNode ? "single" : connectionMode.cliValue
+                    executionMode: effectiveBackendMode == .singleNode ? "single" : "distributed",
+                    connectionMode: effectiveBackendMode == .singleNode ? "single" : effectiveConnectionMode.cliValue
                 )
             }
             activeModelLoadID = nil
@@ -2163,6 +2500,10 @@ final class TokenityStore: ObservableObject {
                 modelLoadStates = states
                 restoreActiveManagedInstance()
                 modelLoadMessage = "Model loading cancelled."
+                if loadedModelName == nil {
+                    phase = .readyToLoad
+                    serverHealth = .stopped
+                }
                 appendLog("Model loading cancelled: \(row.displayName).")
             }
             modelLoadTask = nil
@@ -2181,6 +2522,7 @@ final class TokenityStore: ObservableObject {
             modelLoadProgress = nil
             let message = userFacingMessage(for: error)
             serverHealth = loadedModelName == nil ? .error(message) : .ready
+            phase = loadedModelName == nil ? .failed : .running
             modelLoadMessage = message
             appendLog("Model load failed: \(message)")
         }
@@ -2199,6 +2541,7 @@ final class TokenityStore: ObservableObject {
         // status monitor can observe a stopped process while the model still
         // looks loaded and incorrectly collapse the logical cluster state.
         modelOperationEpoch &+= 1
+        let stoppingInstanceID = activeModelInstanceID
         activeModelLoadID = nil
         pendingModelLoadID = nil
         modelLoadTask?.cancel()
@@ -2211,6 +2554,15 @@ final class TokenityStore: ObservableObject {
         modelLoadMessage = "Unloading \(row.displayName) and releasing memory on all Macs..."
         appendLog("Unloading model: \(row.displayName).")
 
+        let targetInstanceIDs = managedModelInstances.values
+            .filter { $0.modelID == row.id }
+            .map(\.instanceID)
+            .sorted()
+        let fallbackInstanceIDs = targetInstanceIDs.isEmpty
+            ? [stoppingInstanceID].compactMap { $0 }
+            : targetInstanceIDs
+        locallyStoppedModelInstanceIDs.formUnion(fallbackInstanceIDs)
+
         let stopsActiveChatModel = activeLoadedModelID == row.id
         let cancelledChatTask = stopsActiveChatModel
             ? cancelActiveChat(
@@ -2219,13 +2571,7 @@ final class TokenityStore: ObservableObject {
             )
             : nil
         if let cancelledChatTask { await cancelledChatTask.value }
-        let targetInstanceIDs = managedModelInstances.values
-            .filter { $0.modelID == row.id }
-            .map(\.instanceID)
-            .sorted()
-        let fallbackInstanceIDs = targetInstanceIDs.isEmpty
-            ? [activeLoadedModelID == row.id ? activeModelInstanceID : nil].compactMap { $0 }
-            : targetInstanceIDs
+        var failedInstanceIDs: Set<String> = []
         if fallbackInstanceIDs.isEmpty {
             do {
                 try await cleanupInstanceOrLegacy(
@@ -2243,24 +2589,28 @@ final class TokenityStore: ObservableObject {
                         allowsGlobalFallback: managedModelInstances.count <= fallbackInstanceIDs.count
                     )
                 } catch {
+                    failedInstanceIDs.insert(instanceID)
                     appendLog("Some model stop requests could not reach a selected Mac: \(userFacingMessage(for: error))")
                 }
             }
         }
+        locallyStoppedModelInstanceIDs.subtract(failedInstanceIDs)
         for instanceID in targetInstanceIDs {
             managedModelInstances.removeValue(forKey: instanceID)
         }
         states = modelLoadStates
         states[row.id] = .notLoaded
         modelLoadStates = states
-        if activeLoadedModelID == row.id {
+        if activeLoadedModelID == row.id
+            || stoppingInstanceID.map(fallbackInstanceIDs.contains) == true {
             restoreActiveManagedInstance()
         }
         await refreshSelectedNodeStatus()
         modelLoadProgress = nil
         modelLoadMessage = loadedModelName.map { "\($0) remains loaded." } ?? "No model loaded"
         if loadedModelName == nil {
-            serverHealth = .starting("Waiting for a model to load")
+            phase = .readyToLoad
+            serverHealth = .stopped
         }
         appendLog("Model stopped: \(row.displayName).")
     }
@@ -2505,22 +2855,19 @@ final class TokenityStore: ObservableObject {
     }
 
     func createCluster() {
-        // Connectivity is refreshed asynchronously immediately before model
-        // loading. The UI still disables this action while an Agent is offline,
-        // but the synchronous state transition must not trust an unrefreshed
-        // sample snapshot (and remains directly testable with mocked Agents).
+        // Selecting Macs prepares a launch plan; it does not start a service.
+        // Readiness becomes Ready only after model, quorum and inference probes.
         let configurationIssues = launchPreview.readinessIssues.filter {
             !$0.hasSuffix("Node Agent is offline.")
         }
         if configurationIssues.isEmpty {
-            phase = .launching
-            serverHealth = .starting("Waiting for a model to load")
-            appendLog("Cluster created with \(selectedNodes.count) selected Mac(s).")
-            phase = .running
+            phase = .readyToLoad
+            serverHealth = .stopped
+            appendLog("\(selectedNodes.count) Mac(s) selected and ready to load a model.")
         } else {
             phase = .failed
-            serverHealth = .error("Cluster creation is blocked by readiness issues.")
-            appendLog("Cluster creation blocked. Review readiness warnings.")
+            serverHealth = .error("Mac selection needs attention.")
+            appendLog("Mac selection blocked. Review readiness warnings.")
         }
     }
 
@@ -2540,6 +2887,7 @@ final class TokenityStore: ObservableObject {
         }
         videoRuntimeInstanceID = nil
         videoRuntimeState = .stopped
+        videoRuntimeLoadProgress = nil
         videoProgressStage = "Waiting for a MiniMax H3 runtime"
         activeModelLoadID = nil
         pendingModelLoadID = nil
@@ -2585,6 +2933,7 @@ final class TokenityStore: ObservableObject {
         }
         videoRuntimeInstanceID = nil
         videoRuntimeState = .stopped
+        videoRuntimeLoadProgress = nil
         activeModelLoadID = nil
         pendingModelLoadID = nil
         modelLoadTask?.cancel()
@@ -2612,7 +2961,7 @@ final class TokenityStore: ObservableObject {
     func rebuildLaunchPreview() {
         let nodes = selectedNodes
         var readiness = readinessIssues(for: nodes)
-        if backendMode == .distributed,
+        if effectiveBackendMode == .distributed,
            nativeMTPMode == .required,
            let capability = aggregatedNativeMTPCapability,
            capability.status != "supported",
@@ -2623,14 +2972,14 @@ final class TokenityStore: ObservableObject {
         }
         let readinessText = readiness.isEmpty ? "Ready to create" : "Needs attention"
         let summary = [
-            LaunchSummaryItem(title: "Backend", value: backendMode.rawValue),
-            LaunchSummaryItem(title: "Connection", value: connectionMode.rawValue),
+            LaunchSummaryItem(title: "Compute", value: effectiveBackendMode == .singleNode ? "Single Mac" : "Multiple Macs"),
+            LaunchSummaryItem(title: "Connection", value: effectiveBackendMode == .singleNode ? "Single Mac" : effectiveConnectionMode.rawValue),
             LaunchSummaryItem(title: "Selected Macs", value: "\(nodes.count)"),
             LaunchSummaryItem(title: "Native MTP", value: effectiveNativeMTPConfiguration.mode.title),
             LaunchSummaryItem(title: "Readiness", value: readinessText),
         ]
         var warnings = ["Tokenity Distributed Server verifies readiness with a real chat probe before marking a model loaded."]
-        if backendMode == .distributed && nativeMTPMode == .auto {
+        if effectiveBackendMode == .distributed && nativeMTPMode == .auto {
             warnings.append("Native MTP Auto falls back to standard decoding when the model, checkpoint, or runtime is incompatible.")
         }
         let nextPreview = LaunchPreview(
@@ -2644,21 +2993,35 @@ final class TokenityStore: ObservableObject {
         }
     }
 
-    private func fetchModels(for node: TokenityNode) async -> [ModelEntry]? {
+    private func fetchModels(for node: TokenityNode) async -> NodeModelsResponse? {
         guard let baseURL = Self.normalizedAgentBaseURL(node.agentURL) else { return nil }
-        var components = URLComponents(
-            url: baseURL.appendingPathComponent("v1/node/models"),
-            resolvingAgainstBaseURL: false
-        )
-        components?.queryItems = [URLQueryItem(name: "root", value: modelRoot)]
-        guard let url = components?.url else { return nil }
+        let requestedRoot = modelRoot.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        do {
-            let (data, _) = try await URLSession.shared.data(from: url)
-            return try JSONDecoder().decode(NodeModelsResponse.self, from: data).models
-        } catch {
-            return nil
+        func fetch(root: String?) async -> NodeModelsResponse? {
+            var components = URLComponents(
+                url: baseURL.appendingPathComponent("v1/node/models"),
+                resolvingAgainstBaseURL: false
+            )
+            if let root, !root.isEmpty {
+                components?.queryItems = [URLQueryItem(name: "root", value: root)]
+            }
+            guard let url = components?.url else { return nil }
+            do {
+                var request = URLRequest(url: url)
+                request.timeoutInterval = 5
+                let (data, response) = try await dataTransport(request)
+                try validate(response, data: data)
+                return try JSONDecoder().decode(NodeModelsResponse.self, from: data)
+            } catch {
+                return nil
+            }
         }
+
+        let requested = await fetch(root: requestedRoot)
+        if requested?.models.isEmpty == false || requestedRoot.isEmpty {
+            return requested
+        }
+        return await fetch(root: nil) ?? requested
     }
 
     private func fetchStatus(for node: TokenityNode) async -> NodeStatusResponse? {
@@ -2749,19 +3112,39 @@ final class TokenityStore: ObservableObject {
     }
 
     private func mergeDiscoveredNode(
-        _ discovery: DiscoveredNodeEndpoint
+        _ discovery: DiscoveredNodeEndpoint,
+        source: NodeSource = .automatic
     ) -> DiscoveryMergeResult {
         let info = discovery.info
         guard let discoveredURL = Self.normalizedAgentBaseURL(discovery.agentURL) else {
             return .unchanged
         }
+        if let bound = nodes.first(where: { $0.agentURL == discoveredURL.absoluteString }),
+           let expected = bound.machineID,
+           !expected.isEmpty,
+           let observed = info.machineID,
+           !observed.isEmpty,
+           expected != observed {
+            return .conflict
+        }
+        let discoveredAddresses = Set(info.ips + [discoveredURL.host].compactMap { $0 })
+        if info.machineID?.isEmpty != false,
+           nodes.contains(where: { node in
+               guard node.machineID?.isEmpty == false else { return false }
+               let knownAddresses = Set(node.ips + [URL(string: node.agentURL)?.host].compactMap { $0 })
+               return !knownAddresses.isDisjoint(with: discoveredAddresses)
+           }) {
+            // A legacy Agent on a Mac already represented by a verified modern
+            // identity must not create a duplicate card or erase that identity.
+            return .unchanged
+        }
         var existingIndex = nodes.firstIndex { node in
-            if node.agentURL == discovery.agentURL || node.id == info.nodeID {
-                return true
-            }
             if let machineID = info.machineID,
-               !machineID.isEmpty,
-               node.machineID == machineID {
+               !machineID.isEmpty {
+                return node.machineID == machineID
+                    || node.agentURL == discoveredURL.absoluteString
+            }
+            if node.agentURL == discoveredURL.absoluteString || node.id == info.nodeID {
                 return true
             }
             if let rdmaIP = info.rdma.thunderboltIP,
@@ -2791,6 +3174,7 @@ final class TokenityStore: ObservableObject {
             mlxLMVersion: info.mlxLMVersion,
             tokenityVersion: info.tokenityVersion,
             machineID: info.machineID,
+            machineIdentityVerified: info.machineID?.isEmpty == false,
             tokenityCodeRevision: info.tokenityCodeRevision,
             agentContract: info.agentContract,
             rdma: info.rdma,
@@ -2803,13 +3187,14 @@ final class TokenityStore: ObservableObject {
             lastAgentResponseAt: Date(),
             modelInstances: info.instances ?? []
         )
+        discoveredNode.source = source
 
         if let existingIndex {
             let existing = nodes[existingIndex]
             let claimedPlaceholder = unboundPlaceholderNodeIDs.contains(existing.id)
             let endpointChanged = existing.agentURL != discovery.agentURL
             discoveredNode.id = existing.id
-            discoveredNode.models = existing.models
+            discoveredNode.models = claimedPlaceholder ? [] : existing.models
             discoveredNode.runtimeMemory = existing.runtimeMemory
             nodes[existingIndex] = discoveredNode
             unboundPlaceholderNodeIDs.remove(existing.id)
@@ -2829,16 +3214,24 @@ final class TokenityStore: ObservableObject {
     }
 
     private func persistNodeEndpointOverrides() {
-        let overrides: [String: String] = Dictionary(
-            uniqueKeysWithValues: nodes.compactMap { node in
+        let savedNodes = nodes.compactMap { node -> (TokenityNode, URL)? in
                 guard let url = Self.normalizedAgentBaseURL(node.agentURL),
                       !unboundPlaceholderNodeIDs.contains(node.id),
                       !Self.isLoopbackAgentURL(url)
                 else { return nil }
-                return (node.id, url.absoluteString)
+                return (node, url)
+            }
+        let overrides = Dictionary(
+            uniqueKeysWithValues: savedNodes.map { ($0.0.id, $0.1.absoluteString) }
+        )
+        let identities: [String: String] = Dictionary(
+            uniqueKeysWithValues: savedNodes.compactMap { node, _ in
+                guard let machineID = node.machineID, !machineID.isEmpty else { return nil }
+                return (node.id, machineID)
             }
         )
         userDefaults.set(overrides, forKey: nodeEndpointOverridesKey)
+        userDefaults.set(identities, forKey: nodeMachineIdentitiesKey)
     }
 
     private static func normalizedAgentBaseURL(_ rawValue: String) -> URL? {
@@ -3003,12 +3396,22 @@ final class TokenityStore: ObservableObject {
             .first(where: { $0.instanceID == instanceID })
         else { return }
 
+        // A status refresh can finish with a snapshot captured before the
+        // stop request. Keep the user-visible lifecycle monotonic while that
+        // request is in flight instead of regressing Stopping to Starting.
+        if case .stopping = videoRuntimeState,
+           snapshot.state.lowercased() != "stopped" {
+            return
+        }
+
         switch snapshot.state.lowercased() {
         case "ready", "busy":
+            videoRuntimeLoadProgress = 1
             videoRuntimeState = .ready
         case "stopped":
             videoRuntimeInstanceID = nil
             videoRuntimeState = .stopped
+            videoRuntimeLoadProgress = nil
             if !isVideoGenerating {
                 videoProgressStage = "Waiting for a MiniMax H3 runtime"
             }
@@ -3016,10 +3419,13 @@ final class TokenityStore: ObservableObject {
             let message = snapshot.healthIssues?.joined(separator: " ")
                 ?? "The MiniMax H3 runtime stopped unexpectedly."
             videoRuntimeState = .failed(message)
+            videoRuntimeLoadProgress = nil
             videoGenerationError = message
         case "stopping":
+            videoRuntimeLoadProgress = nil
             videoRuntimeState = .stopping
         default:
+            videoRuntimeLoadProgress = max(videoRuntimeLoadProgress ?? 0, 0.05)
             videoRuntimeState = .starting
         }
     }
@@ -3045,6 +3451,7 @@ final class TokenityStore: ObservableObject {
                 ? "The MiniMax H3 rank quorum is not ready."
                 : detail
             videoRuntimeState = .failed(message)
+            videoRuntimeLoadProgress = nil
             videoGenerationError = message
             videoProgressStage = "Runtime rank failure"
             appendLog("MiniMax H3 rank quorum failed: \(message)")
@@ -3074,7 +3481,14 @@ final class TokenityStore: ObservableObject {
               expectedEpoch == modelOperationEpoch
         else { return }
 
-        let snapshots = controller.modelInstances
+        // MiniMax H3 shares the Agent instance registry for lifecycle and
+        // resource accounting, but it is not a chat-route resident model.
+        // Filter it here as a compatibility guard for Agents that predate the
+        // equivalent gateway-side filter.
+        let snapshots = controller.modelInstances.filter {
+            $0.requestedModelID != Self.h3ModelID
+                && !locallyStoppedModelInstanceIDs.contains($0.instanceID)
+        }
         let snapshotsByID = Dictionary(
             snapshots.map { ($0.instanceID, $0) },
             uniquingKeysWith: { _, latest in latest }
@@ -3296,6 +3710,15 @@ final class TokenityStore: ObservableObject {
         }
     }
 
+    private func pruneUnavailableSelectionIfEditable() {
+        guard canEditCluster else { return }
+        let onlineNodeIDs = Set(nodes.lazy.filter(\.isOnline).map(\.id))
+        let availableSelection = selectedNodeIDs.intersection(onlineNodeIDs)
+        if availableSelection != selectedNodeIDs {
+            selectedNodeIDs = availableSelection
+        }
+    }
+
     private func resetModelLoadState(message: String) {
         var states = modelLoadStates
         for key in states.keys {
@@ -3371,7 +3794,7 @@ final class TokenityStore: ObservableObject {
                 logReason: "external service stop"
             )
             resetModelLoadState(message: "Model service stopped outside Tokenity.")
-            phase = .stopped
+            phase = .readyToLoad
             appendLog("Detected that the model service was stopped outside Tokenity.")
         }
     }
@@ -3465,7 +3888,23 @@ final class TokenityStore: ObservableObject {
         var issues = nodes.compactMap { node in
             node.isOnline ? nil : "\(node.displayName) Node Agent is offline."
         }
-        guard connectionMode != .ring else { return issues }
+        if nodes.count > 1 {
+            let machineIDs = nodes.compactMap { node -> String? in
+                guard let value = node.machineID?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !value.isEmpty,
+                      node.machineIdentityVerified else { return nil }
+                return value
+            }
+            if machineIDs.count != nodes.count {
+                issues.append("Tokenity components need an update before this Mac can join a multi-Mac run.")
+            } else if Set(machineIDs).count != nodes.count {
+                issues.append("Two selected entries resolve to the same Mac.")
+            }
+        }
+        if nodes.count > 1, connectionMode == .jaccl, !Self.nodesHaveCompatibleRDMA(nodes) {
+            issues.append("Thunderbolt RDMA is selected, but the chosen Macs do not have compatible active Thunderbolt addresses.")
+        }
+        guard effectiveConnectionMode != .ring else { return issues }
         issues.append(contentsOf: nodes.filter(\.isOnline).flatMap { node -> [String] in
             var issues: [String] = []
             if !node.rdma.rdmaEnabled {
@@ -3490,7 +3929,7 @@ final class TokenityStore: ObservableObject {
                 ready = false
                 detail = "Node Agent is offline or unreachable."
             } else {
-                switch connectionMode {
+                switch effectiveConnectionMode {
                 case .ring:
                     ready = true
                     detail = "Uses the standard network path."
@@ -3509,7 +3948,7 @@ final class TokenityStore: ObservableObject {
                 nodeID: node.id,
                 nodeName: node.displayName,
                 role: "Cluster member",
-                link: connectionMode.rawValue,
+                link: effectiveBackendMode == .singleNode ? "Single Mac" : effectiveConnectionMode.rawValue,
                 readiness: ready ? "Ready" : "Needs attention",
                 detail: detail
             )
@@ -3532,13 +3971,13 @@ final class TokenityStore: ObservableObject {
             // The Agent receiving this request always starts rank 0 locally.
             // Keep the selected coordinator first even after users temporarily
             // remove and re-add the original primary Mac.
-            let rankNodes = backendMode == .singleNode
+            let rankNodes = effectiveBackendMode == .singleNode
                 ? Array(plannedNodes.prefix(1))
                 : plannedNodes
             return AgentStartModelRequest(
                 model: row.representativePath,
                 nodes: rankNodes.map(agentNodePayload(for:)),
-                connectionMode: backendMode == .singleNode ? ConnectionMode.ring.cliValue : connectionMode.cliValue,
+                connectionMode: effectiveBackendMode == .singleNode ? ConnectionMode.ring.cliValue : effectiveConnectionMode.cliValue,
                 startingPort: mlxStartingPort,
                 host: "0.0.0.0",
                 port: modelHTTPPort,
@@ -3696,7 +4135,7 @@ final class TokenityStore: ObservableObject {
             url: baseURL.appendingPathComponent("/v1/node/instances/\(instanceID)/stop"),
             body: AgentStopAllRequest(timeout: 10)
         )
-        request.timeoutInterval = 15
+        request.timeoutInterval = 45
         do {
             let (data, response) = try await dataTransport(request)
             try validate(response, data: data)
@@ -4098,13 +4537,23 @@ final class TokenityStore: ObservableObject {
         nativeMTPRuntime = readiness.nativeMTP ?? legacyNativeMTPFallback
         let phaseProgress: Double?
         switch readiness.phase {
-        case "launching": phaseProgress = 0.01
-        case "distributed_init": phaseProgress = 0.05
-        case "loading_model": phaseProgress = readiness.progress ?? 0.1
-        case "compiling": phaseProgress = readiness.progress ?? 0.96
+        case "launching":
+            phaseProgress = 0.01
+            if managedModelInstances.isEmpty { phase = .launching }
+        case "distributed_init":
+            phaseProgress = 0.05
+            if managedModelInstances.isEmpty { phase = .distributedInit }
+        case "loading_model":
+            phaseProgress = readiness.progress ?? 0.1
+            if managedModelInstances.isEmpty { phase = .loadingModel }
+        case "compiling":
+            phaseProgress = readiness.progress ?? 0.96
+            if managedModelInstances.isEmpty { phase = .compiling }
         // Readiness means the weights are resident, but Tokenity still runs a
         // real inference probe before exposing the model as loaded.
-        case "ready": phaseProgress = 0.98
+        case "ready":
+            phaseProgress = 0.98
+            if managedModelInstances.isEmpty { phase = .firstTokenPending }
         default: phaseProgress = readiness.progress
         }
         if let phaseProgress {
@@ -4153,7 +4602,9 @@ final class TokenityStore: ObservableObject {
     }
 
     private func videoControlBaseURL() -> URL? {
-        let endpoint = h3CoordinatorAgentURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let endpoint = videoNodes.first?.agentURL
+            ?? videoEndpoints.first?.agentURL
+            ?? h3CoordinatorAgentURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: endpoint),
               let scheme = url.scheme?.lowercased(),
               ["http", "https"].contains(scheme),
@@ -4266,6 +4717,48 @@ final class TokenityStore: ObservableObject {
             return bridgedMessage
         }
         return "The cluster service is not reachable."
+    }
+
+    private func userFacingVideoMessage(_ detail: String) -> String {
+        let normalized = detail.lowercased()
+        if normalized.contains("binary") || normalized.contains("mlx-serve") {
+            return "Video runtime missing. Install or repair Tokenity components, then scan again."
+        }
+        if normalized.contains("model directory")
+            || normalized.contains("checkpoint")
+            || normalized.contains("config.json") {
+            return "Video model not found or incomplete. Choose the MiniMax H3 model folder, then scan again."
+        }
+        if normalized.contains("protocol")
+            || normalized.contains("code revision")
+            || normalized.contains("runtime fingerprint") {
+            return "Tokenity components need an update. Install or repair them on each selected Mac."
+        }
+        if normalized.contains("rdma") || normalized.contains("high-speed") {
+            return "High-speed connection unavailable. Check the cable and both Macs, or use one Mac."
+        }
+        if normalized.contains("rank")
+            || normalized.contains("traceback")
+            || normalized.contains("python") {
+            return "The video runtime was interrupted. Retry, or install or repair Tokenity components."
+        }
+        return detail
+    }
+
+    private func videoReadinessIssue(for message: String) -> VideoReadinessIssue {
+        if message.hasPrefix("Video model not found") {
+            return .init(state: .modelNotFound, message: message, action: .chooseFolder)
+        }
+        if message.hasPrefix("Video runtime missing") {
+            return .init(state: .runtimeMissing, message: message, action: .installOrRepair)
+        }
+        if message.hasPrefix("Tokenity components") {
+            return .init(state: .componentsNeedUpdate, message: message, action: .installOrRepair)
+        }
+        if message.hasPrefix("High-speed connection unavailable") {
+            return .init(state: .highSpeedConnectionUnavailable, message: message, action: .useOneMac)
+        }
+        return .init(state: .runtimeInterrupted, message: message, action: .retry)
     }
 
     private func isExplicitStreamTransportFailure(_ error: Error) -> Bool {

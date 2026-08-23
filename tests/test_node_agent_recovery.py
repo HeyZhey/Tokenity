@@ -373,13 +373,21 @@ def test_unadoptable_but_fenced_process_is_cleaned_without_touching_siblings(
     monkeypatch.setattr(agent_module.os, "getpgid", lambda pid: pid)
     monkeypatch.setattr(agent_module.os, "killpg", fake_killpg)
 
-    with TestClient(create_app(instance_state_store=store)) as client:
+    supervisor = RoleSupervisor(log_dir=tmp_path / "logs")
+    monkeypatch.setattr(
+        supervisor,
+        "cleanup_orphaned_model_processes",
+        lambda: [{"pid": 4321, "state": "orphaned", "reason": "unjournaled"}],
+    )
+
+    with TestClient(create_app(supervisor=supervisor, instance_state_store=store)) as client:
         status = client.get("/v1/node/status").json()
         health = client.get("/v1/node/health").json()
 
     orphan = status["orphaned_processes"][0]
     assert orphan["state"] == "cleaned"
     assert orphan["cleanup_required"] is False
+    assert len(status["orphaned_processes"]) == 1
     assert signals == [(4321, 15)]
     assert store.records() == []
     assert health["status"] == "healthy"

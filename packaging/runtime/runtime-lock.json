@@ -7,6 +7,11 @@
   "minimum_macos": "26.2",
   "python_version": "3.12.13",
   "backend_name": "mlx-lm-mac-arm64-apple-metal-advsimd-0.31.3",
+  "native_h3": {
+    "runtime_id": "mlx-serve-h3-protocol-1",
+    "binary": "current/bin/mlx-serve",
+    "distributed_protocol": 1
+  },
   "packages": {
     "fastapi": "0.139.0",
     "mlx": "0.32.0",

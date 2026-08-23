@@ -80,13 +80,30 @@ struct TokenityRuntimeBootstrapService {
     let session: URLSession
     let cachesDirectory: URL
     let installedPythonPath: String
+    let localServiceIsHealthy: @Sendable () async -> Bool
 
     init(
         bundle: Bundle = .main,
         fileManager: FileManager = .default,
         session: URLSession = .shared,
         cachesDirectory: URL? = nil,
-        installedPythonPath: String = TokenityDeploymentConfiguration.runtimePythonPath
+        installedPythonPath: String = TokenityDeploymentConfiguration.runtimePythonPath,
+        localServiceIsHealthy: @escaping @Sendable () async -> Bool = {
+            guard let url = URL(string: "http://127.0.0.1:9100/v1/node/health") else {
+                return false
+            }
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 2
+            do {
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard (response as? HTTPURLResponse)?.statusCode == 200,
+                      let payload = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+                else { return false }
+                return payload["status"] as? String == "healthy"
+            } catch {
+                return false
+            }
+        }
     ) {
         self.bundle = bundle
         self.fileManager = fileManager
@@ -94,10 +111,104 @@ struct TokenityRuntimeBootstrapService {
         self.cachesDirectory = cachesDirectory
             ?? fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first!
         self.installedPythonPath = installedPythonPath
+        self.localServiceIsHealthy = localServiceIsHealthy
     }
 
     var isRuntimeInstalled: Bool {
         fileManager.isExecutableFile(atPath: installedPythonPath)
+            && fileManager.isReadableFile(atPath: installedRuntimeManifestURL.path)
+            && fileManager.isExecutableFile(atPath: installedH3BinaryURL.path)
+    }
+
+    var installedRuntimeRootURL: URL {
+        URL(fileURLWithPath: installedPythonPath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    }
+
+    var installedRuntimeManifestURL: URL {
+        installedRuntimeRootURL.appendingPathComponent("runtime-manifest.json")
+    }
+
+    var installedH3BinaryURL: URL {
+        installedRuntimeRootURL.appendingPathComponent("current/bin/mlx-serve")
+    }
+
+    func installedComponentIssues(catalog: TokenityRuntimeCatalog) async -> [String] {
+        let python = installedPythonPath
+        let manifest = installedRuntimeManifestURL.path
+        let binary = installedH3BinaryURL.path
+        guard fileManager.isExecutableFile(atPath: python),
+              fileManager.isReadableFile(atPath: manifest),
+              fileManager.isExecutableFile(atPath: binary)
+        else {
+            return ["Python/MLX, the Runtime manifest, or the MiniMax H3 runtime is missing."]
+        }
+        let expected = catalog.packages
+        var issues = await Task.detached(priority: .utility) {
+            var issues: [String] = []
+            let pythonCheck = Process()
+            pythonCheck.executableURL = URL(fileURLWithPath: python)
+            pythonCheck.environment = ProcessInfo.processInfo.environment.merging([
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONNOUSERSITE": "1",
+            ]) { _, releaseValue in releaseValue }
+            pythonCheck.arguments = [
+                "-c",
+                "import json; from importlib.metadata import version; "
+                    + "print(json.dumps({n: version(n) for n in "
+                    + String(describing: Array(expected.keys).sorted()) + "}))",
+            ]
+            let output = Pipe()
+            pythonCheck.standardOutput = output
+            pythonCheck.standardError = Pipe()
+            do {
+                try pythonCheck.run()
+                pythonCheck.waitUntilExit()
+                let data = output.fileHandleForReading.readDataToEndOfFile()
+                let observed = try JSONDecoder().decode([String: String].self, from: data)
+                if pythonCheck.terminationStatus != 0 || observed != expected {
+                    issues.append("The installed Python/MLX versions do not match this Tokenity release.")
+                }
+            } catch {
+                issues.append("The installed Python/MLX runtime could not be verified.")
+            }
+
+            let h3Check = Process()
+            h3Check.executableURL = URL(fileURLWithPath: binary)
+            h3Check.arguments = ["--help"]
+            let h3Output = Pipe()
+            h3Check.standardOutput = h3Output
+            h3Check.standardError = h3Output
+            do {
+                try h3Check.run()
+                h3Check.waitUntilExit()
+                let help = String(
+                    data: h3Output.fileHandleForReading.readDataToEndOfFile(),
+                    encoding: .utf8
+                ) ?? ""
+                let markers = [
+                    "--h3-distributed-rank",
+                    "--h3-distributed-world-size",
+                    "--h3-distributed-protocol",
+                ]
+                if h3Check.terminationStatus != 0 || !markers.allSatisfy(help.contains) {
+                    issues.append("The installed MiniMax H3 runtime does not support this Tokenity release.")
+                }
+            } catch {
+                issues.append("The installed MiniMax H3 runtime could not be verified.")
+            }
+            return issues
+        }.value
+        let serviceHealthy = await localServiceIsHealthy()
+        if !serviceHealthy {
+            issues.append(
+                "The Tokenity background service is not running. Install or repair Tokenity components."
+            )
+        }
+        return issues
     }
 
     func loadCatalog() throws -> TokenityRuntimeCatalog {
@@ -317,6 +428,7 @@ final class TokenityRuntimeBootstrapModel: ObservableObject {
         case downloadAvailable
         case downloading
         case waitingForInstaller
+        case repairNeeded(String)
         case failed(String)
     }
 
@@ -338,6 +450,7 @@ final class TokenityRuntimeBootstrapModel: ObservableObject {
         case .downloadAvailable: return "Runtime available to download"
         case .downloading: return "Downloading and verifying Runtime"
         case .waitingForInstaller: return "Continue in Installer"
+        case .repairNeeded: return "Tokenity components need repair"
         case .failed: return "Runtime setup needs attention"
         }
     }
@@ -364,6 +477,8 @@ final class TokenityRuntimeBootstrapModel: ObservableObject {
             return "The package is accepted only when its size and SHA-256 match the catalog."
         case .waitingForInstaller:
             return "Installer.app will request administrator approval. Repeat this on every inference Mac."
+        case let .repairNeeded(message):
+            return message
         case let .failed(message):
             return message
         }
@@ -377,6 +492,8 @@ final class TokenityRuntimeBootstrapModel: ObservableObject {
             return "Download Runtime Installer"
         case .installed:
             return "Reinstall Runtime"
+        case .repairNeeded:
+            return "Install or Repair"
         case .failed:
             return "Retry"
         case .checking, .downloading, .waitingForInstaller:
@@ -392,6 +509,7 @@ final class TokenityRuntimeBootstrapModel: ObservableObject {
         if case .failed = state {
             return true
         }
+        if case .repairNeeded = state { return true }
         return false
     }
 
@@ -405,7 +523,10 @@ final class TokenityRuntimeBootstrapModel: ObservableObject {
                 catalog: loadedCatalog
             )
             if service.isRuntimeInstalled {
-                state = .installed
+                let issues = await service.installedComponentIssues(catalog: loadedCatalog)
+                state = issues.isEmpty
+                    ? .installed
+                    : .repairNeeded(issues.joined(separator: " "))
             } else if localArtifact != nil {
                 state = .bundled
             } else {

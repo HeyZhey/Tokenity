@@ -211,7 +211,7 @@ private struct ChatWorkspaceHeader: View {
         }
         if store.isChatRunning { return "Generating" }
         if store.isChatReady { return "Ready" }
-        if store.phase == .running { return "Load a model" }
+        if store.isClusterConfigured { return "Load a model" }
         return "Cluster stopped"
     }
 
@@ -559,7 +559,7 @@ private struct ChatEmptyState: View {
         if store.isChatReady {
             return "Ask a question, paste code, or request a structured Markdown answer."
         }
-        if store.phase == .running {
+        if store.isClusterConfigured {
             return "Load a model from Models, then return here to begin a conversation."
         }
         return "Create a cluster and load a model. Your conversation history will remain available here."

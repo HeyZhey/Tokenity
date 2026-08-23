@@ -7,6 +7,37 @@ import XCTest
 @testable import TokenityControl
 
 final class VideoGenerationContractTests: XCTestCase {
+    func testHistoryRestoresCompletedArtifactsAndMarksPartialOrCorruptRunsInterrupted() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TokenityVideoHistory-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let completedID = UUID()
+        let completed = root.appendingPathComponent(completedID.uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: completed, withIntermediateDirectories: true)
+        try Data([0]).write(to: completed.appendingPathComponent("generation.mov"))
+        try Data([1, 2, 3]).write(to: completed.appendingPathComponent("video.rgb"))
+        try Data(#"{"prompt":"test","seed":42,"steps":28,"fast":false,"frames":24,"width":512,"height":256,"fps":24,"has_muxed_audio":false}"#.utf8)
+            .write(to: completed.appendingPathComponent("metadata.json"))
+
+        for corruptMetadata in [false, true] {
+            let interrupted = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: interrupted, withIntermediateDirectories: true)
+            try Data([1, 2, 3]).write(to: interrupted.appendingPathComponent("video.rgb"))
+            if corruptMetadata {
+                try Data("not-json".utf8).write(to: interrupted.appendingPathComponent("metadata.json"))
+                try Data([0]).write(to: interrupted.appendingPathComponent("generation.mov"))
+            }
+        }
+
+        let history = H3VideoArtifactWriter.loadHistory(rootDirectory: root)
+
+        XCTAssertEqual(history.completed.map(\.id), [completedID])
+        XCTAssertEqual(history.completed.first?.durationSeconds, 1)
+        XCTAssertEqual(history.interruptedCount, 2)
+    }
+
     func testVideoWorkspaceIsAFirstClassClusterSection() {
         XCTAssertTrue(AppSection.allCases.contains(.video))
         XCTAssertEqual(AppSection.video.title, "Video")
@@ -199,6 +230,30 @@ final class VideoGenerationContractTests: XCTestCase {
     }
 
     @MainActor
+    func testVideoUsesTheSelectedClusterMacsWhenNoLegacyWorkerOverrideExists() async {
+        let store = TokenityStore(dataTransport: { request in
+            let response = HTTPURLResponse(
+                url: request.url ?? URL(string: "http://localhost")!,
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            return (Data(TokenityTestFixtures.modernNodeInfoPayload(for: request).utf8), response)
+        })
+        TokenityTestFixtures.bindLoopbackWorkers(on: store)
+        for index in store.nodes.indices where store.selectedNodeIDs.contains(store.nodes[index].id) {
+            store.nodes[index].isOnline = true
+        }
+
+        await store.refreshVideoNodes()
+
+        XCTAssertEqual(
+            store.videoNodes.map(\.agentURL),
+            ["http://127.0.0.1:9100", "http://198.51.100.75:9200"]
+        )
+    }
+
+    @MainActor
     func testH3WorkerLoopbackIsNeverAcceptedAsMacB() async throws {
         let store = TokenityStore(dataTransport: { request in
             let response = try XCTUnwrap(
@@ -217,7 +272,9 @@ final class VideoGenerationContractTests: XCTestCase {
 
         let worker = try XCTUnwrap(store.videoNodes.first { $0.id == "h3-mac-b" })
         XCTAssertFalse(worker.isOnline)
-        XCTAssertTrue(store.videoRuntimeReadinessIssues.contains { $0.contains("offline") })
+        XCTAssertTrue(store.videoReadiness.contains {
+            $0.state == .secondMacUnavailable && $0.action == .useOneMac
+        })
     }
 
     @MainActor
@@ -239,13 +296,60 @@ final class VideoGenerationContractTests: XCTestCase {
 
         await store.refreshVideoNodes()
 
-        XCTAssertTrue(store.videoRuntimeReadinessIssues.contains { $0.contains("two different Macs") })
+        XCTAssertTrue(store.videoReadiness.contains {
+            $0.state == .componentsNeedUpdate && $0.action == .installOrRepair
+        })
+    }
+
+    @MainActor
+    func testH3DryRunBlocksAnIncompleteModelBeforeStart() async throws {
+        var sawDryRun = false
+        let store = TokenityStore(dataTransport: { request in
+            let path = request.url?.path ?? ""
+            let status: Int
+            let payload: String
+            switch path {
+            case "/v1/node/info":
+                status = 200
+                payload = Self.h3NodeInfoPayload(for: request)
+            case "/v1/node/start-minimax-h3-video":
+                let body = try XCTUnwrap(request.httpBody)
+                let object = try XCTUnwrap(
+                    JSONSerialization.jsonObject(with: body) as? [String: Any]
+                )
+                sawDryRun = object["dry_run"] as? Bool == true
+                status = 412
+                payload = #"{"detail":{"stage":"minimax_h3_preflight","issues":["Model directory is incomplete: config.json is missing."]}}"#
+            default:
+                status = 200
+                payload = #"{}"#
+            }
+            let response = try XCTUnwrap(
+                HTTPURLResponse(
+                    url: request.url ?? URL(string: "http://localhost")!,
+                    statusCode: status,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )
+            )
+            return (Data(payload.utf8), response)
+        })
+        store.h3WorkerAgentURL = "http://198.51.100.75:9200"
+
+        await store.refreshVideoNodes(validateRuntime: true)
+
+        XCTAssertTrue(sawDryRun)
+        XCTAssertTrue(store.videoReadiness.contains {
+            $0.state == .modelNotFound && $0.action == .chooseFolder
+        })
+        let videoModel = try XCTUnwrap(store.modelLibraryRows.first { $0.id == "MiniMax-H3" })
+        XCTAssertFalse(store.canLoadModel(videoModel))
     }
 
     @MainActor
     func testStoppingAnInFlightVideoLoadReleasesTheLoadFenceForRetry() async throws {
-        let firstStart = expectation(description: "first H3 start began")
-        let secondStart = expectation(description: "second H3 start began")
+        let firstPreflight = expectation(description: "first H3 preflight began")
+        let retryStart = expectation(description: "retry H3 start began")
         var startCount = 0
         let store = TokenityStore(dataTransport: { request in
             let path = request.url?.path ?? ""
@@ -255,11 +359,18 @@ final class VideoGenerationContractTests: XCTestCase {
                 payload = Self.h3NodeInfoPayload(for: request)
             case "/v1/node/start-minimax-h3-video":
                 startCount += 1
-                if startCount == 1 {
-                    firstStart.fulfill()
-                    try await Task.sleep(for: .seconds(30))
+                let object: [String: Any]?
+                if let body = request.httpBody {
+                    object = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
                 } else {
-                    secondStart.fulfill()
+                    object = nil
+                }
+                let isDryRun = object?["dry_run"] as? Bool == true
+                if startCount == 1, isDryRun {
+                    firstPreflight.fulfill()
+                    try await Task.sleep(for: .seconds(30))
+                } else if !isDryRun {
+                    retryStart.fulfill()
                 }
                 payload = #"{"instance_id":"h3-retry-runtime","operation_id":"h3-retry-operation","api_base_url":"http://127.0.0.1:11242/v1"}"#
             default:
@@ -281,15 +392,69 @@ final class VideoGenerationContractTests: XCTestCase {
         )
 
         store.beginLoadingModel(videoModel)
-        await fulfillment(of: [firstStart], timeout: 2)
+        await fulfillment(of: [firstPreflight], timeout: 2)
+        XCTAssertEqual(store.videoRuntimeLoadProgress, 0.15)
         await store.stopModel(videoModel)
+        XCTAssertNil(store.videoRuntimeLoadProgress)
         store.beginLoadingModel(videoModel)
-        await fulfillment(of: [secondStart], timeout: 2)
+        await fulfillment(of: [retryStart], timeout: 2)
         try? await Task.sleep(for: .milliseconds(50))
 
-        XCTAssertEqual(startCount, 2)
+        XCTAssertEqual(startCount, 3)
         XCTAssertEqual(store.videoRuntimeState, .ready)
+        XCTAssertEqual(store.videoRuntimeLoadProgress, 1)
         await store.stopModel(videoModel)
+        XCTAssertNil(store.videoRuntimeLoadProgress)
+    }
+
+    @MainActor
+    func testStatusRefreshCannotRegressStoppingH3ToStarting() async throws {
+        let stopRequestStarted = expectation(description: "H3 stop request started")
+        var stopIsInFlight = false
+        let store = TokenityStore(dataTransport: { request in
+            let path = request.url?.path ?? ""
+            let payload: String
+            switch path {
+            case "/v1/node/info":
+                let base = Self.h3NodeInfoPayload(for: request)
+                payload = stopIsInFlight
+                    ? base.replacingOccurrences(
+                        of: #""instances":[]"#,
+                        with: #""instances":[{"instance_id":"h3-stop-runtime","requested_model_id":"MiniMax-H3","state":"starting"}]"#
+                    )
+                    : base
+            case "/v1/node/start-minimax-h3-video":
+                payload = #"{"instance_id":"h3-stop-runtime","operation_id":"h3-stop-operation","api_base_url":"http://127.0.0.1:11242/v1"}"#
+            case "/v1/node/instances/h3-stop-runtime/stop":
+                stopIsInFlight = true
+                stopRequestStarted.fulfill()
+                try await Task.sleep(for: .seconds(1))
+                payload = #"{}"#
+            default:
+                payload = #"{}"#
+            }
+            let response = try XCTUnwrap(
+                HTTPURLResponse(
+                    url: request.url ?? URL(string: "http://localhost")!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )
+            )
+            return (Data(payload.utf8), response)
+        })
+        store.h3WorkerAgentURL = "http://198.51.100.75:9200"
+
+        await store.startVideoRuntime()
+        XCTAssertEqual(store.videoRuntimeState, .ready)
+
+        let stopTask = Task { await store.stopVideoRuntime() }
+        await fulfillment(of: [stopRequestStarted], timeout: 2)
+        await store.refreshVideoNodes()
+
+        XCTAssertEqual(store.videoRuntimeState, .stopping)
+        await stopTask.value
+        XCTAssertEqual(store.videoRuntimeState, .stopped)
     }
 
     @MainActor
@@ -523,11 +688,13 @@ final class VideoGenerationContractTests: XCTestCase {
         guard case .failed(let message) = store.videoRuntimeState else {
             return XCTFail("Expected a failed H3 runtime")
         }
-        XCTAssertTrue(message.contains("minimax h3 preflight"))
-        XCTAssertTrue(message.contains("rank shard mismatch"))
-        XCTAssertTrue(message.contains("Redeploy matching shards"))
+        XCTAssertEqual(
+            message,
+            "The video runtime was interrupted. Retry, or install or repair Tokenity components."
+        )
         XCTAssertFalse(message.contains("Internal Server Error"))
         XCTAssertNil(store.videoRuntimeInstanceID)
+        XCTAssertFalse(store.canStopVideoRuntime)
     }
 
     private static func h3NodeInfoPayload(for request: URLRequest) -> String {

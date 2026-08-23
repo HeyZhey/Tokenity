@@ -7,7 +7,7 @@ struct VideoGenerationPage: View {
     @EnvironmentObject private var store: TokenityStore
     @Environment(\.tokenityTheme) private var theme
     @State private var player: AVPlayer?
-    @State private var showsRuntimeConfiguration = false
+    @StateObject private var runtimeBootstrap = TokenityRuntimeBootstrapModel()
 
     var body: some View {
         PageScaffold(title: "Video") {
@@ -16,7 +16,8 @@ struct VideoGenerationPage: View {
             outputSection
         }
         .task {
-            await store.refreshVideoNodes()
+            await store.refreshVideoNodes(validateRuntime: true)
+            await runtimeBootstrap.refresh()
             configurePlayer(for: store.generatedVideoArtifact)
         }
         .onChange(of: store.generatedVideoArtifact) { _, artifact in
@@ -39,26 +40,14 @@ struct VideoGenerationPage: View {
                 }
             }
 
-            ForEach(Array(store.videoNodes.enumerated()), id: \.element.id) { rank, node in
-                InfoRow(label: "Rank \(rank)") {
+            ForEach(Array(store.videoNodes.enumerated()), id: \.element.id) { index, node in
+                InfoRow(label: "Mac \(index + 1)") {
                     HStack(spacing: 9) {
                         StatusPill(text: node.isOnline ? "online" : "offline", tone: node.isOnline ? .good : .danger)
                         Text(node.displayName)
-                        Text(node.agentURL)
-                            .font(.tokenityMono(10))
-                            .foregroundStyle(theme.tertiaryText)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
                         Spacer(minLength: 0)
-                        if rank == 0 {
-                            Text("API · media decode")
-                                .foregroundStyle(theme.secondaryText)
-                        } else {
-                            Text("DiT worker")
-                                .foregroundStyle(theme.secondaryText)
-                        }
                         StatusPill(
-                            text: node.rdma.rdmaEnabled ? "RDMA" : "LAN",
+                            text: node.rdma.rdmaEnabled ? "High-speed" : "Standard network",
                             tone: node.rdma.rdmaEnabled ? .accent : .warning
                         )
                     }
@@ -73,13 +62,20 @@ struct VideoGenerationPage: View {
                 }
             }
 
-            if !store.videoRuntimeReadinessIssues.isEmpty,
+            if !store.videoReadiness.isEmpty,
                store.videoRuntimeState != .ready {
                 InfoRow(label: "Readiness") {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(store.videoRuntimeReadinessIssues, id: \.self) { issue in
-                            Label(issue, systemImage: "exclamationmark.triangle")
-                                .foregroundStyle(theme.warning)
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(store.videoReadiness) { issue in
+                            HStack(spacing: 10) {
+                                Label(issue.message, systemImage: "exclamationmark.triangle")
+                                    .foregroundStyle(theme.warning)
+                                Spacer(minLength: 8)
+                                Button(issue.action.rawValue) {
+                                    perform(issue.action)
+                                }
+                                .controlSize(.small)
+                            }
                         }
                     }
                 }
@@ -98,7 +94,8 @@ struct VideoGenerationPage: View {
                         store.videoRuntimeState == .starting
                             || store.videoRuntimeState == .stopping
                             || store.isVideoRuntimeReady
-                            || !store.videoRuntimeReadinessIssues.isEmpty
+                            || store.isVideoPreflightRunning
+                            || !store.videoReadiness.isEmpty
                     )
 
                     Button(role: .destructive) {
@@ -106,10 +103,10 @@ struct VideoGenerationPage: View {
                     } label: {
                         Label("Stop", systemImage: "stop.fill")
                     }
-                    .disabled(store.videoRuntimeState == .stopped || store.videoRuntimeState == .stopping)
+                    .disabled(!store.canStopVideoRuntime || store.videoRuntimeState == .stopping)
 
                     Button {
-                        Task { await store.refreshVideoNodes() }
+                        Task { await store.refreshVideoNodes(validateRuntime: true) }
                     } label: {
                         Label("Refresh", systemImage: "arrow.clockwise")
                     }
@@ -118,47 +115,12 @@ struct VideoGenerationPage: View {
                 }
             }
 
-            InfoRow(label: "Configuration") {
-                DisclosureGroup(isExpanded: $showsRuntimeConfiguration) {
-                    VStack(alignment: .leading, spacing: 12) {
-                        LabeledContent("Coordinator Agent") {
-                            TextField("Coordinator Node Agent URL", text: $store.h3CoordinatorAgentURL)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(minWidth: 420)
-                        }
-                        LabeledContent("Worker Agent") {
-                            TextField("Worker Node Agent URL", text: $store.h3WorkerAgentURL)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(minWidth: 420)
-                        }
-                        LabeledContent("Model path") {
-                            TextField("MiniMax H3 model path", text: $store.h3ModelPath)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(minWidth: 420)
-                        }
-                        LabeledContent("Native binary") {
-                            TextField("mlx-serve path", text: $store.h3BinaryPath)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(minWidth: 420)
-                        }
-                        LabeledContent("Optimization profile") {
-                            Picker("Optimization profile", selection: $store.h3OptimizationProfile) {
-                                ForEach(H3OptimizationProfile.allCases) { profile in
-                                    Text(profile.title).tag(profile)
-                                }
-                            }
-                            .labelsHidden()
-                            .frame(width: 250)
-                        }
-                        Text(store.h3OptimizationProfile.detail)
-                            .font(.tokenityText(11))
-                            .foregroundStyle(theme.secondaryText)
-                    }
-                    .disabled(store.videoRuntimeState == .starting || store.isVideoRuntimeReady)
-                    .padding(.top, 12)
-                } label: {
-                    Text("H3 Agent endpoints, paths and validated kernel profile")
-                        .foregroundStyle(theme.secondaryText)
+            InfoRow(label: "Video model") {
+                HStack(spacing: 10) {
+                    Text(URL(fileURLWithPath: store.h3ModelPath).lastPathComponent)
+                    Spacer()
+                    Button("Choose Folder") { chooseVideoModelFolder() }
+                        .disabled(store.videoRuntimeState == .starting || store.isVideoRuntimeReady)
                 }
             }
         }
@@ -265,6 +227,12 @@ struct VideoGenerationPage: View {
 
     private var outputSection: some View {
         InfoGroup(title: "Output") {
+            if store.interruptedVideoCount > 0 {
+                InfoRow(label: "Previous task") {
+                    Label("A video task was interrupted when Tokenity closed. Start it again when ready.", systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(theme.warning)
+                }
+            }
             if let artifact = store.generatedVideoArtifact {
                 InfoRow(label: "Preview") {
                     TokenityVideoPlayer(player: player)
@@ -305,6 +273,22 @@ struct VideoGenerationPage: View {
                             .textSelection(.enabled)
                     }
                 }
+                if !store.recentVideoArtifacts.isEmpty {
+                    InfoRow(label: "Recent results") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(store.recentVideoArtifacts.prefix(5)) { recent in
+                                HStack {
+                                    Text("\(recent.width)×\(recent.height) · \(recent.frames) frames")
+                                    Spacer()
+                                    Button("Open") { NSWorkspace.shared.open(recent.movieURL) }
+                                    Button("Show in Finder") {
+                                        NSWorkspace.shared.activateFileViewerSelecting([recent.movieURL])
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             } else {
                 InfoRow(label: "Preview") {
                     VStack(spacing: 10) {
@@ -340,6 +324,35 @@ struct VideoGenerationPage: View {
             return
         }
         player = AVPlayer(url: artifact.movieURL)
+    }
+
+    private func perform(_ action: VideoRecoveryAction) {
+        switch action {
+        case .installOrRepair:
+            runtimeBootstrap.performPrimaryAction()
+        case .chooseFolder:
+            chooseVideoModelFolder()
+        case .scanAgain:
+            Task { await store.refreshVideoNodes(validateRuntime: true) }
+        case .retry:
+            Task { await store.refreshVideoNodes(validateRuntime: true) }
+        case .useOneMac:
+            store.useOneMacForVideo()
+            Task { await store.refreshVideoNodes(validateRuntime: true) }
+        case .openNodeDetails:
+            store.selectedSection = .network
+        }
+    }
+
+    private func chooseVideoModelFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose Model Folder"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        store.h3ModelPath = url.path
+        Task { await store.refreshVideoNodes(validateRuntime: true) }
     }
 
     private func numericField(

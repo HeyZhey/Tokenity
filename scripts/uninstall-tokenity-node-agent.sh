@@ -8,6 +8,8 @@ fi
 
 AGENT_PLIST="/Library/LaunchDaemons/ai.tokenity.node-agent.plist"
 WATCHDOG_PLIST="/Library/LaunchDaemons/ai.tokenity.node-agent-watchdog.plist"
+TB_PLIST="/Library/LaunchDaemons/ai.tokenity.thunderbolt-keepalive.plist"
+TB_SCRIPT="/usr/local/bin/tokenity-tb-keepalive"
 AGENT_URL="http://127.0.0.1:9100"
 plist_value() {
   /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$1" "$AGENT_PLIST" 2>/dev/null || true
@@ -26,6 +28,7 @@ MAINTENANCE_PATH="$STATE_ROOT/maintenance.json"
 /usr/bin/printf '{"until":%s,"reason":"uninstall"}\n' \
   "$(( $(/bin/date +%s) + 600 ))" > "$MAINTENANCE_PATH"
 /bin/launchctl bootout system "$WATCHDOG_PLIST" 2>/dev/null || true
+/bin/launchctl bootout system "$TB_PLIST" 2>/dev/null || true
 
 if /usr/bin/curl --noproxy '*' --silent --fail --max-time 3 \
   "$AGENT_URL/v1/node/health" >/dev/null; then
@@ -45,23 +48,26 @@ if /usr/bin/pgrep -f 'tokenity distributed-openai serve' >/dev/null 2>&1; then
 fi
 
 /bin/launchctl bootout system "$AGENT_PLIST" 2>/dev/null || true
-/bin/rm -f "$WATCHDOG_PLIST" "$AGENT_PLIST"
+/bin/rm -f "$WATCHDOG_PLIST" "$AGENT_PLIST" "$TB_PLIST" "$TB_SCRIPT"
 /bin/rm -f \
   "$STATE_ROOT/node-agent-watchdog.json" \
   "$STATE_ROOT/maintenance.json" \
-  "$STATE_ROOT/node-agent-watchdog.lock"
+  "$STATE_ROOT/node-agent-watchdog.lock" \
+  "$STATE_ROOT/rdma-reset-request"
 /bin/rm -f \
   "$LOG_ROOT/node-agent-watchdog.stdout.log" \
   "$LOG_ROOT/node-agent-watchdog.stderr.log"
 
 while IFS= read -r home_directory; do
-  legacy_plist="$home_directory/Library/LaunchAgents/local.tokenity.node-agent.plist"
-  [[ -f "$legacy_plist" ]] || continue
-  legacy_uid="$(/usr/bin/stat -f '%u' "$legacy_plist" 2>/dev/null || true)"
-  if [[ -n "$legacy_uid" ]]; then
-    /bin/launchctl bootout "gui/$legacy_uid/local.tokenity.node-agent" 2>/dev/null || true
-  fi
-  /bin/rm -f "$legacy_plist"
+  for legacy_label in local.tokenity.node-agent dev.tokenity.dns-sd; do
+    legacy_plist="$home_directory/Library/LaunchAgents/$legacy_label.plist"
+    [[ -f "$legacy_plist" ]] || continue
+    legacy_uid="$(/usr/bin/stat -f '%u' "$legacy_plist" 2>/dev/null || true)"
+    if [[ -n "$legacy_uid" ]]; then
+      /bin/launchctl bootout "gui/$legacy_uid/$legacy_label" 2>/dev/null || true
+    fi
+    /bin/rm -f "$legacy_plist"
+  done
 done < <(/usr/bin/dscacheutil -q user | /usr/bin/awk '/^dir: / {sub(/^dir: /, ""); print}')
 
-echo "Removed the Tokenity Node Agent and watchdog jobs. Model files in ${MODEL_ROOT:-$INSTALL_ROOT/Models} were preserved."
+echo "Removed the Tokenity Node Agent, watchdog, and Thunderbolt keepalive jobs. Model files in ${MODEL_ROOT:-$INSTALL_ROOT/Models} were preserved."

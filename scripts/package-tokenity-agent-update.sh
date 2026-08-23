@@ -45,6 +45,8 @@ EXPECTED_REVISION="$(
     /bin/cat "$ROOT/tokenity/node_agent/agent.py"
     /usr/bin/printf '%s' "distributed_openai.py"
     /bin/cat "$ROOT/tokenity/serving/distributed_openai.py"
+    /usr/bin/printf '%s' "minimax_h3_video.py"
+    /bin/cat "$ROOT/tokenity/serving/minimax_h3_video.py"
   } | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}'
 )"
 
@@ -84,6 +86,8 @@ EXPECTED_REVISION="$(
     <string>$RUNTIME_ROOT/current/.venv/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>PYTHONPATH</key>
     <string>$CODE_ROOT</string>
+    <key>PYTHONDONTWRITEBYTECODE</key>
+    <string>1</string>
     <key>TOKENITY_DATA_ROOT</key>
     <string>$INSTALL_ROOT</string>
     <key>TOKENITY_STATE_ROOT</key>
@@ -121,17 +125,18 @@ MAINTENANCE_PATH="$STATE_ROOT/maintenance.json"
 AGENT_URL="http://127.0.0.1:9100"
 
 remove_legacy_user_agents() {
-  local home_directory legacy_plist legacy_uid
+  local home_directory legacy_plist legacy_uid legacy_label
   while IFS= read -r home_directory; do
-    legacy_plist="$home_directory/Library/LaunchAgents/local.tokenity.node-agent.plist"
-    [[ -f "$legacy_plist" ]] || continue
-    legacy_uid="$(/usr/bin/stat -f '%u' "$legacy_plist" 2>/dev/null || true)"
-    if [[ -n "$legacy_uid" ]]; then
-      /bin/launchctl bootout \
-        "gui/$legacy_uid/local.tokenity.node-agent" 2>/dev/null || \
-        /bin/launchctl bootout "gui/$legacy_uid" "$legacy_plist" 2>/dev/null || true
-    fi
-    /bin/rm -f "$legacy_plist"
+    for legacy_label in local.tokenity.node-agent dev.tokenity.dns-sd; do
+      legacy_plist="$home_directory/Library/LaunchAgents/$legacy_label.plist"
+      [[ -f "$legacy_plist" ]] || continue
+      legacy_uid="$(/usr/bin/stat -f '%u' "$legacy_plist" 2>/dev/null || true)"
+      if [[ -n "$legacy_uid" ]]; then
+        /bin/launchctl bootout "gui/$legacy_uid/$legacy_label" 2>/dev/null || \
+          /bin/launchctl bootout "gui/$legacy_uid" "$legacy_plist" 2>/dev/null || true
+      fi
+      /bin/rm -f "$legacy_plist"
+    done
   done < <(/usr/bin/dscacheutil -q user | /usr/bin/awk '/^dir: / {sub(/^dir: /, ""); print}')
 }
 
@@ -221,6 +226,7 @@ set_plist_environment() {
 /usr/bin/find "\$CODE_ROOT/tokenity" -type d -name __pycache__ -prune -exec /bin/rm -rf {} + 2>/dev/null || true
 /bin/mkdir -p "\$LOG_ROOT" "\$STATE_ROOT/instances"
 set_plist_environment PYTHONPATH "\$CODE_ROOT"
+set_plist_environment PYTHONDONTWRITEBYTECODE "1"
 set_plist_environment TOKENITY_DATA_ROOT "\$INSTALL_ROOT"
 set_plist_environment TOKENITY_CODE_ROOT "\$CODE_ROOT"
 set_plist_environment TOKENITY_MODEL_ROOT "\$MODEL_ROOT"

@@ -64,7 +64,7 @@ collective 使用所选择的数据面。产品不使用 SSH。当前真实硬�
 ## 运行要求
 
 - 位于同一可信网络的 Apple 芯片 Mac。
-- TokenityControl 开发需要 macOS 14+ 和 Swift 5.9+。
+- Tokenity App 开发需要 macOS 26.2+ 和 Swift 5.9+。
 - 后端开发需要 Python 3.10+。
 - 每台推理 Mac 上安装兼容的 MLX/MLX-LM Runtime。
 - 分布式工作负载使用的模型在所有参与节点上具有相同路径。

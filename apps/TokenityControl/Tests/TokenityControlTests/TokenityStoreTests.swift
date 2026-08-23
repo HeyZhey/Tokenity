@@ -3,6 +3,134 @@ import XCTest
 
 @MainActor
 final class TokenityStoreTests: XCTestCase {
+    func testAutomaticTopologyUsesSingleMacWithoutCollectivesAndStableMultiMacFallback() {
+        let store = TokenityStore()
+
+        XCTAssertEqual(store.effectiveBackendMode, .singleNode)
+        XCTAssertEqual(store.effectiveConnectionMode, .ring)
+
+        TokenityTestFixtures.bindLoopbackWorkers(on: store)
+        for index in store.nodes.indices where store.selectedNodeIDs.contains(store.nodes[index].id) {
+            store.nodes[index].isOnline = true
+            store.nodes[index].rdma.rdmaEnabled = true
+            store.nodes[index].rdma.thunderboltIP = "203.0.113.\(index + 1)"
+        }
+        XCTAssertEqual(store.effectiveBackendMode, .distributed)
+        XCTAssertEqual(store.effectiveConnectionMode, .jacclRing)
+
+        store.connectionMode = .ring
+        XCTAssertEqual(store.effectiveConnectionMode, .ring)
+
+        store.connectionMode = .jaccl
+        XCTAssertEqual(store.effectiveConnectionMode, .jacclRing)
+
+        let workerIndex = store.nodes.firstIndex { $0.id == "mac-b" }!
+        store.nodes[workerIndex].rdma.rdmaEnabled = false
+        XCTAssertEqual(store.effectiveConnectionMode, .ring)
+
+        store.nodes[workerIndex].rdma.rdmaEnabled = true
+        store.nodes[workerIndex].rdma.thunderboltIP = "169.254.10.2"
+        XCTAssertEqual(store.effectiveConnectionMode, .ring)
+        store.rebuildLaunchPreview()
+        XCTAssertTrue(store.launchPreview.readinessIssues.contains {
+            $0.contains("Thunderbolt RDMA is selected")
+        })
+    }
+
+    func testCreatingClusterSelectsMacsButNeverClaimsTheServerIsRunning() {
+        var requestCount = 0
+        let store = TokenityStore(dataTransport: { request in
+            requestCount += 1
+            return try await Self.successfulModelTransport(request)
+        })
+
+        store.createCluster()
+
+        XCTAssertEqual(store.phase, .readyToLoad)
+        XCTAssertEqual(store.serverHealth, .stopped)
+        XCTAssertNil(store.loadedModelName)
+        XCTAssertFalse(store.isChatReady)
+        XCTAssertEqual(requestCount, 0)
+    }
+
+    func testPreparedClusterCanBeClosedBeforeLoadingAModel() async {
+        let store = TokenityStore(dataTransport: Self.successfulModelTransport)
+
+        store.createCluster()
+        XCTAssertTrue(store.canStopCluster)
+
+        await store.stopCluster()
+
+        XCTAssertEqual(store.phase, .stopped)
+        XCTAssertFalse(store.canStopCluster)
+    }
+
+    func testModelScanFallsBackToAgentDefaultWhenConfiguredFolderIsEmpty() async throws {
+        var requestedRoots: [String?] = []
+        let store = TokenityStore(dataTransport: { request in
+            if request.url?.path == "/v1/node/models" {
+                let root = URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)?
+                    .queryItems?.first(where: { $0.name == "root" })?.value
+                requestedRoots.append(root)
+                let payload = root == nil
+                    ? #"{"root":"/agent/models","models":[{"id":"Qwen-test","path":"/agent/models/Qwen-test"}]}"#
+                    : #"{"root":"/missing","models":[]}"#
+                return Self.response(for: request, payload: payload)
+            }
+            return try await Self.successfulModelTransport(request)
+        })
+        store.modelRoot = "/missing"
+
+        await store.scanModels()
+
+        XCTAssertEqual(requestedRoots.count, 2)
+        XCTAssertEqual(requestedRoots[0], "/missing")
+        XCTAssertNil(requestedRoots[1])
+        XCTAssertEqual(store.modelRoot, "/agent/models")
+        XCTAssertTrue(store.modelLibraryRows.contains { $0.id == "Qwen-test" })
+    }
+
+    func testModelScanSummaryCountsUniqueLanguageModelsOnly() async {
+        let store = TokenityStore(dataTransport: { request in
+            if request.url?.path == "/v1/node/models" {
+                return Self.response(
+                    for: request,
+                    payload: #"{"root":"/models","models":[{"id":"Qwen","path":"/models/Qwen","model_type":"qwen3_5"},{"id":"MiniMax-H3","path":"/models/MiniMax-H3","model_type":"minimax_h3"}]}"#
+                )
+            }
+            return try await Self.successfulModelTransport(request)
+        })
+        TokenityTestFixtures.bindLoopbackWorkers(on: store)
+
+        await store.scanModels()
+
+        XCTAssertTrue(store.modelScanSummary.hasPrefix("1 text model(s) across 2 selected Mac(s)"))
+        XCTAssertEqual(
+            store.modelLibraryRows.filter { $0.modality == .language }.map(\.id),
+            ["Qwen"]
+        )
+    }
+
+    func testLegacyIdentityBlocksMultiMacLaunchUntilComponentsAreUpdated() {
+        let store = TokenityStore()
+        TokenityTestFixtures.bindLoopbackWorkers(on: store)
+        let workerIndex = store.nodes.firstIndex { $0.id == "mac-b" }!
+        store.nodes[workerIndex].machineID = nil
+
+        XCTAssertTrue(store.launchPreview.readinessIssues.contains {
+            $0.contains("components need an update")
+        })
+    }
+
+    func testIPAddressHostnameUsesOneSharedNonDuplicatingDisplayFormat() {
+        var node = TokenityNode.samples[0]
+        node.hostname = "192.0.2.10"
+        node.ips = ["192.0.2.10"]
+
+        XCTAssertEqual(node.displayName, "Mac at 192.0.2.10")
+        XCTAssertEqual(node.identityDetail, "")
+    }
+
     func testSectionsIncludeChatAndModelsInClusterGroup() {
         XCTAssertEqual(AppSection.chat.group, "Cluster")
         XCTAssertEqual(AppSection.models.group, "Cluster")
@@ -61,6 +189,7 @@ final class TokenityStoreTests: XCTestCase {
 
     func testNativeMTPRequiredBlocksKnownMissingWeightsAndAutoWarns() {
         let store = TokenityStore()
+        TokenityTestFixtures.bindLoopbackWorkers(on: store)
         for index in store.nodes.indices {
             for modelIndex in store.nodes[index].models.indices {
                 store.nodes[index].models[modelIndex].nativeMTP = NativeMTPCapability(
@@ -225,7 +354,7 @@ final class TokenityStoreTests: XCTestCase {
             await store.stopModel(first)
         }
         XCTAssertNil(store.loadedModelName)
-        XCTAssertEqual(store.phase, .running)
+        XCTAssertEqual(store.phase, .readyToLoad)
     }
 
     func testModelLoadOmitsOffForLegacyAgentAndAutoFallsBack() async throws {
@@ -250,7 +379,10 @@ final class TokenityStoreTests: XCTestCase {
             }
             return try await Self.successfulModelTransport(request)
         })
+        TokenityTestFixtures.bindLoopbackWorkers(on: store)
+        store.backendMode = .distributed
         store.connectionMode = .ring
+        store.nativeMTPMode = .off
         store.createCluster()
         let model = try XCTUnwrap(store.modelLibraryRows.first)
 
@@ -449,6 +581,8 @@ final class TokenityStoreTests: XCTestCase {
             }
             return try await Self.successfulModelTransport(request)
         })
+        TokenityTestFixtures.bindLoopbackWorkers(on: store)
+        store.backendMode = .distributed
         store.connectionMode = .ring
         for nodeIndex in store.nodes.indices {
             for modelIndex in store.nodes[nodeIndex].models.indices {
@@ -477,7 +611,8 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertTrue(store.modelLoadMessage.contains("Restart the installed Tokenity Node Agent"))
     }
 
-    func testRDMALoadRefreshesNodeInfoAndBlocksInactiveLink() async {
+    func testMultiMacLoadFallsBackToStandardNetworkWhenRDMALinkIsInactive() async {
+        var startConnectionMode: String?
         let store = TokenityStore(dataTransport: { request in
             let path = request.url?.path ?? ""
             let host = request.url?.host ?? ""
@@ -487,20 +622,21 @@ final class TokenityStoreTests: XCTestCase {
             if path == "/v1/node/info", host == "127.0.0.1", request.url?.port == 9_100 {
                 statusCode = 200
                 payload = """
-                {"node_id":"mac-a","hostname":"127.0.0.1","user":"node-a-user","ips":["127.0.0.1"],"architecture":"arm64","macos_version":"26.5.1","python_path":"/fixtures/tokenity/runtime/current/.venv/bin/python","mlx_version":"0.31.2","mlx_lm_version":"0.31.3","tokenity_version":"0.1.0","process_roles":[],"memory":{"total_bytes":1,"used_bytes":0,"free_bytes":1,"used_ratio":0},"rdma":{"rdma_enabled":false,"rdma_devices":["rdma_en4"],"rdma_port_state":{"rdma_en4":"down"},"thunderbolt_ip":"tokenity-rdma-a.invalid","rdma_errors":["RDMA devices were found, but no active RDMA port was detected."]}}
+                {"node_id":"mac-a","machine_id":"machine-mac-a","hostname":"127.0.0.1","user":"node-a-user","ips":["127.0.0.1"],"architecture":"arm64","macos_version":"26.5.1","python_path":"/fixtures/tokenity/runtime/current/.venv/bin/python","mlx_version":"0.31.2","mlx_lm_version":"0.31.3","tokenity_version":"0.1.0","agent_contract":{"version":1,"capabilities":["agent_health","cluster_runtime","instance_quorum","instance_runtimes","managed_instances"]},"process_roles":[],"memory":{"total_bytes":1,"used_bytes":0,"free_bytes":1,"used_ratio":0},"rdma":{"rdma_enabled":false,"rdma_devices":["rdma_en4"],"rdma_port_state":{"rdma_en4":"down"},"thunderbolt_ip":"tokenity-rdma-a.invalid","rdma_errors":["RDMA devices were found, but no active RDMA port was detected."]}}
                 """
-            } else if path == "/v1/node/info", host == "127.0.0.1", request.url?.port == 9_200 {
+            } else if path == "/v1/node/info", host == "198.51.100.75", request.url?.port == 9_200 {
                 statusCode = 200
                 payload = """
-                {"node_id":"mac-b","hostname":"127.0.0.1","user":"node-b-user","ips":["127.0.0.1"],"architecture":"arm64","macos_version":"26.5.1","python_path":"/fixtures/tokenity/runtime/current/.venv/bin/python","mlx_version":"0.31.2","mlx_lm_version":"0.31.3","tokenity_version":"0.1.0","process_roles":[],"memory":{"total_bytes":1,"used_bytes":0,"free_bytes":1,"used_ratio":0},"rdma":{"rdma_enabled":true,"rdma_devices":["rdma_en5"],"rdma_port_state":{"rdma_en5":"active"},"thunderbolt_ip":"tokenity-rdma-b.invalid","rdma_errors":[]}}
+                {"node_id":"mac-b","machine_id":"machine-mac-b","hostname":"198.51.100.75","user":"node-b-user","ips":["198.51.100.75"],"architecture":"arm64","macos_version":"26.5.1","python_path":"/fixtures/tokenity/runtime/current/.venv/bin/python","mlx_version":"0.31.2","mlx_lm_version":"0.31.3","tokenity_version":"0.1.0","agent_contract":{"version":1,"capabilities":["agent_health","cluster_runtime","instance_quorum","instance_runtimes","managed_instances"]},"process_roles":[],"memory":{"total_bytes":1,"used_bytes":0,"free_bytes":1,"used_ratio":0},"rdma":{"rdma_enabled":true,"rdma_devices":["rdma_en5"],"rdma_port_state":{"rdma_en5":"active"},"thunderbolt_ip":"tokenity-rdma-b.invalid","rdma_errors":[]}}
                 """
             } else if path.contains("/v1/node/start") {
-                XCTFail("RDMA load should be blocked before starting the backend.")
-                statusCode = 500
-                payload = #"{"error":{"message":"unexpected start"}}"#
+                if let body = request.httpBody,
+                   let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any] {
+                    startConnectionMode = object["connection_mode"] as? String
+                }
+                return try await Self.successfulModelTransport(request)
             } else {
-                statusCode = 200
-                payload = #"{"roles":[]}"#
+                return try await Self.successfulModelTransport(request)
             }
 
             let response = HTTPURLResponse(
@@ -511,6 +647,7 @@ final class TokenityStoreTests: XCTestCase {
             )!
             return (Data(payload.utf8), response)
         })
+        TokenityTestFixtures.bindLoopbackWorkers(on: store)
         guard let first = store.modelLibraryRows.first else {
             XCTFail("Expected sample model")
             return
@@ -519,10 +656,10 @@ final class TokenityStoreTests: XCTestCase {
         store.createCluster()
         await store.loadModel(first)
 
-        XCTAssertNil(store.loadedModelName)
-        XCTAssertTrue(store.modelLoadMessage.contains("Thunderbolt RDMA is not ready"))
-        XCTAssertTrue(store.modelLoadMessage.contains("no active RDMA port"))
-        XCTAssertTrue(store.launchPreview.readinessIssues.contains { $0.contains("no active RDMA port") })
+        XCTAssertNotNil(store.loadedModelName)
+        XCTAssertEqual(startConnectionMode, "ring")
+        XCTAssertEqual(store.effectiveConnectionMode, .ring)
+        XCTAssertTrue(store.launchPreview.readinessIssues.allSatisfy { !$0.contains("RDMA") })
     }
 
     func testModelLoadShowsIncompatibleAgentMessage() async {
@@ -530,7 +667,7 @@ final class TokenityStoreTests: XCTestCase {
             if request.url?.path == "/v1/node/info" {
                 return Self.response(
                     for: request,
-                    payload: TokenityTestFixtures.basicNodeInfoPayload(for: request)
+                    payload: TokenityTestFixtures.modernNodeInfoPayload(for: request)
                 )
             }
             let response = HTTPURLResponse(
@@ -758,10 +895,10 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertEqual(store.backendMode, .singleNode)
         XCTAssertEqual(startNodeCount, 1)
         XCTAssertEqual(store.loadedModelName, row.id)
-        XCTAssertEqual(store.modelLoadTargetSummary(for: row), "1/1 load target · 127.0.0.1")
+        XCTAssertEqual(store.modelLoadTargetSummary(for: row), "1/1 load target · Mac at 127.0.0.1")
         XCTAssertEqual(store.chatTopologyLabel, "1 Mac · Single")
         XCTAssertFalse(store.chatUsesMultipleNodes)
-        XCTAssertEqual(store.activeBackendDisplayName, "Tokenity Single-Mac Server")
+        XCTAssertEqual(store.activeBackendDisplayName, "Single Mac")
         XCTAssertEqual(store.activeConnectionDisplayName, "Single Mac")
     }
 
@@ -861,7 +998,7 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertFalse(store.isModelLoading)
         XCTAssertNil(store.loadedModelName)
         XCTAssertEqual(store.modelLoadMessage, "No model loaded")
-        XCTAssertEqual(store.phase, .running)
+        XCTAssertEqual(store.phase, .readyToLoad)
         XCTAssertGreaterThanOrEqual(stopAllRequests, store.selectedNodes.count * 2)
     }
 
@@ -903,7 +1040,7 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertFalse(store.isModelUnloading)
         XCTAssertEqual(store.modelLoadStates[first.id], .notLoaded)
         XCTAssertEqual(store.modelLoadMessage, "No model loaded")
-        XCTAssertEqual(store.phase, .running)
+        XCTAssertEqual(store.phase, .readyToLoad)
     }
 
     func testMemoryStatsDecodePhysicalMemoryUsage() throws {
@@ -986,7 +1123,7 @@ final class TokenityStoreTests: XCTestCase {
 
         await store.shutdownForApplicationTermination()
 
-        XCTAssertEqual(store.phase, .running)
+        XCTAssertEqual(store.phase, .readyToLoad)
         XCTAssertTrue(stopAllHosts.isEmpty)
         // With no accepted managed instance there is no identity-safe lease to
         // renew. Recovery tests cover the resident grace heartbeat itself.
@@ -1817,7 +1954,7 @@ final class TokenityStoreTests: XCTestCase {
         let path = request.url?.path ?? ""
         let payload: String
         if path == "/v1/node/info" {
-            payload = TokenityTestFixtures.basicNodeInfoPayload(for: request)
+            payload = TokenityTestFixtures.modernNodeInfoPayload(for: request)
         } else if path.contains("/v1/models") {
             payload = #"{"data":[{"id":"Qwen3.5-122B-A10B-4bit"}]}"#
         } else if path.contains("/v1/chat/completions") {
