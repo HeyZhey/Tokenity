@@ -2,129 +2,209 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="apps/TokenityControl/Sources/TokenityControl/Resources/TokenityBrandLockupDark.png">
     <source media="(prefers-color-scheme: light)" srcset="apps/TokenityControl/Sources/TokenityControl/Resources/TokenityBrandLockup.png">
-    <img alt="Tokenity" src="apps/TokenityControl/Sources/TokenityControl/Resources/TokenityBrandLockup.png" width="220">
+    <img alt="Tokenity" src="apps/TokenityControl/Sources/TokenityControl/Resources/TokenityBrandLockup.png" width="240">
   </picture>
+</p>
+
+<p align="center">
+  <strong>Distributed video generation and language inference for Apple-silicon Macs.</strong>
 </p>
 
 <p align="center">
   <strong>English</strong> · <a href="README.zh-CN.md">简体中文</a>
 </p>
 
+<p align="center">
+  <img alt="Apple silicon" src="https://img.shields.io/badge/Apple%20silicon-required-111111?logo=apple">
+  <img alt="macOS 26.2+" src="https://img.shields.io/badge/macOS-26.2%2B-111111?logo=apple">
+  <img alt="Swift 5.9+" src="https://img.shields.io/badge/Swift-5.9%2B-F05138?logo=swift&logoColor=white">
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white">
+  <img alt="API OpenAI compatible" src="https://img.shields.io/badge/API-OpenAI--compatible-6E56CF">
+</p>
+
 # Tokenity
 
-Tokenity turns Apple-silicon Macs on a local network into a managed AI cluster.
-It provides one native control plane for language and video inference, with
-distributed execution, resource isolation, acceleration, and recovery built
-into the runtime.
+Tokenity turns Apple-silicon Macs on a local network into one managed AI
+cluster. Its native macOS app discovers machines, validates the high-speed data
+plane, starts distributed ranks, loads models, streams progress, and keeps the
+whole workload lifecycle visible from one place.
 
-The project contains:
+The headline workload is **multi-Mac video generation**. Tokenity can split
+MiniMax H3 across two Macs with block-wise tensor parallelism over Thunderbolt
+RDMA/JACCL, so the machines cooperate on one generation instead of running two
+independent copies of the model. The same control plane also runs distributed
+language models, resident model pools, Chat, and an OpenAI-compatible API.
 
-- **TokenityControl** — a native SwiftUI app for cluster discovery, topology,
-  model management, chat, video generation, health, logs, and recovery.
-- **Tokenity Node Agent** — a supervised HTTP service on each inference Mac.
-- **Tokenity runtimes** — distributed MLX inference and workload-specific
-  backends behind one OpenAI-compatible gateway.
+> [!IMPORTANT]
+> Tokenity is an early-stage project for trusted local networks. The current
+> hardware baseline covers single-Mac and two-Mac Apple-silicon workloads.
+> MiniMax H3 TP2 and GLM 5.2 over JACCL/RDMA have been exercised on real
+> hardware; other models and topologies depend on their MLX compatibility.
 
-## Product highlights
+## Multi-Mac video generation
 
-- **Mac cluster control plane** — discover, select, inspect, and operate
-  Apple-silicon nodes from one native macOS application.
-- **Automatic LAN discovery** — finds Node Agents on private networks, tracks
-  Macs by stable `machine_id`, and repairs changed addresses without turning a
-  remote node into loopback.
-- **Fast distributed data plane** — uses Thunderbolt RDMA/JACCL when available,
-  with readiness checks and standard-network modes for other deployments.
-- **Accelerated inference** — metadata-driven model compatibility, Native MTP
-  capability detection, and guarded activation instead of model-name switches.
-- **Unified workloads** — OpenAI-compatible streaming and non-streaming LLM
-  inference plus native video generation; MiniMax H3 is the currently validated
-  video backend, not the product boundary.
-- **Production lifecycle** — multiple isolated instances, automatic routing,
-  request queues, timeouts, cancellation, memory admission, resource ledgers,
-  health/readiness probes, watchdogs, and restart recovery.
-- **Cluster-safe operations** — typed HTTP orchestration, coordinated rank
-  startup and shutdown, and no SSH dependency in the product path.
+Tokenity makes distributed MiniMax H3 a first-class workflow in the macOS app:
 
-## Architecture
+1. Discover the coordinator and worker Mac and verify their stable machine
+   identities, Agent versions, memory, model files, and RDMA devices.
+2. Preflight the H3 checkpoint, TP2 manifest, rank shard hashes, native binary,
+   protocol version, ports, and available disk space before starting either
+   rank.
+3. Launch Rank 0 and Rank 1 through typed Node Agent requests, wait for the
+   JACCL data plane and complete `2/2` quorum, and roll back both ranks if
+   startup fails.
+4. Generate from the **Video** workspace with prompt, canvas, frame count,
+   sampling steps, seed, and optimization controls while native SSE events
+   drive live progress.
+5. Preview the result in Tokenity and export a playable H.264 MOV with audio.
+   Raw RGB video, PCM/WAV audio, and request metadata are retained alongside
+   every completed result.
 
-```text
-                    ┌────────── HTTP control plane ──────────┐
-TokenityControl ───►│ Coordinator Agent      Worker Agents   │
-LAN discovery ─────►│ health · routing       local watchdogs │
-                    └──────────────┬─────────────────────────┘
-                                   │ stable gateway :9100
-OpenAI clients ─────────────────────┤
-                                   ▼
-                         LLM · video workloads
-                          ╲                      ╱
-                           Thunderbolt RDMA/JACCL
-                              or standard network
+The Models page uses the same Load, progress, Cancel, and Stop lifecycle for
+MiniMax H3 and language models. The Video page adds modality-specific runtime
+configuration, generation controls, preview, export, and a compact list of the
+five most recent results.
+
+### One model, two cooperating Macs
+
+```mermaid
+flowchart LR
+    UI["TokenityControl\nVideo workspace"] -->|"typed HTTP control :9100"| A["Coordinator Agent"]
+    A -->|"rank start + lifecycle"| B["Worker Agent"]
+    A --> R0["H3 Rank 0\nAPI · conditioning · VAE/audio decode"]
+    B --> R1["H3 Rank 1\nTP transformer shard"]
+    R0 <-->|"JACCL ring over\nThunderbolt RDMA"| R1
+    R0 -->|"SSE progress + RGB8/PCM"| UI
+    UI --> OUT["Preview · MOV · WAV · metadata"]
 ```
 
-Node Agents start and supervise only local processes. Distributed ranks are
-coordinated through typed HTTP requests while model collectives use the chosen
-data plane. SSH is not used by the product. Current hardware validation covers
-single-node and two-node workloads; the control plane is agent-based rather
-than a fixed two-machine topology.
+This is **block-wise tensor parallelism**, not two full-model replicas. Rank 0
+owns the public API, text encoder, initial latents, and final video/audio
+decode. Rank 1 loads its transformer shard and participates in the 50 main DiT
+blocks. A standard 28-step request performs 2,800 cross-rank collectives.
 
-## Requirements
+Each machine needs only its own `tp2/rank-N/transformer.safetensors` shard.
+Rank 0 additionally owns the conditioning and decode components. A shared
+versioned manifest pins both shards so Tokenity can reject mixed checkpoints,
+binaries, protocols, or code revisions before they reach JACCL startup.
 
-- Apple-silicon Macs on the same trusted network.
-- macOS 26.2+ and Swift 5.9+ for Tokenity app development.
-- Python 3.10+ for backend development.
-- A compatible MLX/MLX-LM runtime on every inference Mac.
-- The same model path on every participating Mac for a distributed workload.
-- TCP port `9100` reachable between TokenityControl and each Node Agent.
-- For RDMA: an active direct Thunderbolt link, RDMA devices, and peer IPs.
+### Validated TP2 result
 
-The currently validated packaged runtime is Apple-silicon only and requires
-macOS 26.2 or newer. Model weights are not included.
+The fixed `512×256`, 124-frame, 28-step MiniMax H3 request completed through
+the Agent gateway with all RGB8 frames and stereo PCM audio:
 
-## Development setup
+| Measurement | Single Mac | Two-Mac TP2 | Improvement |
+| --- | ---: | ---: | ---: |
+| DiT sampling | 301.891 s | 187.384 s | **1.611×** |
+| End to end | 322.583 s | 204.512 s | **1.577×** |
+| Video decode | 10.036 s | 9.976 s | Rank 0 only |
+| Audio decode | 0.910 s | 0.835 s | Rank 0 only |
 
-```bash
-git clone <repository-url> Tokenity
-cd Tokenity
+These numbers are one validated two-machine configuration, not a universal
+benchmark. Performance depends on the Mac models, checkpoint, native runtime,
+frame size, step count, and Thunderbolt/RDMA topology. See
+[MiniMax H3 video](docs/minimax-h3-video.md) for the full protocol, benchmark
+harness, fingerprints, and reproducibility notes.
 
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -e ".[dev]"
+### Safe distributed lifecycle
+
+- **Fail-closed startup** — a missing rank, incompatible Agent, inactive RDMA
+  device, mismatched shard, or unsupported H3 protocol blocks launch with a
+  structured diagnostic.
+- **Quorum-aware health** — a surviving Rank 0 is never presented as Ready when
+  Rank 1 has failed.
+- **Collective-safe cancellation** — a disconnected TP2 request is drained in
+  collective order so the ranks do not diverge; the runtime remains usable for
+  the next request.
+- **Instance-scoped stop** — stopping H3 targets its exact ranks and does not
+  widen into a global cleanup that could kill a sibling language model.
+- **Recovery and watchdogs** — PID start identity, operation identity, leases,
+  ports, memory reservations, and rank evidence fence stale or orphaned work.
+
+## More than video
+
+| Capability | What Tokenity provides |
+| --- | --- |
+| Distributed language models | Single- or multi-Mac MLX inference with coordinated rank startup, readiness, cancellation, and shutdown. |
+| Resident model pool | Multiple isolated model instances can remain loaded, expose independent health, and share one stable gateway. |
+| Automatic routing | Routes by requested model and policy while keeping explicit instance selection available. |
+| Native Chat | Streaming answers, separated reasoning, conversation history, metrics, repetition protection, and immediate user cancellation. |
+| OpenAI-compatible API | Streaming and non-streaming chat completions for local clients such as Cherry Studio, Msty, SDKs, and scripts. |
+| Model intelligence | Scans model metadata, quantization, architecture, shards, and Native MTP capability instead of relying on folder-name allowlists. |
+| Cluster discovery | Finds Node Agents on the LAN, tracks each Mac by stable `machine_id`, and repairs address changes without confusing remote nodes with loopback. |
+| Operations | Memory admission, queues, timeouts, leases, health/readiness probes, resource ledgers, logs, watchdog restart, and upgrade-safe maintenance windows. |
+
+Current model coverage includes GLM 5.2, Qwen-family MLX checkpoints, MiniMax
+H3, and other compatible MLX models selected through metadata and runtime
+capabilities. Native MTP activation is guarded by checkpoint and backend
+evidence rather than model-name switches.
+
+## Product architecture
+
+Tokenity consists of three layers:
+
+- **TokenityControl** — the native SwiftUI control plane for discovery,
+  topology, Models, Chat, Video, API access, health, logs, settings, and repair.
+- **Tokenity Node Agent** — a supervised HTTP service on every inference Mac.
+  It owns local processes, resources, health evidence, instance journals, and
+  watchdog integration.
+- **Tokenity runtimes** — distributed MLX language inference and the native H3
+  backend behind a stable gateway.
+
+```mermaid
+flowchart TB
+    CONTROL["TokenityControl for macOS"] -->|"LAN discovery + typed control"| AGENTS["Node Agents on selected Macs"]
+    CLIENTS["Chat · OpenAI clients · scripts"] -->|"stable gateway :9100"| AGENTS
+    AGENTS --> LLM["Distributed language models\nJACCL/RDMA or standard network"]
+    AGENTS --> VIDEO["MiniMax H3 video\nsingle Mac or TP2/RDMA"]
+    AGENTS --> OPS["Health · memory · leases · logs · watchdogs"]
 ```
 
-Build and open the native app:
+Agents start and supervise only local processes. Cross-machine orchestration
+uses typed HTTP contracts; model collectives use the selected data plane.
+Product startup and inference do not use SSH.
 
-```bash
-./scripts/run-tokenity-control-app.sh
-```
+## Quick start
 
-Run a development Node Agent:
+### 1. Install every participating Mac
 
-```bash
-tokenity node-agent --host 0.0.0.0 --port 9100
-```
+Open the full Tokenity installer on each Mac. It installs Tokenity.app, the
+Node Agent and watchdog, the pinned Python/MLX runtime, JACCL, and the native H3
+runtime. Administrator approval is local to each machine.
 
-For persistent deployment, install the Node Agent package on every inference
-Mac as described in [Installer and packaging](docs/installer-dmg.md).
+Model weights are intentionally separate. Place compatible models under the
+configured model root and keep the same logical model path on participating
+language-model ranks. For H3 TP2, install the common manifest and the correct
+rank shard on each Mac.
 
-## Basic workflow
+### 2. Build the cluster
 
-1. Install the Node Agent on each Mac and open **Cluster**.
-2. Let LAN discovery find the nodes, or connect to an Agent directly.
-3. Select the Macs for the workload and confirm the data plane reports
-   **Ready**.
+1. Open **Cluster** and let LAN discovery find the Macs, or connect to an Agent
+   URL directly.
+2. Select the machines for the workload and review memory and network health.
+3. Use Thunderbolt RDMA/JACCL when the direct link is Ready; standard-network
+   modes remain available for compatible language workloads.
 4. Create the cluster topology.
-5. Open **Models**, enter the shared absolute model directory, and select
-   **Scan Models**.
-6. Load a model, then use **Chat** or the external API.
-7. Open **Video** for video-runtime checks, generation, streamed progress,
-   cancellation, preview, and export.
 
-The LLM model directory and H3 runtime paths are separate settings. A model is
-listed only when it exists under the scanned directory on the selected Macs.
+### 3. Generate video
 
-## OpenAI-compatible API
+1. Open **Models**, scan the selected Macs, and locate **MiniMax H3**.
+2. Select **Load** and wait for topology validation, preflight, rank launch, and
+   `2/2` readiness.
+3. Select **Open Video**, enter a prompt, configure the canvas, frames, steps,
+   seed, and optimization profile, then choose **Generate Video**.
+4. Follow native progress, preview the result, and open, reveal, or share the
+   saved movie.
 
-The coordinator exposes the stable gateway at:
+### 4. Run a language model
+
+1. Scan the shared language-model directory from **Models**.
+2. Configure and load one or more compatible models.
+3. Use **Chat**, automatic routing, or the external API.
+
+## API
+
+The coordinator exposes a stable gateway at:
 
 ```text
 http://<coordinator-host>:9100/v1
@@ -137,53 +217,103 @@ Main endpoints:
 - `POST /v1/chat/completions`
 - `POST /v1/video/generations`
 
-Example:
+Language example:
 
 ```bash
-export TOKENITY_HOST=<coordinator-host>
-
-curl "http://${TOKENITY_HOST}:9100/v1/chat/completions" \
+curl -N http://<coordinator-host>:9100/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "<model-id>",
-    "messages": [{"role": "user", "content": "Hello from Tokenity"}],
-    "stream": false
+    "messages": [{"role": "user", "content": "Explain tensor parallelism"}],
+    "stream": true
   }'
 ```
 
-Authentication and TLS are not enabled by default. Keep the API on a trusted
-local network.
-
-## Validation
-
-Run the complete local baseline:
+Video example:
 
 ```bash
+curl -N http://<coordinator-host>:9100/v1/video/generations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "MiniMax-H3",
+    "prompt": "A cinematic tracking shot through a rain-soaked neon market",
+    "width": 512,
+    "height": 256,
+    "num_frames": 124,
+    "steps": 28,
+    "seed": 42,
+    "stream": true
+  }'
+```
+
+Authentication and TLS are not enabled by default. Keep the gateway on a
+trusted local network.
+
+## Requirements
+
+- Apple-silicon Macs on the same trusted network.
+- The packaged runtime currently requires macOS 26.2 or newer.
+- Swift 5.9+ for TokenityControl development and Python 3.10+ for backend
+  development.
+- TCP port `9100` reachable between TokenityControl and each Node Agent.
+- Compatible model files on every participating Mac.
+- For TP2 video and RDMA language inference: an active direct Thunderbolt link,
+  supported RDMA devices, peer IPs, and matching JACCL/runtime components.
+
+## Development and validation
+
+```bash
+git clone git@github.com:HeyZhey/Tokenity.git
+cd Tokenity
+
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
+
 ./scripts/verify-stable-baseline.sh
 ```
 
-This runs the Python tests, Swift tests, and a fresh TokenityControl debug app
-build. Real distributed model, video, MTP, and RDMA validation additionally
-requires the matching runtimes, checkpoints, and cluster hardware. The current
-hardware baseline includes GLM 5.2 and MiniMax H3 TP2.
-
-## Packaging
+Build and open the native app:
 
 ```bash
-./scripts/build-tokenity-control-app.sh
+./scripts/run-tokenity-control-app.sh
+```
+
+Build the full installer after importing the validated runtime:
+
+```bash
 ./scripts/package-tokenity-dmg.sh
 ```
 
-Release packaging, runtime pinning, signing status, and Node Agent installation
-are documented in [Installer and packaging](docs/installer-dmg.md).
+Model weights are excluded by default. The current build is ad-hoc signed and
+the pkg is unsigned; public distribution still requires Developer ID signing,
+notarization, and stapling. See
+[Installer and runtime distribution](docs/installer-dmg.md).
+
+## Verification baseline
+
+The local baseline covers Python and Swift tests plus a fresh app build. Real
+distributed validation additionally requires matching Macs, runtimes,
+checkpoints, and network hardware. The current hardware baseline includes:
+
+- MiniMax H3 single-Mac and TP2/RDMA video generation, SSE progress, complete
+  RGB8 + PCM output, coordinated stop, and repeatable output hashes.
+- GLM 5.2 `2/2` JACCL/RDMA readiness, streaming and non-streaming completions,
+  multi-turn chat, queues, cancellation, memory reclamation, and clean reload.
+- Cross-workload RDMA/JACCL restart, Agent recovery, model inventory
+  synchronization, and instance-scoped lifecycle behavior.
+
+Run the baseline after changing MLX, MLX-LM, the H3 native binary, model
+weights, Agent protocol, or distributed topology.
 
 ## Documentation
 
+- [MiniMax H3 video](docs/minimax-h3-video.md)
 - [Deployment configuration](docs/deployment-configuration.md)
+- [Installer and runtime distribution](docs/installer-dmg.md)
 - [HTTP Node Agent](docs/http-node-agent.md)
 - [External API](docs/external-api.md)
 - [GLM 5.2 compatibility](docs/glm-5.2-compat.md)
-- [MiniMax H3 video](docs/minimax-h3-video.md)
 - [Native MTP](docs/native-mtp.md)
 - [RDMA operations](docs/current-usage-rdma-qwen.md)
 - [Stable baseline](docs/stable-baseline.md)
@@ -191,14 +321,19 @@ are documented in [Installer and packaging](docs/installer-dmg.md).
 ## Repository layout
 
 ```text
-apps/TokenityControl/  SwiftUI application and tests
+apps/TokenityControl/  Native SwiftUI application and tests
 tokenity/              Python CLI, Node Agent, routing, and runtimes
 tests/                 Python regression tests
 scripts/               Build, verification, deployment, and packaging tools
-docs/                  Focused operator and compatibility guides
+docs/                  Operations, API, compatibility, and validation guides
 ```
 
-## License
+## Security and license
+
+Tokenity is designed for a trusted local network. The API currently has no
+authentication or TLS, and the Node Agent should not be exposed to the public
+internet. Product orchestration does not accept arbitrary shell commands and
+does not store SSH credentials.
 
 No open-source license has been declared for Tokenity. All rights are reserved.
 See [Third-party notices](THIRD_PARTY_NOTICES.md) for separately licensed code.
