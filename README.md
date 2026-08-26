@@ -88,24 +88,6 @@ Rank 0 additionally owns the conditioning and decode components. A shared
 versioned manifest pins both shards so Tokenity can reject mixed checkpoints,
 binaries, protocols, or code revisions before they reach JACCL startup.
 
-### Validated TP2 result
-
-The fixed `512×256`, 124-frame, 28-step MiniMax H3 request completed through
-the Agent gateway with all RGB8 frames and stereo PCM audio:
-
-| Measurement | Single Mac | Two-Mac TP2 | Improvement |
-| --- | ---: | ---: | ---: |
-| DiT sampling | 301.891 s | 187.384 s | **1.611×** |
-| End to end | 322.583 s | 204.512 s | **1.577×** |
-| Video decode | 10.036 s | 9.976 s | Rank 0 only |
-| Audio decode | 0.910 s | 0.835 s | Rank 0 only |
-
-These numbers are one validated two-machine configuration, not a universal
-benchmark. Performance depends on the Mac models, checkpoint, native runtime,
-frame size, step count, and Thunderbolt/RDMA topology. See
-[MiniMax H3 video](docs/minimax-h3-video.md) for the full protocol, benchmark
-harness, fingerprints, and reproducibility notes.
-
 ### Safe distributed lifecycle
 
 - **Fail-closed startup** — a missing rank, incompatible Agent, inactive RDMA
@@ -120,6 +102,49 @@ harness, fingerprints, and reproducibility notes.
   widen into a global cleanup that could kill a sibling language model.
 - **Recovery and watchdogs** — PID start identity, operation identity, leases,
   ports, memory reservations, and rank evidence fence stale or orphaned work.
+
+## Benchmark results
+
+These are measured workload results from the validated two-Mac lab, not
+vendor estimates. Both machines have 512 GiB of unified memory, and the TP2
+runs use JACCL over Thunderbolt RDMA. Higher is better for language-model
+throughput; lower is better for video-generation time. Results are specific to
+this hardware, checkpoint, runtime, and topology.
+
+### GLM 5.2 language inference
+
+The formal run used one excluded 64-token warm-up followed by five sequential
+streaming requests at temperature 0 and concurrency 1. Every measured request
+used the same 40-token prompt and generated 256 completion tokens.
+
+| Topology | Load result | Mean decode | p50 decode | Mean TTFT | p50 TTFT | Completed runs |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Single Mac · 512 GiB | Blocked by safe admission | — | — | — | — | — |
+| Two-Mac TP2 · 2 × 512 GiB | 2/2 ranks Ready | **23.28 tok/s** | **23.75 tok/s** | **1.63 s** | **2.06 s** | **5/5** |
+
+The single-Mac launch was rejected before model startup because the
+conservative requirement was 523.58 GB while only 394.59 GB was admissible on
+the node. Tokenity did not bypass that safety check, so no misleading
+single-Mac throughput is reported. In the TP2 run, each rank observed roughly
+200 GB peak model memory; both ranks remained healthy through all five requests
+and stopped cleanly afterward. The test used `GLM-5.2-mxfp4` with the
+repository's [streaming benchmark harness](scripts/benchmark-openai-stream.py).
+
+### MiniMax H3 video generation
+
+The fixed request used `512×256`, 124 frames, 28 sampling steps, seed 42, and
+`fast=false`. It completed through the Agent gateway with all RGB8 frames and
+stereo PCM audio:
+
+| Measurement | Single Mac | Two-Mac TP2 | Improvement |
+| --- | ---: | ---: | ---: |
+| DiT sampling | 301.891 s | 187.384 s | **1.611×** |
+| End to end | 322.583 s | 204.512 s | **1.577×** |
+| Video decode | 10.036 s | 9.976 s | Rank 0 only |
+| Audio decode | 0.910 s | 0.835 s | Rank 0 only |
+
+See [MiniMax H3 video](docs/minimax-h3-video.md) for the full protocol,
+benchmark harness, fingerprints, and reproducibility notes.
 
 ## More than video
 
