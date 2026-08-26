@@ -169,10 +169,10 @@ def _parse_sse_and_archive(
 
 def _preflight(config: BenchmarkConfig, transport: Transport) -> dict[str, object]:
     nodes: dict[str, object] = {}
-    for role, url in (
-        ("rank-0", config.coordinator_agent.rstrip("/")),
-        ("rank-1", config.worker_agent.rstrip("/")),
-    ):
+    for rank, node in enumerate(config.nodes):
+        role = f"rank-{rank}"
+        fallback_url = config.coordinator_agent if rank == 0 else config.worker_agent
+        url = str(node.get("agent_url") or fallback_url).rstrip("/")
         health = transport.get_json(f"{url}/health", 10.0)
         info = transport.get_json(f"{url}/v1/node/info", 10.0)
         if health.get("status") != "healthy":
@@ -188,7 +188,9 @@ def _preflight(config: BenchmarkConfig, transport: Transport) -> dict[str, objec
                 f"{role} disk gate failed: need {config.minimum_free_disk_bytes} free bytes, got {free}."
             )
         rdma = info.get("rdma")
-        if not isinstance(rdma, dict) or rdma.get("rdma_enabled") is not True:
+        if len(config.nodes) > 1 and (
+            not isinstance(rdma, dict) or rdma.get("rdma_enabled") is not True
+        ):
             raise RuntimeError(f"{role} RDMA is not enabled.")
         nodes[role] = {"agent_url": url, "health": health, "info": info}
     return {"sampled_at_epoch": time.time(), "nodes": nodes}
@@ -199,8 +201,8 @@ def run_benchmark(
 ) -> dict[str, object]:
     if config.runs < 1:
         raise ValueError("runs must be at least one")
-    if len(config.nodes) != 2:
-        raise ValueError("MiniMax H3 TP2 benchmark requires exactly two typed nodes")
+    if len(config.nodes) not in {1, 2}:
+        raise ValueError("MiniMax H3 benchmark requires one or two typed nodes")
     transport = transport or HttpTransport()
     root = config.output_dir / config.test_id
     root.mkdir(parents=True, exist_ok=False)
@@ -220,7 +222,7 @@ def run_benchmark(
         "model": config.model,
         "binary": config.binary,
         "nodes": config.nodes,
-        "connection_mode": "jaccl-ring",
+        "connection_mode": "ring" if len(config.nodes) == 1 else "jaccl-ring",
         "port": config.port,
         "starting_port": config.starting_port,
         "api_identifier": config.instance_id,
@@ -299,21 +301,23 @@ def run_benchmark(
                 raise RuntimeError(
                     f"Expected {expected_progress} progress events, got {parsed['progress_events']}."
                 )
+            rank_snapshots = {
+                "rank-0": transport.get_json(
+                    f"{coordinator}/v1/node/instances/{config.instance_id}", 15.0
+                )
+            }
+            if len(config.nodes) == 2:
+                rank_snapshots["rank-1"] = transport.get_json(
+                    f"{config.worker_agent.rstrip('/')}/v1/node/instances/{config.instance_id}",
+                    15.0,
+                )
             run = {
                 "run": index + 1,
                 "temperature": "cold" if index == 0 else "warm",
                 "http_status": status,
                 "end_to_end_seconds": time.monotonic() - started,
                 **parsed,
-                "rank_snapshots": {
-                    "rank-0": transport.get_json(
-                        f"{coordinator}/v1/node/instances/{config.instance_id}", 15.0
-                    ),
-                    "rank-1": transport.get_json(
-                        f"{config.worker_agent.rstrip('/')}/v1/node/instances/{config.instance_id}",
-                        15.0,
-                    ),
-                },
+                "rank_snapshots": rank_snapshots,
             }
             report["runs"].append(run)  # type: ignore[union-attr]
             _write_json(root / f"run-{index + 1:02d}.json", run)
@@ -354,10 +358,10 @@ def run_benchmark(
                 shutdown["requested"] = True
             except Exception as exc:
                 shutdown["error"] = str(exc)
-            for role, url in (
-                ("rank-0", coordinator),
-                ("rank-1", config.worker_agent.rstrip("/")),
-            ):
+            snapshot_agents = [("rank-0", coordinator)]
+            if len(config.nodes) == 2:
+                snapshot_agents.append(("rank-1", config.worker_agent.rstrip("/")))
+            for role, url in snapshot_agents:
                 try:
                     shutdown[role] = transport.get_json(
                         f"{url}/v1/node/instances/{config.instance_id}", 15.0
@@ -376,10 +380,10 @@ def run_benchmark(
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run and archive the fixed MiniMax H3 TP2 cold/warm benchmark."
+        description="Run and archive the fixed MiniMax H3 single- or two-Mac cold/warm benchmark."
     )
     parser.add_argument("--coordinator-agent", required=True)
-    parser.add_argument("--worker-agent", required=True)
+    parser.add_argument("--worker-agent")
     parser.add_argument("--nodes-json", type=Path, required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--binary", required=True)
@@ -408,7 +412,7 @@ def main(argv: list[str] | None = None) -> None:
         output_dir=args.output_dir,
         test_id=args.test_id,
         coordinator_agent=args.coordinator_agent,
-        worker_agent=args.worker_agent,
+        worker_agent=args.worker_agent or args.coordinator_agent,
         nodes=nodes,
         model=args.model,
         binary=args.binary,

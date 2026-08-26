@@ -1920,6 +1920,73 @@ def test_h3_single_node_start_becomes_ready_and_reports_video_api(
     assert state_store.records() == []
 
 
+def test_h3_single_node_start_survives_concurrent_ready_quorum_probe(
+    tmp_path: Path,
+    monkeypatch,
+):
+    model, binary = _create_h3_fixture(tmp_path)
+    monkeypatch.setattr(agent_module, "_tcp_port_available", lambda port: True)
+    monkeypatch.setattr(agent_module, "process_start_identity", lambda pid: "h3-start-identity")
+    supervisor = _FakeSupervisor()
+    first_probe_started = threading.Event()
+    release_first_probe = threading.Event()
+    probe_lock = threading.Lock()
+    probe_count = 0
+
+    def h3_ready(pid, port, timeout):
+        nonlocal probe_count
+        with probe_lock:
+            probe_count += 1
+            current_probe = probe_count
+        if current_probe == 1:
+            first_probe_started.set()
+            assert release_first_probe.wait(timeout=2.0)
+        return True
+
+    client = TestClient(
+        create_app(
+            rdma_probe_fn=fake_rdma_probe,
+            supervisor=supervisor,
+            h3_runtime_preflight_fn=lambda **kwargs: (
+                [],
+                _h3_single_capabilities(binary),
+            ),
+            h3_ready_fn=h3_ready,
+        )
+    )
+    result = {}
+
+    def start_runtime():
+        result["response"] = client.post(
+            "/v1/node/start-minimax-h3-video",
+            json={
+                "model": str(model),
+                "binary": str(binary),
+                "api_identifier": "MiniMax-H3",
+                "dry_run": False,
+                "instance_id": "h3-raced-start-instance",
+                "operation_id": "h3-raced-start-operation",
+                "port": 24_101,
+                "memory_reservation_bytes": 1,
+            },
+        )
+
+    start_thread = threading.Thread(target=start_runtime)
+    start_thread.start()
+    assert first_probe_started.wait(timeout=2.0)
+    quorum = client.get("/v1/node/instances/h3-raced-start-instance/quorum")
+    assert quorum.status_code == 200, quorum.text
+    assert quorum.json()["ready"] is True
+    release_first_probe.set()
+    start_thread.join(timeout=2.0)
+
+    assert not start_thread.is_alive()
+    response = result["response"]
+    assert response.status_code == 200, response.text
+    assert response.json()["instance"]["state"] == "ready"
+    assert response.json()["instance"]["readiness_evidence"]["rank_quorum"] == "1/1"
+
+
 def test_h3_video_gateway_preserves_stream_and_releases_request_lease(
     tmp_path: Path,
     monkeypatch,

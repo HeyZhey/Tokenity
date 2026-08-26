@@ -200,26 +200,36 @@ intentionally rejects H3 keyframes in TP2. If an SSE client disconnects during
 a distributed generation, both ranks finish that in-flight job to preserve
 collective ordering; subsequent jobs remain usable.
 
-## Validated hardware result
+## Validated hardware results
 
 On 2026-08-09 the two 512 GiB Macs passed the formal 2,800-call collective
 gate in `19.499 s` on the slower rank (`6.943 ms` p50, `6.991 ms` p95,
-`7.405 GiB/s`). The fixed paper-boat request (`512x256`, 124 frames, 28 steps,
-seed 42, `fast=false`) completed through the Agent gateway with HTTP `200`:
+`7.405 GiB/s`). A fresh paired benchmark on 2026-08-26 used the same fixed
+paper-boat request (`512x256`, 124 frames, 28 steps, seed 42, `fast=false`),
+the installed `stock-qmm` runtime, and one cold plus three warm requests per
+topology:
 
 | Measurement | Single Mac | TP2 | Improvement |
 | --- | ---: | ---: | ---: |
-| DiT sampling | 301.891 s | 187.384 s | 1.611x |
-| End to end | 322.583 s | 204.512 s | 1.577x |
-| Video decode | 10.036 s | 9.976 s | Rank 0 only |
-| Audio decode | 0.910 s | 0.835 s | Rank 0 only |
+| Cold DiT sampling | 316.203 s | 181.385 s | 1.743x |
+| Cold end to end | 347.126 s | 201.497 s | 1.723x |
+| Warm DiT mean, n=3 | 315.024 s | 182.076 s | 1.730x, 42.2% less time |
+| Warm end-to-end median, n=3 | 338.744 s | 204.544 s | 1.656x, 39.6% less time |
+| Warm video-decode mean | 9.937 s | 10.002 s | Rank 0 only |
+| Warm audio-decode mean | 0.570 s | 0.571 s | Rank 0 only |
 
-The output carried all 124 RGB8 frames plus stereo PCM audio. A separate TP2
-lifecycle run reached `2/2` readiness and stopped in `1.29 s`; both native
-ranks exited `0`, and Rank 1 received the protocol stop sentinel. The Agent's
-`/health` and `/v1/node/health` routes deliberately return the same watchdog-
-compatible `healthy` contract so the isolated Rank 1 Agent is not restarted
-during an inference job.
+All eight outputs carried 124 RGB8 frames plus stereo PCM audio and produced
+31 progress events. Video and audio hashes were identical across all four runs
+within each topology. The full-weight and sharded paths were not byte-identical
+to each other; comparison of all 124 RGB frames measured SSIM `0.910` and PSNR
+`27.26 dB`. The end-to-end warm median avoids overstating the result after one
+single-Mac gateway transfer outlier (`422.042 s`); single-Mac warm DiT remained
+stable at `315.547`, `314.749`, and `314.776 s`.
+
+The final TP2 lifecycle reached `2/2` readiness, completed four jobs with the
+ranks in step lock, and stopped both native ranks with return code `0`. Rank 1
+received the protocol stop sentinel, and both Agent resource ledgers contained
+no retained ports or memory reservations after shutdown.
 
 ## Phase 3 profiles, reproducible harness, and current default
 
@@ -240,7 +250,9 @@ artifacts installed below different rank-local model roots compare equal.
 Rank mismatch fails closed with HTTP `412` before JACCL launch.  Both actual
 starts and dry-runs enforce a 2 GiB default free-disk gate.
 
-The reusable fixed-request harness replaces manual curl bookkeeping:
+The reusable fixed-request harness replaces manual curl bookkeeping. A
+two-node JSON array plus `--worker-agent` selects TP2; a one-node array with no
+worker selects the matching single-Mac path:
 
 ```bash
 python -m tokenity.benchmarking.minimax_h3_tp2 \
@@ -253,11 +265,12 @@ python -m tokenity.benchmarking.minimax_h3_tp2 \
   --test-id h3-tp2-run
 ```
 
-It validates current Agent identity/capability/disk/RDMA state, dry-runs,
-launches 2/2, maintains the request lease, records readiness/fingerprints,
-performs one cold plus three warm requests, archives raw SSE/RGB/PCM and both
-rank snapshots, verifies 31 events and deterministic hashes, then always asks
-for coordinated stop and records the post-stop resource ledgers.
+It validates current Agent identity/capability/disk state (plus RDMA for TP2),
+dry-runs, launches the requested `1/1` or `2/2` topology, maintains the request
+lease, records readiness/fingerprints, performs one cold plus three warm
+requests, archives raw SSE/RGB/PCM and rank snapshots, verifies 31 events and
+deterministic hashes, then always asks for an instance-scoped stop and records
+the post-stop resource ledgers.
 
 On 2026-08-09, the same-runtime paired warm means were `200.393 s` for the
 former DQ+Steel baseline, `199.784 s` for all three block fusions, and

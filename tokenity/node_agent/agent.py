@@ -1139,6 +1139,40 @@ def create_app(
                 raise
             return roles.start(role, command, env=env, cwd=_distributed_code_root())
 
+    def advance_h3_instance_to_ready(
+        instance,
+        readiness_evidence: dict[str, object],
+    ) -> None:
+        """Finish H3 startup without racing concurrent quorum health probes."""
+
+        transitions = {
+            InstanceLifecycle.DISTRIBUTED_INITIALIZING: InstanceLifecycle.LOADING_METADATA,
+            InstanceLifecycle.LOADING_METADATA: InstanceLifecycle.MATERIALIZING_WEIGHTS,
+            InstanceLifecycle.MATERIALIZING_WEIGHTS: InstanceLifecycle.COMPILING_WARMING,
+            InstanceLifecycle.COMPILING_WARMING: InstanceLifecycle.READY,
+        }
+        with lifecycle_lock:
+            while instance.state not in {
+                InstanceLifecycle.READY,
+                InstanceLifecycle.BUSY,
+            }:
+                next_state = transitions.get(instance.state)
+                if next_state is None:
+                    raise RuntimeError(
+                        f"Cannot complete MiniMax H3 readiness from {instance.state.value}."
+                    )
+                instance.transition(
+                    next_state,
+                    readiness_evidence=(
+                        readiness_evidence
+                        if next_state == InstanceLifecycle.READY
+                        else None
+                    ),
+                )
+            # A concurrent quorum request may have completed the transition
+            # first with generic evidence. Preserve the richer launch contract.
+            instance.readiness_evidence.update(readiness_evidence)
+
     def supervisor_status(role: str, instance_id: str | None = None):
         try:
             return roles.status(role, instance_id=instance_id)
@@ -1673,30 +1707,26 @@ def create_app(
             instance.health_ready = ready
             instance.health_sampled_at = time.time()
             instance.health_issues = list(issues)
-            if ready and instance.state != InstanceLifecycle.READY:
+            if ready and instance.state not in {
+                InstanceLifecycle.READY,
+                InstanceLifecycle.BUSY,
+            }:
                 try:
-                    if instance.state == InstanceLifecycle.DISTRIBUTED_INITIALIZING:
-                        instance.transition(InstanceLifecycle.LOADING_METADATA)
-                    if instance.state == InstanceLifecycle.LOADING_METADATA:
-                        instance.transition(InstanceLifecycle.MATERIALIZING_WEIGHTS)
-                    if instance.state == InstanceLifecycle.MATERIALIZING_WEIGHTS:
-                        instance.transition(InstanceLifecycle.COMPILING_WARMING)
-                    if instance.state == InstanceLifecycle.COMPILING_WARMING:
-                        instance.transition(
-                            InstanceLifecycle.READY,
-                            readiness_evidence={
-                                "rank_quorum": f"{len(ranks)}/{instance.world_size}",
-                                "model_revision": instance.model_revision,
-                                "connection_mode": instance.connection_mode,
-                                "all_ranks_healthy": True,
-                                "native_video_health": True,
-                                "distributed_protocol": (
-                                    H3_DISTRIBUTED_PROTOCOL_VERSION
-                                    if instance.world_size > 1
-                                    else None
-                                ),
-                            },
-                        )
+                    advance_h3_instance_to_ready(
+                        instance,
+                        {
+                            "rank_quorum": f"{len(ranks)}/{instance.world_size}",
+                            "model_revision": instance.model_revision,
+                            "connection_mode": instance.connection_mode,
+                            "all_ranks_healthy": True,
+                            "native_video_health": True,
+                            "distributed_protocol": (
+                                H3_DISTRIBUTED_PROTOCOL_VERSION
+                                if instance.world_size > 1
+                                else None
+                            ),
+                        },
+                    )
                 except RuntimeError as exc:
                     issues.append(str(exc))
                     ready = False
@@ -3116,12 +3146,9 @@ def create_app(
             instance.process_identities[nodes[0].id] = local_status.pid
             if local_status.log_path:
                 instance.log_paths[nodes[0].id] = local_status.log_path
-            instance.transition(InstanceLifecycle.LOADING_METADATA)
-            instance.transition(InstanceLifecycle.MATERIALIZING_WEIGHTS)
-            instance.transition(InstanceLifecycle.COMPILING_WARMING)
-            instance.transition(
-                InstanceLifecycle.READY,
-                readiness_evidence={
+            advance_h3_instance_to_ready(
+                instance,
+                {
                     "rank_quorum": "2/2",
                     "model_revision": model_revision,
                     "connection_mode": request.connection_mode.value,
@@ -3259,11 +3286,9 @@ def create_app(
         instance.process_identities[nodes[0].id] = status.pid
         if status.log_path:
             instance.log_paths[nodes[0].id] = status.log_path
-        instance.transition(InstanceLifecycle.MATERIALIZING_WEIGHTS)
-        instance.transition(InstanceLifecycle.COMPILING_WARMING)
-        instance.transition(
-            InstanceLifecycle.READY,
-            readiness_evidence={
+        advance_h3_instance_to_ready(
+            instance,
+            {
                 "rank_quorum": "1/1",
                 "model_revision": model_revision,
                 "connection_mode": "single",

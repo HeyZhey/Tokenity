@@ -113,6 +113,40 @@ def test_benchmark_default_profile_is_stock_fused_qmm(tmp_path: Path):
     assert config.starting_port == 30_096
 
 
+def test_benchmark_harness_supports_single_mac(tmp_path: Path):
+    transport = FakeTransport()
+    config = BenchmarkConfig(
+        output_dir=tmp_path,
+        test_id="single-mac",
+        coordinator_agent="http://mac-a:9100",
+        worker_agent="http://mac-a:9100",
+        nodes=[
+            {
+                "id": "mac-a",
+                "agent_url": "http://mac-a:9100",
+                "lan_ip": "mac-a",
+                "rdma_devices": [],
+            }
+        ],
+        model="/models/h3",
+        binary="/runtime/bin/mlx-serve",
+        runs=1,
+        heartbeat_interval_seconds=3600,
+    )
+
+    report = run_benchmark(config, transport=transport)
+
+    assert len(report["runs"]) == 1
+    assert set(report["runs"][0]["rank_snapshots"]) == {"rank-0"}
+    start_payloads = [
+        payload for url, payload in transport.posts
+        if url.endswith("/v1/node/start-minimax-h3-video")
+    ]
+    assert start_payloads[0]["connection_mode"] == "ring"
+    assert set(report["shutdown"]) >= {"rank-0", "rank-0_node_info_after"}
+    assert "rank-1" not in report["shutdown"]
+
+
 def test_benchmark_cli_uses_the_reserved_h3_collective_range():
     args = _build_parser().parse_args(
         [
