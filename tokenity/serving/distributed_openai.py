@@ -228,14 +228,9 @@ class _MLXServerSymbols:
         cls,
         native_mtp: NativeMTPRuntimeController | None = None,
     ) -> "_MLXServerSymbols":
+        _install_model_compatibility()
         import mlx_lm.server as server  # type: ignore
 
-        from tokenity.mlx.glm_moe_dsa_compat import install_glm_moe_dsa_compat
-
-        if install_glm_moe_dsa_compat():
-            logging.warning(
-                "Tokenity installed GLM-5.2 cross-layer indexer sharing compatibility from mlx-lm PR #1410."
-            )
         if native_mtp is not None:
             attach_controller(server, native_mtp)
         _install_chunked_sharded_load(server)
@@ -260,6 +255,15 @@ class _MLXServerSymbols:
             ModelProvider=ModelProvider,
             ResponseGenerator=ResponseGenerator,
             SamplingArguments=SamplingArguments,
+        )
+
+
+def _install_model_compatibility() -> None:
+    from tokenity.mlx.glm_moe_dsa_compat import install_glm_moe_dsa_compat
+
+    if install_glm_moe_dsa_compat():
+        logging.warning(
+            "Tokenity installed GLM-5.2 cross-layer indexer sharing compatibility from mlx-lm PR #1410."
         )
 
 
@@ -1050,6 +1054,8 @@ class TokenityDistributedRuntime:
         try:
             import mlx.core as mx  # type: ignore
             from mlx.utils import tree_flatten  # type: ignore
+
+            _install_model_compatibility()
             from mlx_lm import load  # type: ignore
 
             _configure_mlx_wired_memory(

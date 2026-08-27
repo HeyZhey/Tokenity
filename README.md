@@ -119,25 +119,31 @@ used the same 40-token prompt and generated 256 completion tokens.
 
 | Topology | Load result | Mean decode | p50 decode | Mean TTFT | p50 TTFT | Completed runs |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Single Mac · 512 GiB | Blocked by safe admission | — | — | — | — | — |
+| Single Mac · 512 GiB | 1/1 Runtime Ready · controlled profile | **19.39 tok/s** | **19.70 tok/s** | **4.02 s** | **5.22 s** | **5/5** |
 | Two-Mac TP2 · 2 × 512 GiB | 2/2 ranks Ready | **23.28 tok/s** | **23.75 tok/s** | **1.63 s** | **2.06 s** | **5/5** |
 
-The single-Mac launch was rejected before model startup because the
-conservative requirement was 523.58 GB while only 394.59 GB was admissible on
-the node. Tokenity did not bypass that safety check, so no misleading
-single-Mac throughput is reported. In the TP2 run, each rank observed roughly
-200 GB peak model memory; both ranks remained healthy through all five requests
-and stopped cleanly afterward. The test used `GLM-5.2-mxfp4` with the
-repository's [streaming benchmark harness](scripts/benchmark-openai-stream.py).
+The single-Mac measurement used a controlled 512-token runtime profile with one
+prompt-cache entry and 128-token prefill chunks; every measured request still
+used the same 40-token prompt and 256-token output as TP2. The Runtime reached
+complete `1/1` readiness and observed 395.09 GB of resident MLX model memory.
+Tokenity's normal 4K single-Mac profile remains blocked by conservative safe
+admission (523.58 GB required versus 394.59 GB admissible), so the controlled
+profile is a benchmark configuration rather than a new product default. In the
+TP2 run, each rank observed roughly 200 GB peak model memory. Every request
+completed, and all processes, ports, and reservations were released afterward.
+The test used `GLM-5.2-mxfp4` with the repository's
+[streaming benchmark harness](scripts/benchmark-openai-stream.py).
 
 ### MiniMax H3 video generation
 
 The paired 2026-08-26 cold run used `512×256`, 124 frames, 28 sampling steps,
 seed 42, and `fast=false`:
 
-| Measurement | Single Mac | Two-Mac TP2 | Improvement |
-| --- | ---: | ---: | ---: |
-| Cold DiT sampling | 316.203 s | 181.385 s | **1.743× · 42.6% less time** |
+| Topology / comparison | Cold DiT sampling | Relative result |
+| --- | ---: | ---: |
+| Single Mac · 512 GiB | 316.203 s | 1.000× baseline |
+| Two-Mac TP2 · 2 × 512 GiB | 181.385 s | **1.743× speedup** |
+| TP2 improvement | **134.818 s saved** | **42.6% less time** |
 
 Both requests completed all 28 denoising steps and returned 124 RGB8 frames
 plus stereo PCM audio. TP2 used JACCL over Thunderbolt RDMA; both ranks exited
