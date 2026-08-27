@@ -115,6 +115,60 @@ def test_runtime_supports_custom_api_identifier_and_runtime_tuning():
     assert runtime.prompt_concurrency == 3
 
 
+def test_single_loader_installs_model_compatibility_before_mlx_lm_load(
+    tmp_path,
+    monkeypatch,
+):
+    calls = []
+    fake_mlx = types.ModuleType("mlx")
+    fake_mlx.__path__ = []  # type: ignore[attr-defined]
+    fake_core = types.ModuleType("mlx.core")
+    fake_core.metal = SimpleNamespace(is_available=lambda: True)  # type: ignore[attr-defined]
+    fake_core.device_info = lambda: {"max_recommended_working_set_size": 1}  # type: ignore[attr-defined]
+    fake_core.set_wired_limit = lambda _limit: None  # type: ignore[attr-defined]
+    fake_mlx.core = fake_core  # type: ignore[attr-defined]
+    fake_utils = types.ModuleType("mlx.utils")
+    fake_utils.tree_flatten = lambda _parameters: []  # type: ignore[attr-defined]
+
+    fake_compat = types.ModuleType("tokenity.mlx.glm_moe_dsa_compat")
+    fake_compat.install_glm_moe_dsa_compat = lambda: calls.append("compat") or True  # type: ignore[attr-defined]
+    fake_mlx_lm = types.ModuleType("mlx_lm")
+
+    class FakeModel:
+        def parameters(self):
+            return {}
+
+    class FakeTokenizer:
+        pass
+
+    def fake_load(_model, **_kwargs):
+        calls.append("load")
+        return FakeModel(), FakeTokenizer()
+
+    fake_mlx_lm.load = fake_load  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mlx", fake_mlx)
+    monkeypatch.setitem(sys.modules, "mlx.core", fake_core)
+    monkeypatch.setitem(sys.modules, "mlx.utils", fake_utils)
+    monkeypatch.setitem(sys.modules, "mlx_lm", fake_mlx_lm)
+    monkeypatch.setitem(
+        sys.modules,
+        "tokenity.mlx.glm_moe_dsa_compat",
+        fake_compat,
+    )
+
+    runtime = TokenityDistributedRuntime(
+        model=str(tmp_path / "GLM-5.2-mxfp4"),
+        state=ReadinessState(model="GLM-5.2-mxfp4", connection_mode="single"),
+        execution_mode="single",
+    )
+    runtime._warmup_single = lambda: None  # type: ignore[method-assign]  # noqa: SLF001
+
+    runtime._start_single()  # noqa: SLF001
+
+    assert calls == ["compat", "load"]
+    assert runtime.state.phase is ReadinessPhase.READY
+
+
 def test_stream_payload_keeps_reasoning_separate_from_answer():
     reasoning = _stream_payload(
         SimpleNamespace(text="check the plan", state="reasoning"),
