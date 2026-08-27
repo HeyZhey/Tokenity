@@ -132,27 +132,16 @@ repository's [streaming benchmark harness](scripts/benchmark-openai-stream.py).
 
 ### MiniMax H3 video generation
 
-The paired 2026-08-26 run used `512×256`, 124 frames, 28 sampling steps, seed
-42, and `fast=false`. Each topology completed one cold and three warm requests
-through the Agent gateway with all RGB8 frames and stereo PCM audio:
+The paired 2026-08-26 cold run used `512×256`, 124 frames, 28 sampling steps,
+seed 42, and `fast=false`:
 
 | Measurement | Single Mac | Two-Mac TP2 | Improvement |
 | --- | ---: | ---: | ---: |
-| Cold DiT sampling | 316.203 s | 181.385 s | **1.743×** |
-| Cold end to end | 347.126 s | 201.497 s | **1.723×** |
-| Warm DiT mean · n=3 | 315.024 s | 182.076 s | **1.730× · 42.2% less time** |
-| Warm end-to-end median · n=3 | 338.744 s | 204.544 s | **1.656× · 39.6% less time** |
-| Warm video-decode mean | 9.937 s | 10.002 s | Rank 0 only |
-| Warm audio-decode mean | 0.570 s | 0.571 s | Rank 0 only |
+| Cold DiT sampling | 316.203 s | 181.385 s | **1.743× · 42.6% less time** |
 
-All eight requests completed with 31 progress events, 124 frames, and valid
-audio. Each topology was byte-deterministic across its four runs. The
-full-weight single-Mac and sharded TP2 numerical paths are not cross-topology
-bit-exact; their complete 124-frame RGB outputs measured SSIM `0.910` and PSNR
-`27.26 dB`. The warm end-to-end median is reported because one single-Mac run
-had a gateway output-transfer outlier; the backend DiT measurements remained
-stable. Both TP2 ranks exited with code 0, and both Agents released every port
-and memory reservation.
+Both requests completed all 28 denoising steps and returned 124 RGB8 frames
+plus stereo PCM audio. TP2 used JACCL over Thunderbolt RDMA; both ranks exited
+with code 0 and released their ports and memory reservations.
 
 See [MiniMax H3 video](docs/minimax-h3-video.md) for the full protocol,
 benchmark harness, fingerprints, and reproducibility notes.
