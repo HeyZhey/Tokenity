@@ -1769,8 +1769,11 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertEqual(restored.chatSessions.count, 2)
     }
 
-    func testModelLibraryRowsExposeFormatQuantizationAndSize() {
-        let store = TokenityStore()
+    func testModelLibraryRowsExposeMetadataAndDefaultToSupportedContextLength() {
+        let suiteName = "TokenityStoreTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = TokenityStore(userDefaults: defaults)
         for index in store.nodes.indices where store.selectedNodeIDs.contains(store.nodes[index].id) {
             store.nodes[index].models = [
                 ModelEntry(
@@ -1780,6 +1783,7 @@ final class TokenityStoreTests: XCTestCase {
                     quantization: "4-bit · group 64",
                     sizeBytes: 64 * 1_073_741_824,
                     architecture: "QwenMoeForCausalLM",
+                    contextLength: 131_072,
                     shardCount: 10
                 )
             ]
@@ -1790,7 +1794,15 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertEqual(row?.quantization, "4-bit · group 64")
         XCTAssertEqual(row?.sizeText, "64 GB")
         XCTAssertEqual(row?.architecture, "QwenMoeForCausalLM")
+        XCTAssertEqual(row?.contextLength, 131_072)
         XCTAssertEqual(row?.shardCount, 10)
+        XCTAssertEqual(store.modelConfiguration(for: "Qwen").maximumOutputTokens, 131_072)
+
+        var customized = store.modelConfiguration(for: "Qwen")
+        customized.maximumOutputTokens = 4_096
+        store.updateModelConfiguration(customized, for: "Qwen")
+
+        XCTAssertEqual(store.modelConfiguration(for: "Qwen").maximumOutputTokens, 4_096)
     }
 
     func testLegacyModelConfigurationMigratesThinkingAndPenaltyDefaults() throws {

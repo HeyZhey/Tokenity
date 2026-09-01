@@ -307,6 +307,10 @@ final class TokenityStore: ObservableObject {
         "No cluster is running."
     ]
 
+    lazy var benchmarkRunner = BenchmarkRunner(
+        transport: TokenityStoreBenchmarkTransport(store: self)
+    )
+
     private let dataTransport: DataTransport
     private let lineStreamTransport: LineStreamTransport
     private let videoArtifactTransport: VideoArtifactTransport
@@ -376,6 +380,7 @@ final class TokenityStore: ObservableObject {
     // from an older epoch is never allowed to rewrite model/instance state.
     private var modelOperationEpoch: UInt64 = 0
     private var nodeTopologyRevision = 0
+    private var benchmarkLifecycleMutationInProgress = false
     private(set) var statusMonitoringStartCount = 0
 
     init(
@@ -898,6 +903,10 @@ final class TokenityStore: ObservableObject {
     }
 
     func startVideoRuntime() async {
+        guard !benchmarkRunner.isActive || benchmarkLifecycleMutationInProgress else {
+            appendLog("Video runtime start blocked while Benchmark is active.")
+            return
+        }
         guard videoRuntimeState != .starting, !isVideoRuntimeReady else { return }
         let runtimeOperationID = UUID()
         activeVideoRuntimeOperationID = runtimeOperationID
@@ -1008,6 +1017,10 @@ final class TokenityStore: ObservableObject {
     }
 
     func stopVideoRuntime() async {
+        guard !benchmarkRunner.isActive || benchmarkLifecycleMutationInProgress else {
+            appendLog("Video runtime stop blocked while Benchmark is active.")
+            return
+        }
         guard videoRuntimeInstanceID != nil || videoRuntimeState != .stopped else { return }
         activeVideoRuntimeOperationID = nil
         cancelVideoGeneration()
@@ -1037,6 +1050,10 @@ final class TokenityStore: ObservableObject {
     }
 
     func beginVideoGeneration() {
+        guard !benchmarkRunner.isActive else {
+            appendLog("Video generation blocked while Benchmark is active.")
+            return
+        }
         guard videoTask == nil, !isVideoGenerating else { return }
         videoTask = Task { [weak self] in
             await self?.generateVideo()
@@ -1163,7 +1180,14 @@ final class TokenityStore: ObservableObject {
     }
 
     func modelConfiguration(for modelID: String) -> ModelRuntimeConfiguration {
-        modelConfigurations[modelID, default: .default]
+        if let saved = modelConfigurations[modelID] {
+            return saved
+        }
+        var configuration = ModelRuntimeConfiguration.default
+        if let contextLength = modelLibraryRows.first(where: { $0.id == modelID })?.contextLength {
+            configuration.maximumOutputTokens = contextLength
+        }
+        return configuration.validated()
     }
 
     func updateModelConfiguration(_ configuration: ModelRuntimeConfiguration, for modelID: String) {
@@ -1218,6 +1242,10 @@ final class TokenityStore: ObservableObject {
     }
 
     func stopResidentModelInstance(_ instanceID: String) async {
+        guard !benchmarkRunner.isActive || benchmarkLifecycleMutationInProgress else {
+            appendLog("Resident model stop blocked while Benchmark is active.")
+            return
+        }
         guard let managed = managedModelInstances[instanceID] else { return }
         modelOperationEpoch &+= 1
         locallyStoppedModelInstanceIDs.insert(instanceID)
@@ -1466,9 +1494,11 @@ final class TokenityStore: ObservableObject {
                 quantization: modelEntries.compactMap(\.quantization).first,
                 sizeBytes: modelEntries.compactMap(\.sizeBytes).max(),
                 architecture: modelEntries.compactMap(\.architecture).first,
+                contextLength: modelEntries.compactMap(\.contextLength).filter { $0 > 0 }.min(),
                 shardCount: modelEntries.compactMap(\.shardCount).max(),
                 nativeMTP: nativeMTP,
                 modelType: modelEntries.compactMap(\.modelType).first,
+                revision: modelEntries.compactMap(\.revision).first,
                 standaloneLoadable: draftOnlyEntry == nil,
                 loadBlockReason: draftOnlyEntry?.loadBlockReason ?? (draftOnlyEntry == nil ? nil : "Qwen3.5 MTP weights are a speculative-decoding draft model and cannot be loaded as a standalone chat model. Load the matching Qwen3.5 base model instead."),
                 distributedLoadable: distributedBlockedEntry == nil,
@@ -1494,6 +1524,7 @@ final class TokenityStore: ObservableObject {
                 shardCount: videoNodes.count == 2 ? 2 : nil,
                 nativeMTP: nil,
                 modelType: "minimax_h3",
+                revision: nil,
                 standaloneLoadable: true,
                 loadBlockReason: nil,
                 distributedLoadable: true,
@@ -1514,7 +1545,7 @@ final class TokenityStore: ObservableObject {
     }
 
     func canLoadModel(_ row: ModelLibraryRow) -> Bool {
-        guard row.standaloneLoadable, !isModelTransitioning else { return false }
+        guard row.standaloneLoadable, !isModelTransitioning, !benchmarkRunner.isActive else { return false }
         if row.modality == .video {
             return !isVideoPreflightRunning && videoRuntimeReadinessIssues.isEmpty
         }
@@ -1682,6 +1713,10 @@ final class TokenityStore: ObservableObject {
     }
 
     func useOneMacForVideo() {
+        guard !benchmarkRunner.isActive else {
+            appendLog("Video topology changes are blocked while Benchmark is active.")
+            return
+        }
         guard let target = videoNodes.first ?? plannedNodes.first else { return }
         selectedNodeIDs = [target.id]
         coordinatorID = target.id
@@ -2271,6 +2306,10 @@ final class TokenityStore: ObservableObject {
     }
 
     func toggleNodeSelection(_ node: TokenityNode) {
+        guard !benchmarkRunner.isActive else {
+            appendLog("Mac selection changes are blocked while Benchmark is active.")
+            return
+        }
         guard canEditCluster else {
             appendLog("Stop the cluster before changing selected Macs.")
             return
@@ -2292,6 +2331,10 @@ final class TokenityStore: ObservableObject {
     }
 
     func beginLoadingModel(_ row: ModelLibraryRow) {
+        guard !benchmarkRunner.isActive else {
+            appendLog("Model loading blocked while Benchmark is active.")
+            return
+        }
         guard activeModelLoadID == nil, pendingModelLoadID == nil, modelLoadTask == nil else {
             appendLog("Ignored duplicate Load for \(row.displayName); the existing operation remains authoritative.")
             return
@@ -2529,6 +2572,10 @@ final class TokenityStore: ObservableObject {
     }
 
     func stopModel(_ row: ModelLibraryRow) async {
+        guard !benchmarkRunner.isActive || benchmarkLifecycleMutationInProgress else {
+            appendLog("Model stop blocked while Benchmark is active.")
+            return
+        }
         if row.modality == .video {
             modelOperationEpoch &+= 1
             pendingModelLoadID = nil
@@ -2617,6 +2664,10 @@ final class TokenityStore: ObservableObject {
 
     func beginSendingChatMessage() {
         let prompt = chatInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !benchmarkRunner.isActive else {
+            appendLog("Chat generation blocked while Benchmark is active.")
+            return
+        }
         guard !prompt.isEmpty, !isChatRunning, chatTask == nil else { return }
         guard loadedModelName != nil, phase == .running else {
             appendLog("Chat is waiting for a running cluster and loaded model.")
@@ -2872,6 +2923,10 @@ final class TokenityStore: ObservableObject {
     }
 
     func stopCluster() async {
+        guard !benchmarkRunner.isActive || benchmarkLifecycleMutationInProgress else {
+            appendLog("Cluster stop blocked while Benchmark is active.")
+            return
+        }
         modelOperationEpoch &+= 1
         phase = .stopping
         serverHealth = .starting("Stopping model service")
@@ -2908,6 +2963,7 @@ final class TokenityStore: ObservableObject {
     func shutdownForApplicationTermination() async {
         stopStatusMonitoring()
         stopNodeDiscoveryMonitoring()
+        await benchmarkRunner.cancelAndWait()
         let cancelledChatTask = cancelActiveChat(
             message: "Generation stopped because Tokenity is closing.",
             logReason: "application termination"
@@ -5264,6 +5320,471 @@ final class TokenityStore: ObservableObject {
 
     private func estimateTokens(_ text: String) -> Int {
         max(1, text.split(whereSeparator: { $0.isWhitespace }).count)
+    }
+
+    func benchmarkPreflight(
+        _ configuration: BenchmarkConfiguration
+    ) async throws -> BenchmarkPreparedTarget {
+        if let issue = configuration.validationIssue {
+            throw BenchmarkRunnerError.invalidConfiguration(issue)
+        }
+        guard !isChatRunning else {
+            throw BenchmarkRunnerError.conflictingWorkload(
+                "Wait for Chat to finish or cancel it before running Benchmark."
+            )
+        }
+        guard !isVideoGenerating else {
+            throw BenchmarkRunnerError.conflictingWorkload(
+                "Wait for video generation to finish or cancel it before running Benchmark."
+            )
+        }
+        guard !isModelTransitioning else {
+            throw BenchmarkRunnerError.conflictingWorkload(
+                "Wait for the active model load or unload operation to finish."
+            )
+        }
+
+        let storageRoot = BenchmarkResultStore.defaultRootDirectory()
+        let capacityProbe = storageRoot.deletingLastPathComponent()
+        if let available = try? capacityProbe.resourceValues(
+            forKeys: [.volumeAvailableCapacityForImportantUsageKey]
+        ).volumeAvailableCapacityForImportantUsage {
+            let previewBytes = configuration.saveVideoPreview
+                ? Int64(configuration.width * configuration.height * configuration.frames * 3)
+                : 0
+            let required = configuration.kind == .videoGeneration
+                ? max(Int64(2 * 1_024 * 1_024 * 1_024), previewBytes + Int64(2 * 1_024 * 1_024 * 1_024))
+                : Int64(128 * 1_024 * 1_024)
+            guard available >= required else {
+                throw BenchmarkRunnerError.runtimeUnavailable(
+                    "Benchmark needs at least \(ByteCountFormatter.string(fromByteCount: required, countStyle: .file)) of free disk space."
+                )
+            }
+        }
+
+        guard let row = modelLibraryRows.first(where: {
+            $0.id == configuration.modelID && $0.modality == configuration.kind.modality
+        }) else {
+            throw BenchmarkRunnerError.runtimeUnavailable(
+                "The selected model is not present in the current model inventory. Scan Models and try again."
+            )
+        }
+        guard row.standaloneLoadable else {
+            throw BenchmarkRunnerError.runtimeUnavailable(
+                row.loadBlockReason ?? "The selected checkpoint cannot run independently."
+            )
+        }
+        if configuration.target == .tensorParallel2, !row.distributedLoadable {
+            throw BenchmarkRunnerError.topologyUnavailable(
+                row.distributedLoadBlockReason ?? "The selected model is not available for TP2."
+            )
+        }
+
+        let targetNodes: [TokenityNode]
+        switch configuration.target {
+        case .currentMac:
+            guard let node = coordinator ?? selectedNodes.first else {
+                throw BenchmarkRunnerError.topologyUnavailable("No current Mac is selected.")
+            }
+            targetNodes = [node]
+        case .selectedNode:
+            guard let nodeID = configuration.targetNodeID,
+                  let node = selectedNodes.first(where: { $0.id == nodeID }) else {
+                throw BenchmarkRunnerError.topologyUnavailable("Choose an available Mac for this benchmark.")
+            }
+            targetNodes = [node]
+        case .tensorParallel2:
+            guard selectedNodes.count == 2 else {
+                throw BenchmarkRunnerError.topologyUnavailable(
+                    "TP2 requires exactly two selected Macs. Adjust the Cluster selection first."
+                )
+            }
+            targetNodes = plannedNodes
+        }
+        guard targetNodes.allSatisfy(\.isOnline) else {
+            throw BenchmarkRunnerError.topologyUnavailable("Every Benchmark Mac must be online.")
+        }
+        if configuration.kind == .languageModel {
+            let unavailable = targetNodes.filter { node in
+                !node.models.contains(where: { entry in
+                    entry.id == configuration.modelID
+                        && entry.standaloneLoadable != false
+                        && (configuration.target != .tensorParallel2 || entry.distributedLoadable != false)
+                })
+            }
+            guard unavailable.isEmpty else {
+                throw BenchmarkRunnerError.topologyUnavailable(
+                    "\(configuration.modelID) is unavailable on: \(unavailable.map(\.displayName).joined(separator: ", "))."
+                )
+            }
+        }
+        if configuration.kind == .videoGeneration,
+           configuration.target != .tensorParallel2,
+           !managedModelInstances.isEmpty {
+            throw BenchmarkRunnerError.conflictingWorkload(
+                "A single-Mac H3 benchmark would change the active Mac selection. Stop resident language models first, or use TP2."
+            )
+        }
+
+        let targetIDs = Set(targetNodes.map(\.id))
+        var existingInstanceID: String?
+        var serviceBaseURL: String?
+        var existingRevision: String?
+        if configuration.kind == .languageModel {
+            let existing = managedModelInstances.values.first { instance in
+                instance.modelID == configuration.modelID
+                    && instance.isRoutable
+                    && Set(instance.selectedNodes) == targetIDs
+                    && (configuration.target == .tensorParallel2
+                        ? instance.executionMode?.lowercased() == "distributed"
+                        : instance.executionMode?.lowercased() == "single")
+            }
+            existingInstanceID = existing?.instanceID
+            serviceBaseURL = existing?.apiBaseURL
+            existingRevision = existing?.modelRevision
+        } else if isVideoRuntimeReady {
+            let activeIDs = Set(videoNodes.map(\.id))
+            if activeIDs == targetIDs {
+                existingInstanceID = videoRuntimeInstanceID
+                existingRevision = videoNodes.compactMap { node in
+                    node.modelInstances.first(where: { $0.instanceID == videoRuntimeInstanceID })?.modelRevision
+                }.first
+            }
+        }
+
+        return BenchmarkPreparedTarget(
+            kind: configuration.kind,
+            modelID: configuration.modelID,
+            topology: configuration.target.topology,
+            nodeIDs: targetNodes.map(\.id),
+            nodes: targetNodes.map(\.displayName),
+            rankOrder: targetNodes.map(\.displayName),
+            modelRevision: existingRevision ?? row.revision,
+            quantization: row.quantization,
+            instanceID: existingInstanceID,
+            borrowedResidentModel: existingInstanceID != nil,
+            needsLoading: existingInstanceID == nil,
+            serviceBaseURL: serviceBaseURL,
+            loadMilliseconds: nil,
+            previousBackendMode: backendMode,
+            previousCoordinatorID: coordinatorID,
+            previousSelectedNodeIDs: selectedNodeIDs,
+            previousH3WorkerAgentURL: h3WorkerAgentURL
+        )
+    }
+
+    func benchmarkPrepare(
+        _ configuration: BenchmarkConfiguration,
+        target original: BenchmarkPreparedTarget
+    ) async throws -> BenchmarkPreparedTarget {
+        guard original.needsLoading else { return original }
+        var target = original
+        let started = ProcessInfo.processInfo.systemUptime
+        let beforeLanguageInstances = Set(managedModelInstances.keys)
+        var createdLanguageInstanceID: String?
+        var createdVideoInstanceID: String?
+        benchmarkLifecycleMutationInProgress = true
+        defer { benchmarkLifecycleMutationInProgress = false }
+        do {
+            switch configuration.target {
+            case .currentMac, .selectedNode:
+                guard let selectedID = target.nodeIDs.first,
+                      let chosen = nodes.first(where: { $0.id == selectedID }) else {
+                    throw BenchmarkRunnerError.topologyUnavailable("The selected Mac is no longer available.")
+                }
+                backendMode = .singleNode
+                coordinatorID = chosen.id
+                if configuration.kind == .videoGeneration {
+                    selectedNodeIDs = [chosen.id]
+                    h3WorkerAgentURL = ""
+                }
+            case .tensorParallel2:
+                backendMode = .distributed
+            }
+
+            switch configuration.kind {
+            case .languageModel:
+                if phase == .stopped || phase == .failed {
+                    createCluster()
+                }
+                guard isClusterConfigured else {
+                    throw BenchmarkRunnerError.topologyUnavailable(
+                        launchPreview.readinessIssues.first ?? "The selected cluster is not ready."
+                    )
+                }
+                guard let row = modelLibraryRows.first(where: {
+                    $0.id == configuration.modelID && $0.modality == .language
+                }) else {
+                    throw BenchmarkRunnerError.runtimeUnavailable("The selected language model disappeared from inventory.")
+                }
+                await loadModel(row)
+                let created = managedModelInstances.values.first { instance in
+                    !beforeLanguageInstances.contains(instance.instanceID)
+                        && instance.modelID == configuration.modelID
+                        && instance.isRoutable
+                }
+                guard let created else {
+                    throw BenchmarkRunnerError.runtimeUnavailable(modelLoadMessage)
+                }
+                createdLanguageInstanceID = created.instanceID
+                target.instanceID = created.instanceID
+                target.serviceBaseURL = created.apiBaseURL
+                target.modelRevision = created.modelRevision ?? target.modelRevision
+            case .videoGeneration:
+                await refreshVideoNodes(validateRuntime: true)
+                if let issue = videoReadiness.first {
+                    throw BenchmarkRunnerError.runtimeUnavailable(issue.message)
+                }
+                await startVideoRuntime()
+                guard isVideoRuntimeReady, let instanceID = videoRuntimeInstanceID else {
+                    throw BenchmarkRunnerError.runtimeUnavailable(
+                        videoGenerationError ?? "MiniMax H3 did not become ready."
+                    )
+                }
+                createdVideoInstanceID = instanceID
+                target.instanceID = instanceID
+            }
+            target.needsLoading = false
+            target.borrowedResidentModel = false
+            target.loadMilliseconds = (ProcessInfo.processInfo.systemUptime - started) * 1_000
+            return target
+        } catch {
+            if let createdLanguageInstanceID {
+                await stopResidentModelInstance(createdLanguageInstanceID)
+            }
+            if let createdVideoInstanceID, videoRuntimeInstanceID == createdVideoInstanceID {
+                await stopVideoRuntime()
+            }
+            backendMode = original.previousBackendMode
+            coordinatorID = original.previousCoordinatorID
+            selectedNodeIDs = original.previousSelectedNodeIDs
+            h3WorkerAgentURL = original.previousH3WorkerAgentURL
+            throw error
+        }
+    }
+
+    func benchmarkLanguageStream(
+        _ configuration: BenchmarkConfiguration,
+        target: BenchmarkPreparedTarget
+    ) -> AsyncThrowingStream<BenchmarkTimedStreamEvent, Error> {
+        guard let base = target.serviceBaseURL,
+              var components = URLComponents(string: base),
+              components.host != nil else {
+            return AsyncThrowingStream { continuation in
+                continuation.finish(throwing: BenchmarkRunnerError.runtimeUnavailable(
+                    "The exact resident model service address is unavailable."
+                ))
+            }
+        }
+        components.path = "/v1/chat/completions"
+        components.query = nil
+        guard let url = components.url else {
+            return AsyncThrowingStream { continuation in
+                continuation.finish(throwing: TokenityTransportError.missingModelService)
+            }
+        }
+        let serviceName = target.instanceID.flatMap { managedModelInstances[$0]?.serviceModelName }
+            ?? configuration.modelID
+        let body = OpenAIChatRequest(
+            model: serviceName,
+            messages: [.init(role: "user", content: configuration.prompt)],
+            stream: true,
+            maxTokens: configuration.maximumOutputTokens,
+            temperature: configuration.temperature,
+            topP: 1,
+            topK: 0,
+            minP: 0,
+            presencePenalty: 0,
+            repetitionPenalty: 1,
+            chatTemplateKwargs: nil,
+            tokenityRoutePolicy: nil,
+            tokenitySessionID: "benchmark-\(UUID().uuidString)",
+            tokenityLockModel: true,
+            tokenityConstraints: nil
+        )
+        let request: URLRequest
+        do {
+            var encoded = try jsonRequest(url: url, body: body)
+            encoded.timeoutInterval = 600
+            encoded.addValue("text/event-stream", forHTTPHeaderField: "Accept")
+            request = encoded
+        } catch {
+            return AsyncThrowingStream { continuation in continuation.finish(throwing: error) }
+        }
+        let source = lineStreamTransport(request)
+        return AsyncThrowingStream(bufferingPolicy: .bufferingOldest(32)) { continuation in
+            let task = Task {
+                do {
+                    for try await event in source {
+                        let timestamp = ProcessInfo.processInfo.systemUptime
+                        switch event {
+                        case .response(let metadata):
+                            _ = continuation.yield(BenchmarkTimedStreamEvent(
+                                timestamp: timestamp,
+                                payload: .response(BenchmarkStreamResponse(
+                                    requestID: metadata.route.requestID,
+                                    modelRevision: metadata.route.modelRevision ?? target.modelRevision,
+                                    instanceID: metadata.route.instanceID ?? target.instanceID
+                                ))
+                            ))
+                        case .line(let line):
+                            _ = continuation.yield(BenchmarkTimedStreamEvent(
+                                timestamp: timestamp,
+                                payload: .line(line)
+                            ))
+                        }
+                        try Task.checkCancellation()
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    func benchmarkRequestTimeline(
+        requestID: String,
+        target: BenchmarkPreparedTarget
+    ) async throws -> BenchmarkRequestTimeline? {
+        guard let base = target.serviceBaseURL,
+              var components = URLComponents(string: base),
+              components.host != nil else { return nil }
+        components.path = "/v1/readiness"
+        components.query = nil
+        guard let url = components.url else { return nil }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 5
+        let (data, response) = try await dataTransport(request)
+        try validate(response, data: data)
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let timeline = object["last_request"] as? [String: Any],
+              let timelineRequestID = timeline["request_id"] as? String,
+              timelineRequestID == requestID else { return nil }
+        return BenchmarkRequestTimeline(
+            requestID: timelineRequestID,
+            prefillStart: timeline["prefill_start"] as? Double,
+            prefillEnd: timeline["prefill_end"] as? Double
+        )
+    }
+
+    func benchmarkVideoStream(
+        _ configuration: BenchmarkConfiguration,
+        target: BenchmarkPreparedTarget
+    ) -> AsyncThrowingStream<BenchmarkTimedStreamEvent, Error> {
+        guard let instanceID = target.instanceID, let baseURL = videoControlBaseURL() else {
+            return AsyncThrowingStream { continuation in
+                continuation.finish(throwing: BenchmarkRunnerError.runtimeUnavailable(
+                    "The exact MiniMax H3 runtime is unavailable."
+                ))
+            }
+        }
+        let generation = H3VideoGenerationRequest(
+            model: instanceID,
+            prompt: configuration.prompt,
+            width: configuration.width,
+            height: configuration.height,
+            numFrames: configuration.frames,
+            steps: configuration.steps,
+            seed: configuration.seed,
+            fast: configuration.fast,
+            stream: true
+        ).validated()
+        let request: URLRequest
+        do {
+            var encoded = try jsonRequest(
+                url: baseURL.appendingPathComponent("/v1/video/generations"),
+                body: generation
+            )
+            encoded.timeoutInterval = 14_400
+            encoded.addValue("text/event-stream", forHTTPHeaderField: "Accept")
+            request = encoded
+        } catch {
+            return AsyncThrowingStream { continuation in continuation.finish(throwing: error) }
+        }
+        let source = lineStreamTransport(request)
+        return AsyncThrowingStream(bufferingPolicy: .bufferingOldest(32)) { continuation in
+            let task = Task {
+                do {
+                    for try await event in source {
+                        let timestamp = ProcessInfo.processInfo.systemUptime
+                        switch event {
+                        case .response(let metadata):
+                            _ = continuation.yield(BenchmarkTimedStreamEvent(
+                                timestamp: timestamp,
+                                payload: .response(BenchmarkStreamResponse(
+                                    requestID: metadata.route.requestID,
+                                    modelRevision: metadata.route.modelRevision ?? target.modelRevision,
+                                    instanceID: metadata.route.instanceID ?? target.instanceID
+                                ))
+                            ))
+                        case .line(let line):
+                            _ = continuation.yield(BenchmarkTimedStreamEvent(timestamp: timestamp, payload: .line(line)))
+                        }
+                        try Task.checkCancellation()
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    func benchmarkSaveVideoPreview(
+        completionLine: String,
+        configuration: BenchmarkConfiguration
+    ) async throws -> URL? {
+        guard let event = try H3VideoSSEParser.parse(line: completionLine),
+              case .complete(let payload) = event else {
+            throw BenchmarkRunnerError.malformedSSE("preview completion payload is invalid")
+        }
+        let request = H3VideoGenerationRequest(
+            prompt: configuration.prompt,
+            width: configuration.width,
+            height: configuration.height,
+            numFrames: configuration.frames,
+            steps: configuration.steps,
+            seed: configuration.seed,
+            fast: configuration.fast,
+            stream: true
+        )
+        return try await videoArtifactTransport(payload, request).movieURL
+    }
+
+    func benchmarkCleanup(_ target: BenchmarkPreparedTarget) async throws {
+        guard !target.borrowedResidentModel else { return }
+        benchmarkLifecycleMutationInProgress = true
+        defer {
+            backendMode = target.previousBackendMode
+            coordinatorID = target.previousCoordinatorID
+            selectedNodeIDs = target.previousSelectedNodeIDs
+            h3WorkerAgentURL = target.previousH3WorkerAgentURL
+            benchmarkLifecycleMutationInProgress = false
+        }
+        switch target.kind {
+        case .languageModel:
+            if let instanceID = target.instanceID,
+               managedModelInstances[instanceID]?.modelID == target.modelID {
+                await stopResidentModelInstance(instanceID)
+                if managedModelInstances[instanceID] != nil {
+                    throw BenchmarkRunnerError.runtimeUnavailable(
+                        "Could not stop Benchmark-owned model instance \(instanceID)."
+                    )
+                }
+            }
+        case .videoGeneration:
+            if let instanceID = target.instanceID, videoRuntimeInstanceID == instanceID {
+                await stopVideoRuntime()
+                if videoRuntimeInstanceID == instanceID {
+                    throw BenchmarkRunnerError.runtimeUnavailable(
+                        "Could not stop Benchmark-owned MiniMax H3 instance \(instanceID)."
+                    )
+                }
+            }
+        }
     }
 
     private nonisolated static func liveData(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {

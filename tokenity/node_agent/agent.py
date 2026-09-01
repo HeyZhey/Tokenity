@@ -4680,6 +4680,13 @@ def scan_models(root: Path) -> list[dict[str, object]]:
                     "quantization": _quantization_description(config, model_path),
                     "size_bytes": _directory_size(model_path),
                     "architecture": architecture,
+                    "context_length": _first_positive_int(
+                        config,
+                        "max_position_embeddings",
+                        "context_length",
+                        "model_max_length",
+                        default=32_768,
+                    ),
                     "shard_count": len(gguf_files) + len(safetensors),
                     "revision": _model_revision(str(model_path)),
                     "native_mtp": scan_native_mtp_capability(model_path).to_dict(),

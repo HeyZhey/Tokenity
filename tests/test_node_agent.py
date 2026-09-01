@@ -817,7 +817,13 @@ def test_model_scan(tmp_path: Path):
     model = tmp_path / "Qwen3.5-122B-A10B-4bit"
     model.mkdir()
     (model / "config.json").write_text(
-        '{"architectures":["Qwen3_5MoeForCausalLM"],"quantization":{"bits":4,"group_size":64}}',
+        json.dumps(
+            {
+                "architectures": ["Qwen3_5MoeForCausalLM"],
+                "text_config": {"max_position_embeddings": 262_144},
+                "quantization": {"bits": 4, "group_size": 64},
+            }
+        ),
         encoding="utf-8",
     )
     (model / "model-00001-of-00002.safetensors").write_bytes(b"a" * 128)
@@ -832,6 +838,7 @@ def test_model_scan(tmp_path: Path):
     assert payload["format"] == "MLX"
     assert payload["quantization"] == "4-bit · group 64"
     assert payload["architecture"] == "Qwen3_5MoeForCausalLM"
+    assert payload["context_length"] == 262_144
     assert payload["shard_count"] == 2
     assert payload["size_bytes"] >= 384
 

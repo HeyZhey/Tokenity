@@ -8,6 +8,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     case models
     case network
     case api
+    case benchmark
     case logs
     case settings
 
@@ -22,6 +23,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .models: return "Models"
         case .network: return "Network / RDMA"
         case .api: return "API Access"
+        case .benchmark: return "Benchmark"
         case .logs: return "Logs"
         case .settings: return "Settings"
         }
@@ -36,6 +38,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .models: return "cube.transparent"
         case .network: return "network"
         case .api: return "point.3.connected.trianglepath.dotted"
+        case .benchmark: return "gauge.with.needle"
         case .logs: return "scroll"
         case .settings: return "gearshape"
         }
@@ -44,7 +47,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     var group: String {
         switch self {
         case .overview, .cluster, .chat, .video, .models, .network: return "Cluster"
-        case .api, .logs, .settings: return "Operations"
+        case .api, .benchmark, .logs, .settings: return "Operations"
         }
     }
 }
@@ -536,6 +539,7 @@ struct ModelEntry: Codable, Hashable, Identifiable {
     var quantization: String? = nil
     var sizeBytes: Int64? = nil
     var architecture: String? = nil
+    var contextLength: Int? = nil
     var shardCount: Int? = nil
     var nativeMTP: NativeMTPCapability? = nil
     var modelType: String? = nil
@@ -547,6 +551,7 @@ struct ModelEntry: Codable, Hashable, Identifiable {
 
     enum CodingKeys: String, CodingKey {
         case id, path, format, quantization, architecture, revision
+        case contextLength = "context_length"
         case sizeBytes = "size_bytes"
         case shardCount = "shard_count"
         case nativeMTP = "native_mtp"
@@ -925,9 +930,11 @@ struct ModelLibraryRow: Identifiable, Hashable {
     var quantization: String?
     var sizeBytes: Int64?
     var architecture: String?
+    var contextLength: Int? = nil
     var shardCount: Int?
     var nativeMTP: NativeMTPCapability?
     var modelType: String?
+    var revision: String? = nil
     var standaloneLoadable: Bool
     var loadBlockReason: String?
     var distributedLoadable: Bool

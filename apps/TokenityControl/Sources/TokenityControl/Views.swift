@@ -18,6 +18,7 @@ struct TokenityRootView: View {
             case .models: ModelsPage()
             case .network: NetworkPage()
             case .api: APIAccessPage()
+            case .benchmark: BenchmarkPage()
             case .logs: LogsPage()
             case .settings: SettingsPage()
             }
@@ -1225,6 +1226,11 @@ private struct ModelConfigurationSheet: View {
                             .truncationMode(.middle)
                             .textSelection(.enabled)
                     }
+                    if let contextLength = row.contextLength {
+                        LabeledContent("Context Window") {
+                            Text("\(contextLength.formatted()) tokens")
+                        }
+                    }
                 }
 
                 Section("Generation") {
@@ -1253,7 +1259,7 @@ private struct ModelConfigurationSheet: View {
                         "Max Output Tokens",
                         value: $draft.maximumOutputTokens,
                         range: 1...262_144,
-                        help: "Maximum reasoning and answer tokens for each chat completion."
+                        help: "Defaults to this model's reported maximum context length. Reduce it to place a smaller cap on reasoning and answer tokens."
                     )
                     Group {
                         decimalField("Temperature", value: customSamplingBinding(\.temperature), range: 0...2)

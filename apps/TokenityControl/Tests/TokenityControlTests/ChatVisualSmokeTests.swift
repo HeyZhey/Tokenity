@@ -355,6 +355,7 @@ final class ChatVisualSmokeTests: XCTestCase {
         case .models: return AnyView(ModelsPage())
         case .network: return AnyView(NetworkPage())
         case .api: return AnyView(APIAccessPage())
+        case .benchmark: return AnyView(BenchmarkPage())
         case .logs: return AnyView(LogsPage())
         case .settings: return AnyView(SettingsPage())
         }
