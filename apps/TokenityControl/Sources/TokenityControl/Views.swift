@@ -1534,6 +1534,61 @@ struct SettingsPage: View {
                     }
                 }
             }
+
+            InfoGroup(title: "Advanced") {
+                InfoRow(label: "Memory Admission") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Picker("Memory Admission", selection: $store.memoryAdmissionMode) {
+                            ForEach(MemoryAdmissionMode.selectableCases) { mode in
+                                Text(memoryAdmissionLabel(mode)).tag(mode)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+
+                        if store.effectiveMemoryAdmissionMode == .custom {
+                            HStack(spacing: 12) {
+                                Slider(
+                                    value: Binding(
+                                        get: { Double(store.customMemoryHeadroomPercent) },
+                                        set: { store.customMemoryHeadroomPercent = Int($0.rounded()) }
+                                    ),
+                                    in: 5...40,
+                                    step: 1
+                                )
+                                Text("\(min(max(store.customMemoryHeadroomPercent, 5), 40))%")
+                                    .font(.tokenityMono(12))
+                                    .frame(width: 42, alignment: .trailing)
+                            }
+                        }
+
+                        Text(store.memoryAdmissionDetail)
+                            .foregroundStyle(theme.secondaryText)
+
+                        if let warning = store.memoryAdmissionWarning {
+                            Label(warning, systemImage: "exclamationmark.triangle.fill")
+                                .font(.tokenityText(11, weight: .medium))
+                                .foregroundStyle(theme.warning)
+                        }
+
+                        Text("Always enforced: live non-reclaimable memory, reservations for other Tokenity instances, and the macOS memory-pressure boundary.")
+                            .font(.tokenityText(11))
+                            .foregroundStyle(theme.secondaryText)
+                        Text("Applies to the next language or video model load.")
+                            .font(.tokenityText(11))
+                            .foregroundStyle(theme.secondaryText)
+                    }
+                }
+            }
+        }
+    }
+
+    private func memoryAdmissionLabel(_ mode: MemoryAdmissionMode) -> String {
+        switch mode {
+        case .custom, .disabled:
+            return mode.title
+        case .safe, .balanced, .aggressive:
+            return "\(mode.title) \(mode.headroomPercent(customPercent: store.customMemoryHeadroomPercent))%"
         }
     }
 }

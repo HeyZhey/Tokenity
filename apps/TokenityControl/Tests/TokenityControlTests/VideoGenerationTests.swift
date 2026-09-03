@@ -74,7 +74,8 @@ final class VideoGenerationContractTests: XCTestCase {
             leaseSeconds: 30,
             instanceID: "h3-ui-instance",
             operationID: "h3-ui-operation",
-            optimizationProfile: .stockQMM
+            optimizationProfile: .stockQMM,
+            memoryHeadroomRatio: 0.1
         )
 
         let object = try XCTUnwrap(
@@ -86,6 +87,7 @@ final class VideoGenerationContractTests: XCTestCase {
         XCTAssertEqual(nodes[1]["agent_url"] as? String, "http://198.51.100.75:9200")
         XCTAssertEqual(object["optimization_profile"] as? String, "stock-qmm")
         XCTAssertEqual(object["api_identifier"] as? String, "MiniMax-H3")
+        XCTAssertEqual(object["memory_headroom_ratio"] as? Double, 0.1)
         XCTAssertNil(object["environment"])
         XCTAssertNil(object["shell"])
     }

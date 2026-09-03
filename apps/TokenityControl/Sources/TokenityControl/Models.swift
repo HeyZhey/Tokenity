@@ -239,6 +239,71 @@ enum NativeMTPMode: String, CaseIterable, Codable, Identifiable {
     }
 }
 
+enum MemoryAdmissionMode: String, Codable, Identifiable {
+    case safe
+    case balanced
+    case aggressive
+    case custom
+    case disabled
+
+    var id: String { rawValue }
+
+    static var selectableCases: [MemoryAdmissionMode] {
+        var modes: [MemoryAdmissionMode] = [.safe, .balanced, .aggressive, .custom]
+#if DEBUG
+        modes.append(.disabled)
+#endif
+        return modes
+    }
+
+    var title: String {
+        switch self {
+        case .safe: return "Safe"
+        case .balanced: return "Balanced"
+        case .aggressive: return "Aggressive"
+        case .custom: return "Custom"
+        case .disabled: return "Disabled"
+        }
+    }
+
+    func headroomPercent(customPercent: Int) -> Int {
+        switch self {
+        case .safe: return 25
+        case .balanced: return 15
+        case .aggressive: return 10
+        case .custom: return min(max(customPercent, 5), 40)
+        case .disabled: return 0
+        }
+    }
+
+    func detail(customPercent: Int) -> String {
+        let percent = headroomPercent(customPercent: customPercent)
+        switch self {
+        case .safe:
+            return "Keeps the current 25% fixed headroom policy."
+        case .balanced:
+            return "Keeps 15% fixed headroom; recommended for 256 or 512 GiB Macs."
+        case .aggressive:
+            return "Keeps 10% fixed headroom to admit larger models."
+        case .custom:
+            return "Keeps a custom \(percent)% fixed headroom (5%–40%)."
+        case .disabled:
+            return "Development only: removes fixed headroom, but live system usage, other reservations, and memory-pressure checks still apply."
+        }
+    }
+
+    func warning(customPercent: Int) -> String? {
+        let percent = headroomPercent(customPercent: customPercent)
+        if self == .disabled {
+            return "Fixed headroom is disabled. Memory pressure can rise rapidly during model loading."
+        }
+        if percent <= 10 {
+            return "Low headroom can cause compression, swap, or system stalls during peak allocation."
+        }
+        return nil
+    }
+}
+
 struct NativeMTPConfiguration: Codable, Hashable {
     var mode: NativeMTPMode = .off
     var maxDepth: Int = 1
@@ -1424,6 +1489,7 @@ struct AgentStartModelRequest: Encodable {
     var instanceID: String? = nil
     var operationID: String? = nil
     var memoryReservationBytes: Int64? = nil
+    var memoryHeadroomRatio: Double? = nil
 
     enum CodingKeys: String, CodingKey {
         case model, nodes, host, port
@@ -1441,6 +1507,7 @@ struct AgentStartModelRequest: Encodable {
         case instanceID = "instance_id"
         case operationID = "operation_id"
         case memoryReservationBytes = "memory_reservation_bytes"
+        case memoryHeadroomRatio = "memory_headroom_ratio"
     }
 }
 

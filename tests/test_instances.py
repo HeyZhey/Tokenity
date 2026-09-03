@@ -192,6 +192,25 @@ def test_resource_admission_honors_live_system_memory_headroom():
     assert snapshot["system_available_memory_bytes"] == 750
 
 
+def test_resource_admission_allows_a_per_load_headroom_override():
+    ledger = ResourceLedger(10_000, minimum_headroom_ratio=0.25)
+    ledger.reserve("instance-a", 6_000, [8000])
+
+    with pytest.raises(ResourceAdmissionError):
+        ledger.reserve("instance-b", 2_000, [8010])
+
+    ledger.reserve(
+        "instance-b",
+        2_000,
+        [8010],
+        minimum_headroom_ratio=0.15,
+    )
+    snapshot = ledger.snapshot(minimum_headroom_ratio=0.1)
+    assert snapshot["reserved_memory_bytes"] == 8_000
+    assert snapshot["available_memory_bytes"] == 1_000
+    assert snapshot["minimum_headroom_ratio"] == 0.1
+
+
 def test_live_system_available_memory_accounts_for_wired_residue_and_pressure():
     gib = 1_073_741_824
 
@@ -204,6 +223,19 @@ def test_live_system_available_memory_accounts_for_wired_residue_and_pressure():
     )
 
     assert available == int(512 * gib * 0.9) - 443 * gib
+
+
+def test_disabled_fixed_headroom_still_enforces_live_pressure_and_in_use_memory():
+    available = live_system_available_memory_bytes(
+        {
+            "total_bytes": 10_000,
+            "in_use_bytes": 2_000,
+            "pressure_available_ratio": 0.5,
+        },
+        minimum_headroom_ratio=0.0,
+    )
+
+    assert available == 5_000
 
 
 def test_live_system_available_memory_falls_back_when_signals_are_unavailable():

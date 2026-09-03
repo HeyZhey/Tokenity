@@ -16,6 +16,7 @@ enum TokenityTransportError: LocalizedError {
     case rdmaNotReady(String)
     case nativeMTPAgentUpgradeRequired
     case multiInstanceAgentUpgradeRequired
+    case memoryAdmissionAgentUpgradeRequired
     case repetitiveOutput
 
     var errorDescription: String? {
@@ -48,6 +49,8 @@ enum TokenityTransportError: LocalizedError {
             return "Native MTP Required needs the current Node Agent. Restart the installed Tokenity Node Agent on every selected Mac, then try again."
         case .multiInstanceAgentUpgradeRequired:
             return "Loading an additional resident model requires current Node Agents on every selected Mac. Upgrade or restart all selected Node Agents, then try again."
+        case .memoryAdmissionAgentUpgradeRequired:
+            return "This Memory Admission policy requires the current Node Agent on every selected Mac. Upgrade or restart the Agents, then try again."
         case .repetitiveOutput:
             return "Generation stopped because repeated output was detected."
         }
@@ -244,6 +247,20 @@ final class TokenityStore: ObservableObject {
     @Published var nativeMTPMode: NativeMTPMode = .auto {
         didSet { rebuildLaunchPreview() }
     }
+    @Published var memoryAdmissionMode: MemoryAdmissionMode = .safe {
+        didSet {
+            if !isRestoringMemoryAdmissionSettings {
+                persistMemoryAdmissionSettings()
+            }
+        }
+    }
+    @Published var customMemoryHeadroomPercent: Int = 20 {
+        didSet {
+            if !isRestoringMemoryAdmissionSettings {
+                persistMemoryAdmissionSettings()
+            }
+        }
+    }
     @Published var phase: ClusterPhase = .stopped
     @Published private(set) var modelPath: String = ""
     @Published private(set) var coordinatorID: String = "mac-a" {
@@ -322,6 +339,8 @@ final class TokenityStore: ObservableObject {
     private let onboardingRevisionKey = "TokenityOnboarding.completedRevision"
     private let nodeEndpointOverridesKey = "TokenityNodeAgentEndpoints.v1"
     private let nodeMachineIdentitiesKey = "TokenityNodeMachineIdentities.v1"
+    private let memoryAdmissionModeKey = "TokenityMemoryAdmission.mode.v1"
+    private let customMemoryHeadroomPercentKey = "TokenityMemoryAdmission.customPercent.v1"
     private static let currentOnboardingRevision = 3
     private let chatHistoryQueue = DispatchQueue(label: "ai.tokenity.chat-history", qos: .utility)
     private let writesChatHistorySynchronously: Bool
@@ -375,6 +394,7 @@ final class TokenityStore: ObservableObject {
     private var unboundPlaceholderNodeIDs: Set<String> = []
     private var autoSelectedPlaceholderNodeIDs: Set<String> = []
     private var statusRefreshInFlight = false
+    private var isRestoringMemoryAdmissionSettings = true
     // Every user-owned model transition advances this fence synchronously.
     // Background polling may still finish its network request, but a response
     // from an older epoch is never allowed to rewrite model/instance state.
@@ -415,6 +435,21 @@ final class TokenityStore: ObservableObject {
             ?? h3WorkerAgentURL
         h3ModelPath = environment["TOKENITY_H3_MODEL_PATH"] ?? h3ModelPath
         h3BinaryPath = environment["TOKENITY_H3_BINARY_PATH"] ?? h3BinaryPath
+        if let rawMode = userDefaults.string(forKey: memoryAdmissionModeKey),
+           let storedMode = MemoryAdmissionMode(rawValue: rawMode) {
+#if DEBUG
+            memoryAdmissionMode = storedMode
+#else
+            memoryAdmissionMode = storedMode == .disabled ? .safe : storedMode
+#endif
+        }
+        if userDefaults.object(forKey: customMemoryHeadroomPercentKey) != nil {
+            customMemoryHeadroomPercent = min(
+                max(userDefaults.integer(forKey: customMemoryHeadroomPercentKey), 5),
+                40
+            )
+        }
+        isRestoringMemoryAdmissionSettings = false
         if TokenityDeploymentConfiguration.hasExplicitNodeAgentURLs {
             unboundPlaceholderNodeIDs = Set(
                 nodes.lazy.filter { $0.agentURL.isEmpty }.map(\.id)
@@ -541,6 +576,48 @@ final class TokenityStore: ObservableObject {
 
     var selectedNodes: [TokenityNode] {
         nodes.filter { selectedNodeIDs.contains($0.id) }
+    }
+
+    var effectiveMemoryAdmissionMode: MemoryAdmissionMode {
+#if DEBUG
+        memoryAdmissionMode
+#else
+        memoryAdmissionMode == .disabled ? .safe : memoryAdmissionMode
+#endif
+    }
+
+    var memoryAdmissionHeadroomRatio: Double {
+        Double(
+            effectiveMemoryAdmissionMode.headroomPercent(
+                customPercent: customMemoryHeadroomPercent
+            )
+        ) / 100
+    }
+
+    var memoryAdmissionRequestHeadroomRatio: Double? {
+        effectiveMemoryAdmissionMode == .safe
+            ? nil
+            : memoryAdmissionHeadroomRatio
+    }
+
+    var memoryAdmissionDetail: String {
+        effectiveMemoryAdmissionMode.detail(
+            customPercent: customMemoryHeadroomPercent
+        )
+    }
+
+    var memoryAdmissionWarning: String? {
+        effectiveMemoryAdmissionMode.warning(
+            customPercent: customMemoryHeadroomPercent
+        )
+    }
+
+    private func persistMemoryAdmissionSettings() {
+        userDefaults.set(memoryAdmissionMode.rawValue, forKey: memoryAdmissionModeKey)
+        userDefaults.set(
+            min(max(customMemoryHeadroomPercent, 5), 40),
+            forKey: customMemoryHeadroomPercentKey
+        )
     }
 
     var clusterBuilderNodes: [TokenityNode] {
@@ -954,7 +1031,8 @@ final class TokenityStore: ObservableObject {
             leaseSeconds: appRestartLeaseGraceSeconds,
             instanceID: String(instanceID),
             operationID: String(operationID),
-            optimizationProfile: h3OptimizationProfile
+            optimizationProfile: h3OptimizationProfile,
+            memoryHeadroomRatio: memoryAdmissionRequestHeadroomRatio
         )
 
         var didSubmitLaunch = false
@@ -1696,7 +1774,8 @@ final class TokenityStore: ObservableObject {
             leaseSeconds: appRestartLeaseGraceSeconds,
             instanceID: String(instanceID),
             operationID: String(operationID),
-            optimizationProfile: h3OptimizationProfile
+            optimizationProfile: h3OptimizationProfile,
+            memoryHeadroomRatio: memoryAdmissionRequestHeadroomRatio
         )
         do {
             var request = try jsonRequest(
@@ -4047,7 +4126,8 @@ final class TokenityStore: ObservableObject {
                 leaseSeconds: modelLeaseSeconds,
                 nativeMTP: nativeMTP,
                 instanceID: includesInstanceMetadata ? instanceID : nil,
-                operationID: includesInstanceMetadata ? operationID.uuidString : nil
+                operationID: includesInstanceMetadata ? operationID.uuidString : nil,
+                memoryHeadroomRatio: memoryAdmissionRequestHeadroomRatio
             )
         }
 
@@ -4077,6 +4157,11 @@ final class TokenityStore: ObservableObject {
                 where status == 422 && isUnsupportedOptionalStartField(detail) {
                 let rejectsInstanceMetadata = isUnsupportedInstanceMetadataField(detail)
                 let rejectsNativeMTP = isUnsupportedNativeMTPField(detail)
+                let rejectsMemoryAdmission = isUnsupportedMemoryAdmissionField(detail)
+
+                if rejectsMemoryAdmission {
+                    throw TokenityTransportError.memoryAdmissionAgentUpgradeRequired
+                }
 
                 if includesInstanceMetadata,
                    rejectsInstanceMetadata || (!rejectsNativeMTP && !rejectsInstanceMetadata) {
@@ -4134,6 +4219,12 @@ final class TokenityStore: ObservableObject {
     private func isUnsupportedNativeMTPField(_ detail: String?) -> Bool {
         let normalized = detail?.lowercased() ?? ""
         return normalized.contains("native_mtp") && isUnsupportedOptionalStartField(detail)
+    }
+
+    private func isUnsupportedMemoryAdmissionField(_ detail: String?) -> Bool {
+        let normalized = detail?.lowercased() ?? ""
+        return normalized.contains("memory_headroom_ratio")
+            && isUnsupportedOptionalStartField(detail)
     }
 
     private func stopBackendRole(_ role: String, on node: TokenityNode) async throws {

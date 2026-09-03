@@ -70,6 +70,36 @@ installer does not alter a network interface or install a keepalive job. When
 `TOKENITY_RDMA_CIDRS` is absent, the runtime accepts a private or link-local
 address found on the detected RDMA interface rather than assuming one subnet.
 
+## Memory admission
+
+**Settings → Advanced → Memory Admission** controls the fixed memory headroom
+used for the next language or video model load:
+
+| Policy | Fixed headroom | Intended use |
+| --- | ---: | --- |
+| Safe | 25% | Default and previous Tokenity behavior |
+| Balanced | 15% | Recommended for 256 GiB and 512 GiB Macs |
+| Aggressive | 10% | Larger checkpoints when the workload is controlled |
+| Custom | 5%–40% | Explicit deployment-specific headroom |
+| Disabled | 0% | Development builds only; prominently warned in the UI |
+
+The setting changes only the fixed headroom. It never removes the live
+non-reclaimable-memory observation, reservations owned by other Tokenity model
+instances, or the macOS memory-pressure boundary. Even the development-only
+Disabled policy remains bounded by those three signals.
+
+For a requested headroom ratio `h`, the reservation ledger first limits usable
+memory to `total × (1 − h)` and subtracts other instance reservations. The live
+system bound independently subtracts current in-use memory and applies the
+memory-pressure available ratio. Admission uses the lower of the ledger and
+live-system bounds, so lowering `h` cannot make existing allocations or system
+pressure invisible.
+
+The selected ratio is carried to every rank and retained with the model
+instance for post-load reservation reconciliation and process recovery. Safe is
+the protocol default, allowing the app to omit the new field when talking to an
+older Agent; a non-Safe policy requires an updated Agent on every selected Mac.
+
 ## Preflight and evidence capture
 
 The preflight command requires the complete topology instead of shipping a

@@ -29,7 +29,7 @@ from urllib.request import ProxyHandler, Request, build_opener
 
 from fastapi import FastAPI, HTTPException, Query, Request as FastAPIRequest
 from fastapi.responses import Response, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 
 from tokenity import __version__
@@ -102,6 +102,7 @@ NODE_AGENT_CAPABILITIES = (
     "instance_quorum",
     "instance_runtimes",
     "managed_instances",
+    "memory_admission",
     "native_mtp",
 )
 MANAGED_INSTANCE_CAPABILITIES = frozenset(
@@ -165,6 +166,14 @@ VIDEO_MODEL_ROLES = frozenset(
 )
 
 
+def _memory_headroom_ratio(requested: float | None) -> float:
+    return MINIMUM_MEMORY_HEADROOM_RATIO if requested is None else requested
+
+
+def _memory_admission_capabilities(requested: float | None) -> frozenset[str]:
+    return frozenset({"memory_admission"}) if requested is not None else frozenset()
+
+
 class _LaunchCancelled(RuntimeError):
     pass
 
@@ -212,7 +221,22 @@ class ClusterNodePayload(BaseModel):
         )
 
 
-class StartRequest(BaseModel):
+class _MemoryAdmissionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    memory_headroom_ratio: Optional[float] = Field(default=None, ge=0.0, le=0.4)
+
+    @field_validator("memory_headroom_ratio")
+    @classmethod
+    def validate_memory_headroom_ratio(cls, value: float | None) -> float | None:
+        if value is not None and value != 0.0 and value < 0.05:
+            raise ValueError(
+                "memory_headroom_ratio must be 0.0 or between 0.05 and 0.4"
+            )
+        return value
+
+
+class StartRequest(_MemoryAdmissionRequest):
     model_config = ConfigDict(extra="forbid")
 
     model: str
@@ -245,7 +269,7 @@ class NativeMTPRequest(BaseModel):
     head_placement: Literal["replicated"] = "replicated"
 
 
-class H3VideoStartRequest(BaseModel):
+class H3VideoStartRequest(_MemoryAdmissionRequest):
     model_config = ConfigDict(extra="forbid")
 
     model: str
@@ -276,7 +300,7 @@ class H3VideoStartRequest(BaseModel):
     minimum_free_disk_bytes: int = Field(default=2 * 1024**3, ge=0)
 
 
-class H3VideoRankStartRequest(BaseModel):
+class H3VideoRankStartRequest(_MemoryAdmissionRequest):
     model_config = ConfigDict(extra="forbid")
 
     cluster_id: str = Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
@@ -347,7 +371,7 @@ class HeartbeatRequest(BaseModel):
     instance_id: Optional[str] = None
 
 
-class RankStartRequest(BaseModel):
+class RankStartRequest(_MemoryAdmissionRequest):
     model_config = ConfigDict(extra="forbid")
 
     cluster_id: str = Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
@@ -640,6 +664,12 @@ def create_app(
                     http_port=int(instance_payload["http_port"]),
                     starting_port=int(instance_payload["starting_port"]),
                     memory_reservation_bytes=int(instance_payload["memory_reservation_bytes"]),
+                    memory_headroom_ratio=float(
+                        instance_payload.get(
+                            "memory_headroom_ratio",
+                            MINIMUM_MEMORY_HEADROOM_RATIO,
+                        )
+                    ),
                     memory_reservation_breakdown=instance_payload.get("memory_reservation_breakdown"),
                 )
                 if not created:
@@ -649,7 +679,10 @@ def create_app(
                     instance_id,
                     instance.memory_reservation_bytes,
                     ports,
-                    system_available_memory_bytes=system_available_memory_bytes(),
+                    system_available_memory_bytes=system_available_memory_bytes(
+                        minimum_headroom_ratio=instance.memory_headroom_ratio
+                    ),
+                    minimum_headroom_ratio=instance.memory_headroom_ratio,
                 )
                 log_paths = instance_payload.get("log_paths")
                 log_path = None
@@ -862,17 +895,30 @@ def create_app(
 
     def system_available_memory_bytes(
         memory: dict[str, object] | None = None,
+        *,
+        minimum_headroom_ratio: float | None = None,
     ) -> int | None:
+        headroom_ratio = (
+            resource_ledger.minimum_headroom_ratio
+            if minimum_headroom_ratio is None
+            else minimum_headroom_ratio
+        )
         return live_system_available_memory_bytes(
             memory or _memory_stats(),
-            minimum_headroom_ratio=resource_ledger.minimum_headroom_ratio,
+            minimum_headroom_ratio=headroom_ratio,
         )
 
     def resource_ledger_snapshot(
         memory: dict[str, object] | None = None,
+        *,
+        minimum_headroom_ratio: float | None = None,
     ) -> dict[str, object]:
         return resource_ledger.snapshot(
-            system_available_memory_bytes=system_available_memory_bytes(memory)
+            system_available_memory_bytes=system_available_memory_bytes(
+                memory,
+                minimum_headroom_ratio=minimum_headroom_ratio,
+            ),
+            minimum_headroom_ratio=minimum_headroom_ratio,
         )
 
     def begin_launch(instance_id: str) -> int:
@@ -916,6 +962,9 @@ def create_app(
                 "world_size": request.world_size,
                 "connection_mode": request.connection_mode.value,
                 "model_revision": request.model_revision,
+                "memory_headroom_ratio": _memory_headroom_ratio(
+                    request.memory_headroom_ratio
+                ),
                 "epoch": launch_generation,
                 "role": role,
             }
@@ -995,7 +1044,10 @@ def create_app(
                 observed_footprint_bytes=observed_footprint,
                 safety_margin_ratio=0.1,
                 breakdown=breakdown,
-                system_available_memory_bytes=system_available_memory_bytes(),
+                system_available_memory_bytes=system_available_memory_bytes(
+                    minimum_headroom_ratio=instance.memory_headroom_ratio
+                ),
+                minimum_headroom_ratio=instance.memory_headroom_ratio,
             )
         except ResourceAdmissionError as exc:
             return str(exc)
@@ -2938,7 +2990,11 @@ def create_app(
             if len(nodes) > 1:
                 require_managed_instance_capabilities(
                     nodes,
-                    additional=frozenset({"minimax_h3_video"}),
+                    additional=frozenset({"minimax_h3_video"}).union(
+                        _memory_admission_capabilities(
+                            request.memory_headroom_ratio
+                        )
+                    ),
                 )
                 try:
                     for node, rank_request in zip(nodes[1:], rank_requests[1:]):
@@ -2967,9 +3023,15 @@ def create_app(
         if len(nodes) > 1:
             require_managed_instance_capabilities(
                 nodes,
-                additional=frozenset({"minimax_h3_video"}),
+                additional=frozenset({"minimax_h3_video"}).union(
+                    _memory_admission_capabilities(request.memory_headroom_ratio)
+                ),
             )
-            ledger_snapshot = resource_ledger_snapshot()
+            ledger_snapshot = resource_ledger_snapshot(
+                minimum_headroom_ratio=_memory_headroom_ratio(
+                    request.memory_headroom_ratio
+                )
+            )
             request.port = _allocate_instance_port(request.port, ledger_snapshot)
             request.starting_port = _allocate_collective_port(
                 request.starting_port,
@@ -3017,6 +3079,9 @@ def create_app(
                     http_port=request.port,
                     starting_port=request.starting_port,
                     memory_reservation_bytes=reservation,
+                    memory_headroom_ratio=_memory_headroom_ratio(
+                        request.memory_headroom_ratio
+                    ),
                     memory_reservation_breakdown=reservation_breakdown,
                 )
             except InstanceConflict as exc:
@@ -3039,7 +3104,14 @@ def create_app(
                     instance_id,
                     reservation,
                     ports,
-                    system_available_memory_bytes=system_available_memory_bytes(),
+                    system_available_memory_bytes=system_available_memory_bytes(
+                        minimum_headroom_ratio=_memory_headroom_ratio(
+                            request.memory_headroom_ratio
+                        )
+                    ),
+                    minimum_headroom_ratio=_memory_headroom_ratio(
+                        request.memory_headroom_ratio
+                    ),
                 )
             except ResourceAdmissionError as exc:
                 instances.remove(instance_id)
@@ -3178,7 +3250,11 @@ def create_app(
                 "runtime_fingerprint": runtime_fingerprint,
             }
 
-        ledger_snapshot = resource_ledger_snapshot()
+        ledger_snapshot = resource_ledger_snapshot(
+            minimum_headroom_ratio=_memory_headroom_ratio(
+                request.memory_headroom_ratio
+            )
+        )
         request.port = _allocate_instance_port(request.port, ledger_snapshot)
         reservation_breakdown = _estimated_h3_memory_reservation_breakdown(
             request.model,
@@ -3210,6 +3286,9 @@ def create_app(
                 http_port=request.port,
                 starting_port=request.starting_port,
                 memory_reservation_bytes=reservation,
+                memory_headroom_ratio=_memory_headroom_ratio(
+                    request.memory_headroom_ratio
+                ),
                 memory_reservation_breakdown=reservation_breakdown,
             )
         except InstanceConflict as exc:
@@ -3228,7 +3307,14 @@ def create_app(
                 instance_id,
                 reservation,
                 [request.port],
-                system_available_memory_bytes=system_available_memory_bytes(),
+                system_available_memory_bytes=system_available_memory_bytes(
+                    minimum_headroom_ratio=_memory_headroom_ratio(
+                        request.memory_headroom_ratio
+                    )
+                ),
+                minimum_headroom_ratio=_memory_headroom_ratio(
+                    request.memory_headroom_ratio
+                ),
             )
         except ResourceAdmissionError as exc:
             instances.remove(instance_id)
@@ -3445,6 +3531,9 @@ def create_app(
                 http_port=request.port,
                 starting_port=request.starting_port,
                 memory_reservation_bytes=reservation,
+                memory_headroom_ratio=_memory_headroom_ratio(
+                    request.memory_headroom_ratio
+                ),
                 memory_reservation_breakdown=reservation_breakdown,
             )
             if created:
@@ -3457,7 +3546,14 @@ def create_app(
                             request.starting_port + request.world_size,
                         )
                     ),
-                    system_available_memory_bytes=system_available_memory_bytes(),
+                    system_available_memory_bytes=system_available_memory_bytes(
+                        minimum_headroom_ratio=_memory_headroom_ratio(
+                            request.memory_headroom_ratio
+                        )
+                    ),
+                    minimum_headroom_ratio=_memory_headroom_ratio(
+                        request.memory_headroom_ratio
+                    ),
                 )
                 instance.transition(InstanceLifecycle.LAUNCHING)
                 instance.transition(InstanceLifecycle.DISTRIBUTED_INITIALIZING)
@@ -3572,7 +3668,12 @@ def create_app(
                     requested_connection_mode.value,
                 )
             if not request.dry_run:
-                require_managed_instance_capabilities(nodes)
+                require_managed_instance_capabilities(
+                    nodes,
+                    additional=_memory_admission_capabilities(
+                        request.memory_headroom_ratio
+                    ),
+                )
         model_revision = _model_revision(request.model)
         if not request.dry_run:
             issues = runtime_preflight(request.python, request.model, model_revision)
@@ -3581,7 +3682,11 @@ def create_app(
                     status_code=412,
                     detail={"stage": "preflight", "instance_id": instance_id, "issues": issues},
                 )
-            ledger_snapshot = resource_ledger_snapshot()
+            ledger_snapshot = resource_ledger_snapshot(
+                minimum_headroom_ratio=_memory_headroom_ratio(
+                    request.memory_headroom_ratio
+                )
+            )
             request.port = _allocate_instance_port(request.port, ledger_snapshot)
             request.starting_port = _allocate_collective_port(
                 request.starting_port,
@@ -3641,6 +3746,9 @@ def create_app(
                 http_port=request.port,
                 starting_port=request.starting_port,
                 memory_reservation_bytes=reservation,
+                memory_headroom_ratio=_memory_headroom_ratio(
+                    request.memory_headroom_ratio
+                ),
                 memory_reservation_breakdown=reservation_breakdown,
             )
         except InstanceConflict as exc:
@@ -3660,7 +3768,14 @@ def create_app(
                 instance_id,
                 reservation,
                 ports,
-                system_available_memory_bytes=system_available_memory_bytes(),
+                system_available_memory_bytes=system_available_memory_bytes(
+                    minimum_headroom_ratio=_memory_headroom_ratio(
+                        request.memory_headroom_ratio
+                    )
+                ),
+                minimum_headroom_ratio=_memory_headroom_ratio(
+                    request.memory_headroom_ratio
+                ),
             )
         except ResourceAdmissionError as exc:
             instances.remove(instance_id)
@@ -3860,6 +3975,9 @@ def create_app(
                 http_port=request.port,
                 starting_port=request.starting_port,
                 memory_reservation_bytes=reservation,
+                memory_headroom_ratio=_memory_headroom_ratio(
+                    request.memory_headroom_ratio
+                ),
                 memory_reservation_breakdown=reservation_breakdown,
             )
             if created:
@@ -3867,7 +3985,14 @@ def create_app(
                     instance_id,
                     reservation,
                     list(range(request.starting_port, request.starting_port + max(1, request.world_size))),
-                    system_available_memory_bytes=system_available_memory_bytes(),
+                    system_available_memory_bytes=system_available_memory_bytes(
+                        minimum_headroom_ratio=_memory_headroom_ratio(
+                            request.memory_headroom_ratio
+                        )
+                    ),
+                    minimum_headroom_ratio=_memory_headroom_ratio(
+                        request.memory_headroom_ratio
+                    ),
                 )
                 instance.transition(InstanceLifecycle.LAUNCHING)
                 instance.transition(InstanceLifecycle.DISTRIBUTED_INITIALIZING)
@@ -4991,6 +5116,7 @@ def _http_rank_requests(
             model_revision=model_revision,
             tokenity_code_revision=_tokenity_code_revision(),
             memory_reservation_bytes=request.memory_reservation_bytes,
+            memory_headroom_ratio=request.memory_headroom_ratio,
         )
         for rank in range(world_size)
     ]
@@ -5058,6 +5184,7 @@ def _h3_rank_requests(
             model_revision=model_revision,
             tokenity_code_revision=code_revision,
             memory_reservation_bytes=request.memory_reservation_bytes,
+            memory_headroom_ratio=request.memory_headroom_ratio,
             optimization_profile=request.optimization_profile,
             minimum_free_disk_bytes=request.minimum_free_disk_bytes,
             runtime_contract_sha256=str(runtime_contract["contract_sha256"]),

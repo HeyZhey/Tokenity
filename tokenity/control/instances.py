@@ -252,6 +252,7 @@ class ModelInstance:
     http_port: int
     starting_port: int
     memory_reservation_bytes: int
+    memory_headroom_ratio: float = 0.25
     state: InstanceLifecycle = InstanceLifecycle.QUEUED
     version: int = 0
     generation: int = 1
@@ -274,6 +275,10 @@ class ModelInstance:
     def __post_init__(self) -> None:
         if self.memory_reservation_bytes < 0:
             raise ValueError("memory_reservation_bytes must be non-negative")
+        if not math.isfinite(self.memory_headroom_ratio) or not (
+            0.0 <= self.memory_headroom_ratio <= 0.4
+        ):
+            raise ValueError("memory_headroom_ratio must be between 0.0 and 0.4")
         if isinstance(self.memory_reservation_breakdown, dict):
             self.memory_reservation_breakdown = MemoryReservationBreakdown.from_mapping(
                 self.memory_reservation_breakdown
@@ -439,12 +444,20 @@ class ResourceLedger:
     def _available_memory_bytes(
         self,
         system_available_memory_bytes: int | None = None,
+        minimum_headroom_ratio: float | None = None,
     ) -> int:
-        usable = int(self.total_memory_bytes * (1.0 - self.minimum_headroom_ratio))
+        headroom_ratio = self._effective_headroom_ratio(minimum_headroom_ratio)
+        usable = int(self.total_memory_bytes * (1.0 - headroom_ratio))
         ledger_available = max(0, usable - sum(self._reservations.values()))
         if system_available_memory_bytes is None:
             return ledger_available
         return min(ledger_available, max(0, system_available_memory_bytes))
+
+    def _effective_headroom_ratio(self, value: float | None) -> float:
+        ratio = self.minimum_headroom_ratio if value is None else value
+        if not math.isfinite(ratio) or not (0.0 <= ratio <= 0.9):
+            raise ValueError("minimum_headroom_ratio must be between 0.0 and 0.9")
+        return ratio
 
     def reserve(
         self,
@@ -453,6 +466,7 @@ class ResourceLedger:
         ports: list[int],
         *,
         system_available_memory_bytes: int | None = None,
+        minimum_headroom_ratio: float | None = None,
     ) -> None:
         if memory_bytes < 0:
             raise ResourceAdmissionError("Memory reservation cannot be negative.")
@@ -462,7 +476,10 @@ class ResourceLedger:
             self._prune_port_quarantine()
             current = self._reservations.get(instance_id, 0)
             additional = max(0, memory_bytes - current)
-            available = self._available_memory_bytes(system_available_memory_bytes)
+            available = self._available_memory_bytes(
+                system_available_memory_bytes,
+                minimum_headroom_ratio,
+            )
             if additional > available:
                 raise ResourceAdmissionError(
                     f"Instance {instance_id} needs {memory_bytes} bytes but only "
@@ -488,6 +505,7 @@ class ResourceLedger:
         memory_bytes: int,
         *,
         system_available_memory_bytes: int | None = None,
+        minimum_headroom_ratio: float | None = None,
     ) -> int:
         """Atomically replace memory for an existing reservation.
 
@@ -503,7 +521,8 @@ class ResourceLedger:
             if instance_id not in self._reservations:
                 raise ResourceAdmissionError(f"Unknown memory reservation: {instance_id}")
             current = self._reservations[instance_id]
-            usable = int(self.total_memory_bytes * (1.0 - self.minimum_headroom_ratio))
+            headroom_ratio = self._effective_headroom_ratio(minimum_headroom_ratio)
+            usable = int(self.total_memory_bytes * (1.0 - headroom_ratio))
             ledger_available = max(0, usable - sum(self._reservations.values()))
             additional_available = (
                 ledger_available
@@ -529,6 +548,7 @@ class ResourceLedger:
         minimum_reservation_bytes: int = 0,
         breakdown: MemoryReservationBreakdown | None = None,
         system_available_memory_bytes: int | None = None,
+        minimum_headroom_ratio: float | None = None,
     ) -> int:
         """Resize from local observed memory while retaining a safety floor."""
 
@@ -572,6 +592,7 @@ class ResourceLedger:
             instance_id,
             max(minimum_reservation_bytes, target),
             system_available_memory_bytes=system_available_memory_bytes,
+            minimum_headroom_ratio=minimum_headroom_ratio,
         )
 
     def release(self, instance_id: str) -> None:
@@ -588,20 +609,27 @@ class ResourceLedger:
         self,
         *,
         system_available_memory_bytes: int | None = None,
+        minimum_headroom_ratio: float | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             self._prune_port_quarantine()
-            ledger_available = self._available_memory_bytes()
+            effective_headroom_ratio = self._effective_headroom_ratio(
+                minimum_headroom_ratio
+            )
+            ledger_available = self._available_memory_bytes(
+                minimum_headroom_ratio=effective_headroom_ratio
+            )
             now = self._monotonic_clock()
             return {
                 "total_memory_bytes": self.total_memory_bytes,
                 "reserved_memory_bytes": sum(self._reservations.values()),
                 "available_memory_bytes": self._available_memory_bytes(
-                    system_available_memory_bytes
+                    system_available_memory_bytes,
+                    effective_headroom_ratio,
                 ),
                 "ledger_available_memory_bytes": ledger_available,
                 "system_available_memory_bytes": system_available_memory_bytes,
-                "minimum_headroom_ratio": self.minimum_headroom_ratio,
+                "minimum_headroom_ratio": effective_headroom_ratio,
                 "port_reuse_delay_seconds": self.port_reuse_delay_seconds,
                 "reservations": dict(self._reservations),
                 "ports": {str(port): owner for port, owner in sorted(self._ports.items())},

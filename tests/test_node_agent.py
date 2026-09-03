@@ -63,6 +63,25 @@ def test_h3_default_profile_selects_stock_fused_qmm_after_live_tp2_ab():
     assert worker.starting_port == 30_096
 
 
+@pytest.mark.parametrize("ratio", [None, 0.25, 0.15, 0.1, 0.05, 0.4, 0.0])
+def test_memory_admission_request_accepts_supported_headroom_ratios(ratio):
+    request = agent_module.StartRequest(
+        model="/models/qwen",
+        memory_headroom_ratio=ratio,
+    )
+
+    assert request.memory_headroom_ratio == ratio
+
+
+@pytest.mark.parametrize("ratio", [-0.01, 0.01, 0.049, 0.401])
+def test_memory_admission_request_rejects_out_of_contract_headroom_ratios(ratio):
+    with pytest.raises(ValueError, match="memory_headroom_ratio"):
+        agent_module.StartRequest(
+            model="/models/qwen",
+            memory_headroom_ratio=ratio,
+        )
+
+
 def test_glm_52_indexer_schedule_matches_upstream_pr_1410():
     schedule = derive_indexer_types(
         num_hidden_layers=78,
@@ -174,9 +193,10 @@ def test_node_info_advertises_stable_agent_contract():
             "cluster_runtime",
             "minimax_h3_video",
             "instance_quorum",
-            "instance_runtimes",
-            "managed_instances",
-            "native_mtp",
+                "instance_runtimes",
+                "managed_instances",
+                "memory_admission",
+                "native_mtp",
         ],
     }
 
@@ -351,6 +371,56 @@ def test_start_rejects_model_when_live_wired_memory_exhausts_headroom(
     assert response.status_code == 409
     assert response.json()["detail"]["stage"] == "resource_admission"
     assert supervisor.starts == []
+
+
+def test_aggressive_memory_admission_can_admit_a_larger_model_without_disabling_pressure_checks(
+    monkeypatch,
+):
+    gib = 1_073_741_824
+    supervisor = _FakeSupervisor()
+    monkeypatch.setattr(agent_module, "_total_memory_bytes", lambda: 512 * gib)
+    monkeypatch.setattr(
+        agent_module,
+        "_memory_stats",
+        lambda: {
+            "total_bytes": 512 * gib,
+            "in_use_bytes": 443 * gib,
+            "pressure_available_ratio": 0.19,
+        },
+    )
+    monkeypatch.setattr(agent_module, "_tcp_port_available", lambda port: True)
+
+    client = TestClient(
+        create_app(
+            rdma_probe_fn=fake_rdma_probe,
+            supervisor=supervisor,
+            rank_ready_fn=lambda pid, port, timeout: True,
+            rank_stabilize_fn=lambda seconds: None,
+            rank_connected_fn=lambda pid, request, timeout: True,
+            runtime_preflight_fn=lambda *_: [],
+        )
+    )
+    response = client.post(
+        "/v1/node/start-distributed-openai",
+        json={
+            "model": "/models/qwen",
+            "connection_mode": "ring",
+            "dry_run": False,
+            "memory_reservation_bytes": 15 * gib,
+            "memory_headroom_ratio": 0.1,
+            "nodes": [
+                {
+                    "id": "local",
+                    "agent_url": "http://127.0.0.1:9100",
+                    "lan_ip": "127.0.0.1",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["instance"]["memory_headroom_ratio"] == 0.1
+    assert len(supervisor.starts) == 1
 
 
 def test_running_role_reports_failed_when_child_rank_crashes(tmp_path: Path):
@@ -1310,6 +1380,7 @@ def test_h3_two_mac_dry_run_preflights_the_remote_rank_without_launching(
                         "instance_runtimes",
                         "managed_instances",
                         "minimax_h3_video",
+                        "memory_admission",
                     ]
                 }
             },
@@ -1326,6 +1397,7 @@ def test_h3_two_mac_dry_run_preflights_the_remote_rank_without_launching(
             "model": str(model),
             "binary": str(binary),
             "dry_run": True,
+            "memory_headroom_ratio": 0.1,
             "nodes": [
                 {
                     "id": "mac-a",
@@ -1350,6 +1422,7 @@ def test_h3_two_mac_dry_run_preflights_the_remote_rank_without_launching(
     assert len(remote_requests) == 1
     assert remote_requests[0][0].endswith("/v1/node/start-minimax-h3-video-rank")
     assert remote_requests[0][1]["dry_run"] is True
+    assert remote_requests[0][1]["memory_headroom_ratio"] == 0.1
     assert supervisor.starts == []
 
 
@@ -2205,6 +2278,7 @@ def test_distributed_start_fans_out_worker_rank_over_http():
             "connection_mode": "jaccl",
             "starting_port": 30_020,
             "lease_seconds": 300,
+            "memory_headroom_ratio": 0.15,
             "dry_run": False,
             "nodes": [
                 {
@@ -2233,6 +2307,7 @@ def test_distributed_start_fans_out_worker_rank_over_http():
     assert posts[0][1]["rank"] == 1
     assert "ssh" not in posts[0][1]
     assert "native_mtp" not in posts[0][1]
+    assert posts[0][1]["memory_headroom_ratio"] == 0.15
 
     initial_deadline = response.json()["instance"]["deadline"]
     heartbeat = client.post(
@@ -2252,6 +2327,7 @@ def test_distributed_start_fans_out_worker_rank_over_http():
     assert runtime["rank"] == 0
     assert runtime["world_size"] == 2
     assert runtime["connection_mode"] == "jaccl-ring"
+    assert runtime["memory_headroom_ratio"] == 0.15
     assert supervisor.starts[0][2]["MLX_JACCL_RING"] == "1"
     assert runtime["role"] == "controller"
 

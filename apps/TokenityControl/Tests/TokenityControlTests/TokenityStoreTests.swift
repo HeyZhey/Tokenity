@@ -141,6 +141,40 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertFalse(AppSection.allCases.contains { $0.title == "Nodes" })
     }
 
+    func testMemoryAdmissionPresetsCustomBoundsAndPersistence() {
+        let suiteName = "TokenityStoreTests.memory-admission.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = TokenityStore(userDefaults: defaults)
+
+        XCTAssertEqual(store.effectiveMemoryAdmissionMode, .safe)
+        XCTAssertEqual(store.memoryAdmissionHeadroomRatio, 0.25)
+        XCTAssertNil(store.memoryAdmissionRequestHeadroomRatio)
+        XCTAssertEqual(MemoryAdmissionMode.balanced.headroomPercent(customPercent: 20), 15)
+        XCTAssertEqual(MemoryAdmissionMode.aggressive.headroomPercent(customPercent: 20), 10)
+        XCTAssertEqual(MemoryAdmissionMode.custom.headroomPercent(customPercent: 1), 5)
+        XCTAssertEqual(MemoryAdmissionMode.custom.headroomPercent(customPercent: 99), 40)
+
+        store.customMemoryHeadroomPercent = 33
+        store.memoryAdmissionMode = .custom
+        XCTAssertEqual(store.memoryAdmissionHeadroomRatio, 0.33, accuracy: 0.000_001)
+        XCTAssertEqual(store.memoryAdmissionRequestHeadroomRatio, 0.33)
+        XCTAssertEqual(defaults.string(forKey: "TokenityMemoryAdmission.mode.v1"), "custom")
+        XCTAssertEqual(defaults.integer(forKey: "TokenityMemoryAdmission.customPercent.v1"), 33)
+
+        let restored = TokenityStore(userDefaults: defaults)
+        XCTAssertEqual(restored.memoryAdmissionMode, .custom)
+        XCTAssertEqual(restored.customMemoryHeadroomPercent, 33)
+        XCTAssertEqual(restored.memoryAdmissionHeadroomRatio, 0.33, accuracy: 0.000_001)
+
+#if DEBUG
+        XCTAssertTrue(MemoryAdmissionMode.selectableCases.contains(.disabled))
+        restored.memoryAdmissionMode = .disabled
+        XCTAssertEqual(restored.memoryAdmissionHeadroomRatio, 0)
+        XCTAssertNotNil(restored.memoryAdmissionWarning)
+#endif
+    }
+
     func testClusterModelRequestUsesAgentHTTPURLsWithoutSSHFields() throws {
         let request = AgentStartModelRequest(
             model: "/models/qwen",
@@ -185,6 +219,13 @@ final class TokenityStoreTests: XCTestCase {
         XCTAssertEqual(nativeMTP["mode"] as? String, "auto")
         XCTAssertEqual(nativeMTP["max_depth"] as? Int, 1)
         XCTAssertEqual(nativeMTP["head_placement"] as? String, "replicated")
+
+        var balancedRequest = request
+        balancedRequest.memoryHeadroomRatio = 0.15
+        let balancedObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(balancedRequest)) as? [String: Any]
+        )
+        XCTAssertEqual(balancedObject["memory_headroom_ratio"] as? Double, 0.15)
     }
 
     func testNativeMTPRequiredBlocksKnownMissingWeightsAndAutoWarns() {

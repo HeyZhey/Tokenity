@@ -94,6 +94,7 @@ struct AgentStartH3VideoRequest: Encodable {
     var operationID: String
     var optimizationProfile: H3OptimizationProfile
     var minimumFreeDiskBytes: Int64 = 2 * 1_024 * 1_024 * 1_024
+    var memoryHeadroomRatio: Double? = nil
 
     enum CodingKeys: String, CodingKey {
         case model, binary, nodes, host, port
@@ -106,6 +107,7 @@ struct AgentStartH3VideoRequest: Encodable {
         case operationID = "operation_id"
         case optimizationProfile = "optimization_profile"
         case minimumFreeDiskBytes = "minimum_free_disk_bytes"
+        case memoryHeadroomRatio = "memory_headroom_ratio"
     }
 }
 
