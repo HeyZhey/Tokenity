@@ -446,6 +446,10 @@ struct BenchmarkView: View {
     private var targetNodes: [TokenityNode] {
         switch configuration.target {
         case .currentMac:
+            // TODO(BUG): Recover the Current Mac target independently of cluster selection.
+            // Repro: let the Node Agent go offline until selection pruning clears the
+            // coordinator, then restart it; discovery sees the healthy local Agent but
+            // Benchmark remains blocked on "Choose an online Mac" until manual selection.
             return Array([store.coordinator].compactMap { $0 })
         case .selectedNode:
             return store.selectedNodes.filter { $0.id == configuration.targetNodeID }
