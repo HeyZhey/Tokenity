@@ -3845,6 +3845,11 @@ def create_app(
                 # this field yet. Non-default requests must remain explicit.
                 if rank_request.native_mtp.mode == "off":
                     worker_payload.pop("native_mtp", None)
+                # TODO(BUG): If this worker is already running Benchmark, a
+                # cluster launch from another Mac can surface "cannot parse
+                # response" instead of a structured busy/conflict error.
+                # Preserve the worker's 409 detail and leave its Benchmark
+                # instance untouched.
                 post_json(
                     f"{agent_url}/v1/node/start-distributed-rank",
                     worker_payload,
