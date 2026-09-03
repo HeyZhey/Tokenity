@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import json
+import logging
+import struct
 import sys
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -23,6 +26,9 @@ SUPPORTED_MLX_LM_VERSION = "0.31.3"
 _VENDORED_MODULES = ("sinkhorn", "hyper_connection", "deepseek_v4")
 _VENDOR_ROOT = Path(__file__).with_name("_upstream_pr1189")
 _MARKER = "_tokenity_deepseek_v4_pr1189"
+_QUANTIZATION_MARKER = "_tokenity_deepseek_v4_mixed_quantization"
+_SWITCH_PROJECTIONS = frozenset(("gate_proj", "up_proj", "down_proj"))
+_MXFP4_QUANTIZATION = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
 
 
 def _installed_mlx_lm_version() -> str | None:
@@ -40,6 +46,137 @@ def _import_existing_deepseek_v4() -> ModuleType | None:
         if exc.name != name:
             raise
         return None
+
+
+def _safetensors_header(path: Path) -> dict[str, Any]:
+    """Read tensor metadata without mapping or materializing checkpoint data."""
+
+    try:
+        with path.open("rb") as handle:
+            raw_length = handle.read(8)
+            if len(raw_length) != 8:
+                return {}
+            header_length = struct.unpack("<Q", raw_length)[0]
+            if header_length <= 0 or header_length > 256 * 1024 * 1024:
+                return {}
+            decoded = json.loads(handle.read(header_length))
+    except (OSError, json.JSONDecodeError, struct.error):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _is_mxfp4_tensor_pair(weight: Any, scales: Any) -> bool:
+    if not isinstance(weight, dict) or not isinstance(scales, dict):
+        return False
+    weight_shape = weight.get("shape")
+    scales_shape = scales.get("shape")
+    if not isinstance(weight_shape, list) or not isinstance(scales_shape, list):
+        return False
+    if not weight_shape or not scales_shape:
+        return False
+    packed_width = weight_shape[-1]
+    scale_width = scales_shape[-1]
+    return (
+        weight.get("dtype") == "U32"
+        and scales.get("dtype") == "U8"
+        and isinstance(packed_width, int)
+        and isinstance(scale_width, int)
+        and scale_width > 0
+        and packed_width == scale_width * 4
+    )
+
+
+def _inferred_mxfp4_switch_paths(model_path: Path) -> tuple[str, ...]:
+    """Find routed-expert projections whose files encode MXFP4 metadata."""
+
+    index_path = model_path / "model.safetensors.index.json"
+    try:
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ()
+    weight_map = payload.get("weight_map") if isinstance(payload, dict) else None
+    if not isinstance(weight_map, dict):
+        return ()
+
+    model_root = model_path.resolve()
+    headers: dict[str, dict[str, Any]] = {}
+
+    def metadata(key: str) -> Any:
+        shard = weight_map.get(key)
+        if not isinstance(shard, str):
+            return None
+        if shard not in headers:
+            shard_path = (model_path / shard).resolve()
+            if not shard_path.is_relative_to(model_root):
+                headers[shard] = {}
+            else:
+                headers[shard] = _safetensors_header(shard_path)
+        return headers[shard].get(key)
+
+    inferred: list[str] = []
+    for key in weight_map:
+        if not isinstance(key, str) or not key.endswith(".weight"):
+            continue
+        layer_path = key.removesuffix(".weight")
+        if ".switch_mlp." not in layer_path:
+            continue
+        if layer_path.rsplit(".", 1)[-1] not in _SWITCH_PROJECTIONS:
+            continue
+        scales_key = f"{layer_path}.scales"
+        if scales_key not in weight_map or f"{layer_path}.biases" in weight_map:
+            continue
+        if _is_mxfp4_tensor_pair(metadata(key), metadata(scales_key)):
+            inferred.append(layer_path)
+    return tuple(sorted(inferred))
+
+
+def _augment_mixed_quantization_config(
+    model_path: Path,
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], int]:
+    """Supply omitted per-layer metadata for hybrid DeepSeek V4 exports."""
+
+    if config.get("model_type") != "deepseek_v4":
+        return config, 0
+    quantization = config.get("quantization")
+    if not isinstance(quantization, dict):
+        return config, 0
+
+    inferred_paths = _inferred_mxfp4_switch_paths(model_path)
+    missing_paths = [path for path in inferred_paths if path not in quantization]
+    if not missing_paths:
+        return config, 0
+
+    augmented = dict(config)
+    augmented_quantization = dict(quantization)
+    for path in missing_paths:
+        augmented_quantization[path] = dict(_MXFP4_QUANTIZATION)
+    augmented["quantization"] = augmented_quantization
+    return augmented, len(missing_paths)
+
+
+def _install_mixed_quantization_compat() -> bool:
+    """Patch MLX-LM's config reader for under-specified hybrid checkpoints."""
+
+    utils = importlib.import_module("mlx_lm.utils")
+    if getattr(utils, _QUANTIZATION_MARKER, False):
+        return False
+    original_load_config = utils.load_config
+
+    def load_config_with_mxfp4_switch_metadata(model_path: Path) -> dict[str, Any]:
+        config = original_load_config(model_path)
+        augmented, count = _augment_mixed_quantization_config(Path(model_path), config)
+        if count:
+            logging.warning(
+                "Tokenity inferred MXFP4 quantization for %d DeepSeek V4 "
+                "Switch-MLP projections omitted from config.json.",
+                count,
+            )
+        return augmented
+
+    utils.load_config = load_config_with_mxfp4_switch_metadata
+    setattr(utils, _QUANTIZATION_MARKER, True)
+    return True
 
 
 def install_deepseek_v4_compat() -> bool:
@@ -93,6 +230,7 @@ def install_deepseek_v4_compat() -> bool:
             elif getattr(models_package, leaf_name, None) is not None:
                 delattr(models_package, leaf_name)
         raise
+    _install_mixed_quantization_compat()
     return True
 
 

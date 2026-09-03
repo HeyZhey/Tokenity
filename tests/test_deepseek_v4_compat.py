@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 import hashlib
 import importlib
+import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -110,6 +112,86 @@ def test_pr_1189_model_constructs_prefills_and_decodes(isolated_mlx_lm_models):
     decode = model(inputs[:, 4:], cache=cache)
     mx.eval(prefill, decode)
     assert decode.shape == (1, 1, args.vocab_size)
+
+
+def test_hybrid_checkpoint_infers_omitted_mxfp4_switch_metadata(
+    isolated_mlx_lm_models,
+    tmp_path,
+):
+    mx = pytest.importorskip("mlx.core")
+    nn = pytest.importorskip("mlx.nn")
+    from mlx.utils import tree_flatten
+    from mlx_lm.utils import load_model
+
+    assert compat.install_deepseek_v4_compat()
+    deepseek_v4 = importlib.import_module("mlx_lm.models.deepseek_v4")
+    args = deepseek_v4.ModelArgs(
+        model_type="deepseek_v4",
+        vocab_size=128,
+        hidden_size=64,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        q_lora_rank=16,
+        o_lora_rank=8,
+        o_groups=2,
+        head_dim=16,
+        qk_rope_head_dim=4,
+        sliding_window=16,
+        compress_ratios=[0, 0, 4, 0],
+        index_n_heads=4,
+        index_head_dim=8,
+        index_topk=4,
+        moe_intermediate_size=32,
+        n_routed_experts=4,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
+        num_hash_layers=1,
+        num_nextn_predict_layers=0,
+        hc_mult=2,
+        hc_sinkhorn_iters=2,
+        max_position_embeddings=256,
+    )
+    source = deepseek_v4.Model(args)
+    nn.quantize(
+        source,
+        class_predicate=lambda path, module: (
+            dict(compat._MXFP4_QUANTIZATION)
+            if ".switch_mlp." in path and hasattr(module, "to_quantized")
+            else False
+        ),
+    )
+    weights = dict(tree_flatten(source.parameters()))
+    switch_paths = sorted(
+        key.removesuffix(".weight")
+        for key in weights
+        if ".switch_mlp." in key and key.endswith(".weight")
+    )
+    assert len(switch_paths) == 12
+    assert not any(f"{path}.biases" in weights for path in switch_paths)
+
+    shard_name = "model-00001-of-00001.safetensors"
+    mx.save_safetensors(str(tmp_path / shard_name), weights)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: shard_name for key in weights}}),
+        encoding="utf-8",
+    )
+    config = asdict(args)
+    config["quantization"] = {"group_size": 64, "bits": 8, "mode": "affine"}
+    config["quantization_config"] = dict(config["quantization"])
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    loaded, loaded_config = load_model(tmp_path, lazy=True, strict=True)
+
+    assert all(
+        loaded_config["quantization"][path] == compat._MXFP4_QUANTIZATION
+        for path in switch_paths
+    )
+    assert all(
+        getattr(getattr(layer.ffn.switch_mlp, projection), "mode") == "mxfp4"
+        for layer in loaded.model.layers
+        for projection in compat._SWITCH_PROJECTIONS
+    )
 
 
 def test_server_patch_forces_deepseek_v4_to_sequential_generation():
