@@ -148,9 +148,9 @@ TP2 通过 Thunderbolt RDMA 使用 JACCL；两个 rank 最终均以 code 0 退�
 | 集群发现 | 自动发现局域网 Agent，通过稳定 `machine_id` 跟踪 Mac，并在地址变化后修复连接。 |
 | 运行维护 | 内存准入、队列、超时、lease、健康/readiness、资源账本、日志、watchdog 和升级维护窗口。 |
 
-当前模型覆盖包括 GLM 5.2、Qwen 系列 MLX checkpoint、MiniMax H3，以及其他由
-元数据与 Runtime 能力确认兼容的 MLX 模型。Native MTP 也依据 checkpoint 和
-后端证据安全启用，而不是写死模型名称。
+当前模型覆盖包括 DeepSeek V4、GLM 5.2、Qwen 系列 MLX checkpoint、MiniMax H3，
+以及其他由元数据与 Runtime 能力确认兼容的 MLX 模型。Native MTP 也依据
+checkpoint 和后端证据安全启用，而不是写死模型名称。
 
 ## 产品架构
 
@@ -314,6 +314,7 @@ Mac、Runtime、checkpoint 与网络硬件。当前硬件基线包括：
 - [安装与 Runtime 分发](docs/installer-dmg.md)
 - [HTTP Node Agent](docs/http-node-agent.md)
 - [外部 API](docs/external-api.md)
+- [DeepSeek V4 兼容性](docs/deepseek-v4-compat.md)
 - [GLM 5.2 兼容性](docs/glm-5.2-compat.md)
 - [Native MTP](docs/native-mtp.md)
 - [RDMA 操作](docs/current-usage-rdma-qwen.md)

@@ -20,6 +20,7 @@ from tokenity.serving.distributed_openai import (
     _eval_parameters_in_chunks,
     _install_chunked_sharded_load,
     _install_jaccl_server_control_collectives,
+    _install_model_compatibility,
     _jaccl_control_header,
     _load_eval_policy,
     _parameter_eval_chunks,
@@ -167,6 +168,25 @@ def test_single_loader_installs_model_compatibility_before_mlx_lm_load(
 
     assert calls == ["compat", "load"]
     assert runtime.state.phase is ReadinessPhase.READY
+
+
+def test_deepseek_v4_config_activates_pr_1189_compatibility(tmp_path, monkeypatch):
+    model = tmp_path / "DeepSeek-V4-Flash-4bit"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps({"model_type": "deepseek_v4"}),
+        encoding="utf-8",
+    )
+    calls = []
+    fake_glm = types.ModuleType("tokenity.mlx.glm_moe_dsa_compat")
+    fake_glm.install_glm_moe_dsa_compat = lambda: False  # type: ignore[attr-defined]
+    fake_deepseek = types.ModuleType("tokenity.mlx.deepseek_v4_compat")
+    fake_deepseek.install_deepseek_v4_compat = lambda: calls.append("deepseek_v4") or True  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "tokenity.mlx.glm_moe_dsa_compat", fake_glm)
+    monkeypatch.setitem(sys.modules, "tokenity.mlx.deepseek_v4_compat", fake_deepseek)
+
+    assert _install_model_compatibility(str(model))
+    assert calls == ["deepseek_v4"]
 
 
 def test_stream_payload_keeps_reasoning_separate_from_answer():

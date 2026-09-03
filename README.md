@@ -165,10 +165,10 @@ benchmark harness, fingerprints, and reproducibility notes.
 | Cluster discovery | Finds Node Agents on the LAN, tracks each Mac by stable `machine_id`, and repairs address changes without confusing remote nodes with loopback. |
 | Operations | Memory admission, queues, timeouts, leases, health/readiness probes, resource ledgers, logs, watchdog restart, and upgrade-safe maintenance windows. |
 
-Current model coverage includes GLM 5.2, Qwen-family MLX checkpoints, MiniMax
-H3, and other compatible MLX models selected through metadata and runtime
-capabilities. Native MTP activation is guarded by checkpoint and backend
-evidence rather than model-name switches.
+Current model coverage includes DeepSeek V4, GLM 5.2, Qwen-family MLX
+checkpoints, MiniMax H3, and other compatible MLX models selected through
+metadata and runtime capabilities. Native MTP activation is guarded by
+checkpoint and backend evidence rather than model-name switches.
 
 ## Product architecture
 
@@ -344,6 +344,7 @@ weights, Agent protocol, or distributed topology.
 - [Installer and runtime distribution](docs/installer-dmg.md)
 - [HTTP Node Agent](docs/http-node-agent.md)
 - [External API](docs/external-api.md)
+- [DeepSeek V4 compatibility](docs/deepseek-v4-compat.md)
 - [GLM 5.2 compatibility](docs/glm-5.2-compat.md)
 - [Native MTP](docs/native-mtp.md)
 - [RDMA operations](docs/current-usage-rdma-qwen.md)

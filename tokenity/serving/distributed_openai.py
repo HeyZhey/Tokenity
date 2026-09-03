@@ -38,7 +38,11 @@ from tokenity.inference.native_mtp.runtime import (
     attach_controller,
     controller_for,
 )
-from tokenity.model_inspection import distributed_model_issue, standalone_model_issue
+from tokenity.model_inspection import (
+    distributed_model_issue,
+    read_model_config,
+    standalone_model_issue,
+)
 
 from .readiness import ReadinessPhase, ReadinessState
 
@@ -227,9 +231,20 @@ class _MLXServerSymbols:
     def load(
         cls,
         native_mtp: NativeMTPRuntimeController | None = None,
+        model: str | None = None,
     ) -> "_MLXServerSymbols":
-        _install_model_compatibility()
+        deepseek_v4_requested = _install_model_compatibility(model)
         import mlx_lm.server as server  # type: ignore
+
+        if deepseek_v4_requested:
+            from tokenity.mlx.deepseek_v4_compat import (
+                install_deepseek_v4_server_compat,
+            )
+
+            if install_deepseek_v4_server_compat(server):
+                logging.warning(
+                    "Tokenity disabled unsafe MLX-LM batch generation for DeepSeek V4."
+                )
 
         if native_mtp is not None:
             attach_controller(server, native_mtp)
@@ -258,13 +273,23 @@ class _MLXServerSymbols:
         )
 
 
-def _install_model_compatibility() -> None:
+def _install_model_compatibility(model: str | None = None) -> bool:
     from tokenity.mlx.glm_moe_dsa_compat import install_glm_moe_dsa_compat
 
     if install_glm_moe_dsa_compat():
         logging.warning(
             "Tokenity installed GLM-5.2 cross-layer indexer sharing compatibility from mlx-lm PR #1410."
         )
+    if model is None or read_model_config(model).get("model_type") != "deepseek_v4":
+        return False
+
+    from tokenity.mlx.deepseek_v4_compat import install_deepseek_v4_compat
+
+    if install_deepseek_v4_compat():
+        logging.warning(
+            "Tokenity installed DeepSeek V4 compatibility from mlx-lm PR #1189."
+        )
+    return True
 
 
 def _install_jaccl_server_control_collectives(server: Any) -> None:
@@ -1029,7 +1054,7 @@ class TokenityDistributedRuntime:
             message="Loading model metadata and materializing sharded weights.",
         )
         self.state.progress = 0.1
-        self._symbols = _MLXServerSymbols.load(self.native_mtp)
+        self._symbols = _MLXServerSymbols.load(self.native_mtp, model=self.model)
         args = self._server_args()
         self._provider = self._symbols.ModelProvider(args)
         self._map_model_aliases(self._provider)
@@ -1055,7 +1080,7 @@ class TokenityDistributedRuntime:
             import mlx.core as mx  # type: ignore
             from mlx.utils import tree_flatten  # type: ignore
 
-            _install_model_compatibility()
+            _install_model_compatibility(self.model)
             from mlx_lm import load  # type: ignore
 
             _configure_mlx_wired_memory(
