@@ -7,6 +7,8 @@ source "$ROOT/packaging/install-layout.env"
 INSTALL_ROOT="${TOKENITY_INSTALL_ROOT:-$TOKENITY_INSTALL_ROOT_DEFAULT}"
 CODE_ROOT="$INSTALL_ROOT/Code"
 RUNTIME_ROOT="$INSTALL_ROOT/Runtime"
+RUNTIME_STAGE_ROOT="$INSTALL_ROOT/.Runtime.installing"
+RUNTIME_BACKUP_ROOT="$INSTALL_ROOT/.Runtime.previous"
 MODEL_ROOT="$INSTALL_ROOT/Models"
 STATE_ROOT="$INSTALL_ROOT/State"
 LOG_ROOT="$INSTALL_ROOT/Logs"
@@ -202,7 +204,7 @@ codesign --verify --deep --strict "$APP_BUNDLE"
 
 if [[ "$BUILD_NODE_AGENT_PACKAGE" == "1" ]]; then
 mkdir -p "$PAYLOAD_DIR$CODE_ROOT" \
-  "$PAYLOAD_DIR$RUNTIME_ROOT" \
+  "$PAYLOAD_DIR$RUNTIME_STAGE_ROOT" \
   "$PAYLOAD_DIR$MODEL_ROOT" \
   "$PAYLOAD_DIR/Library/LaunchDaemons" \
   "$PAYLOAD_DIR/usr/local/bin"
@@ -228,7 +230,7 @@ fi
 "$RUNTIME_MANIFEST_TOOL" verify "$RUNTIME_CACHE" \
   --lock "$RUNTIME_LOCK" \
   --manifest "$RUNTIME_CACHE/runtime-manifest.json"
-copy_runtime_dir "$RUNTIME_CACHE/" "$PAYLOAD_DIR$RUNTIME_ROOT"
+copy_runtime_dir "$RUNTIME_CACHE/" "$PAYLOAD_DIR$RUNTIME_STAGE_ROOT"
 
 if [[ "${TOKENITY_INCLUDE_MODEL:-0}" == "1" ]]; then
   MODEL_NAME="${TOKENITY_MODEL_NAME:-Qwen3.5-122B-A10B-4bit}"
@@ -361,6 +363,9 @@ RUNTIME_SIZE_KB="$(du -sk "$RUNTIME_CACHE" | awk '{print $1}')"
   printf 'MINIMUM_MACOS="%s"\n' "$RUNTIME_MINIMUM_MACOS"
   printf 'REQUIRED_KB="%s"\n' "$((RUNTIME_SIZE_KB + 1048576))"
   printf 'INSTALL_ROOT=%q\n' "$INSTALL_ROOT"
+  printf 'RUNTIME_ROOT=%q\n' "$RUNTIME_ROOT"
+  printf 'RUNTIME_STAGE_ROOT=%q\n' "$RUNTIME_STAGE_ROOT"
+  printf 'RUNTIME_BACKUP_ROOT=%q\n' "$RUNTIME_BACKUP_ROOT"
   printf 'RUNTIME_PYTHON=%q\n' "$RUNTIME_PYTHON"
   printf 'STATE_ROOT=%q\n' "$STATE_ROOT"
   cat <<'SCRIPT'
@@ -453,6 +458,19 @@ fi
   "$RUNTIME_PYTHON -u -m tokenity node-agent" \
   2>/dev/null || true
 
+# PackageKit overlays payloads and does not remove unmanaged files that
+# disappeared from a newer package. Always receive the next Runtime in a
+# disposable directory. Recover any backup left by an interrupted install,
+# then protect the live Runtime before PackageKit processes its old receipt.
+if [[ -e "$RUNTIME_BACKUP_ROOT" || -L "$RUNTIME_BACKUP_ROOT" ]]; then
+  /bin/rm -rf "$RUNTIME_ROOT"
+  /bin/mv "$RUNTIME_BACKUP_ROOT" "$RUNTIME_ROOT"
+fi
+/bin/rm -rf "$RUNTIME_STAGE_ROOT"
+if [[ -e "$RUNTIME_ROOT" || -L "$RUNTIME_ROOT" ]]; then
+  /bin/mv "$RUNTIME_ROOT" "$RUNTIME_BACKUP_ROOT"
+fi
+
 exit 0
 SCRIPT
 } > "$SCRIPTS_DIR/preinstall"
@@ -477,6 +495,8 @@ RUNTIME_EXPECTED_H3_PROTOCOL="$(
   printf 'INSTALL_ROOT=%q\n' "$INSTALL_ROOT"
   printf 'CODE_ROOT=%q\n' "$CODE_ROOT"
   printf 'RUNTIME_ROOT=%q\n' "$RUNTIME_ROOT"
+  printf 'RUNTIME_STAGE_ROOT=%q\n' "$RUNTIME_STAGE_ROOT"
+  printf 'RUNTIME_BACKUP_ROOT=%q\n' "$RUNTIME_BACKUP_ROOT"
   printf 'MODEL_ROOT=%q\n' "$MODEL_ROOT"
   printf 'STATE_ROOT=%q\n' "$STATE_ROOT"
   printf 'LOG_ROOT=%q\n' "$LOG_ROOT"
@@ -495,6 +515,38 @@ PYTHON="$RUNTIME_PYTHON"
 H3_BINARY="$RUNTIME_ROOT/current/bin/mlx-serve"
 export PYTHONDONTWRITEBYTECODE=1
 AGENT_USER="$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || true)"
+RUNTIME_SWAPPED=0
+
+rollback_runtime_install() {
+  local exit_code="$?"
+  trap - EXIT
+  if [[ "$exit_code" == "0" ]]; then
+    return
+  fi
+
+  # A failed postinstall must not strand the machine with both system jobs
+  # stopped. Restore the protected Runtime, then make a best-effort attempt to
+  # bring the jobs back online.
+  set +e
+  /bin/launchctl bootout system "$WATCHDOG_PLIST" 2>/dev/null
+  /bin/launchctl bootout system "$NODE_AGENT_PLIST" 2>/dev/null
+  if [[ -e "$RUNTIME_BACKUP_ROOT" || -L "$RUNTIME_BACKUP_ROOT" ]]; then
+    /bin/rm -rf "$RUNTIME_ROOT"
+    /bin/mv "$RUNTIME_BACKUP_ROOT" "$RUNTIME_ROOT"
+  elif [[ "$RUNTIME_SWAPPED" == "1" ]]; then
+    /bin/rm -rf "$RUNTIME_ROOT"
+  fi
+  /bin/rm -rf "$RUNTIME_STAGE_ROOT"
+  /bin/rm -f "$MAINTENANCE_PATH"
+  if [[ -x "$RUNTIME_PYTHON" ]]; then
+    /bin/launchctl bootstrap system "$NODE_AGENT_PLIST" 2>/dev/null
+    /bin/launchctl enable system/ai.tokenity.node-agent 2>/dev/null
+    /bin/launchctl bootstrap system "$WATCHDOG_PLIST" 2>/dev/null
+    /bin/launchctl enable system/ai.tokenity.node-agent-watchdog 2>/dev/null
+  fi
+  exit "$exit_code"
+}
+trap rollback_runtime_install EXIT
 
 if [[ -n "$AGENT_USER" && "$AGENT_USER" != "root" && "$AGENT_USER" != "loginwindow" ]]; then
   /usr/libexec/PlistBuddy -c "Add :UserName string $AGENT_USER" "$NODE_AGENT_PLIST" 2>/dev/null || \
@@ -604,9 +656,24 @@ if [[ -n "$TB_INTERFACE" ]]; then
 fi
 
 /usr/bin/python3 "$CODE_ROOT/scripts/tokenity-runtime-manifest.py" verify \
-  "$RUNTIME_ROOT" \
+  "$RUNTIME_STAGE_ROOT" \
   --lock "$CODE_ROOT/packaging/runtime/runtime-lock.json" \
-  --manifest "$RUNTIME_ROOT/runtime-manifest.json"
+  --manifest "$RUNTIME_STAGE_ROOT/runtime-manifest.json"
+
+# The staged tree is complete and verified.  Both paths share a filesystem, so
+# each rename is atomic; the old Runtime remains available for rollback until
+# every health check below has passed.
+if [[ -e "$RUNTIME_ROOT" || -L "$RUNTIME_ROOT" ]]; then
+  /bin/rm -rf "$RUNTIME_BACKUP_ROOT"
+  /bin/mv "$RUNTIME_ROOT" "$RUNTIME_BACKUP_ROOT"
+fi
+if ! /bin/mv "$RUNTIME_STAGE_ROOT" "$RUNTIME_ROOT"; then
+  if [[ -e "$RUNTIME_BACKUP_ROOT" || -L "$RUNTIME_BACKUP_ROOT" ]]; then
+    /bin/mv "$RUNTIME_BACKUP_ROOT" "$RUNTIME_ROOT"
+  fi
+  exit 1
+fi
+RUNTIME_SWAPPED=1
 
 if [[ -x "$PYTHON" ]]; then
   TOKENITY_EXPECTED_MLX="$EXPECTED_MLX" \
@@ -670,6 +737,9 @@ PY
   for _ in {1..10}; do
     if /usr/bin/curl --noproxy '*' --silent --fail --max-time 2 \
       http://127.0.0.1:9101/v1/watchdog/status >/dev/null; then
+      /bin/rm -rf "$RUNTIME_BACKUP_ROOT"
+      RUNTIME_SWAPPED=0
+      trap - EXIT
       exit 0
     fi
     /bin/sleep 1

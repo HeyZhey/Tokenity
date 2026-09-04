@@ -44,6 +44,22 @@ def test_dmg_exposes_one_installer_with_app_and_runtime_components():
     assert 'H3_BINARY="$RUNTIME_ROOT/current/bin/mlx-serve"' in source
 
 
+def test_runtime_upgrade_uses_verified_staging_and_rollback_paths():
+    source = (ROOT / "scripts/package-tokenity-dmg.sh").read_text(encoding="utf-8")
+
+    assert 'RUNTIME_STAGE_ROOT="$INSTALL_ROOT/.Runtime.installing"' in source
+    assert 'RUNTIME_BACKUP_ROOT="$INSTALL_ROOT/.Runtime.previous"' in source
+    assert 'copy_runtime_dir "$RUNTIME_CACHE/" "$PAYLOAD_DIR$RUNTIME_STAGE_ROOT"' in source
+    assert '"$RUNTIME_STAGE_ROOT"' in source
+    assert '--manifest "$RUNTIME_STAGE_ROOT/runtime-manifest.json"' in source
+    assert '/bin/mv "$RUNTIME_ROOT" "$RUNTIME_BACKUP_ROOT"' in source
+    assert '/bin/mv "$RUNTIME_STAGE_ROOT" "$RUNTIME_ROOT"' in source
+    assert "protect the live Runtime before PackageKit processes its old receipt" in source
+    assert "rollback_runtime_install()" in source
+    assert 'local exit_code="$?"' in source
+    assert 'trap rollback_runtime_install EXIT' in source
+
+
 def test_app_installer_removes_only_the_known_legacy_bundle_name():
     source = (ROOT / "scripts/package-tokenity-dmg.sh").read_text(encoding="utf-8")
 
