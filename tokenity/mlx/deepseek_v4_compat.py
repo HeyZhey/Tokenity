@@ -234,6 +234,33 @@ def install_deepseek_v4_compat() -> bool:
     return True
 
 
+# Same chat delimiters as the working V4 export. Only supply a missing template;
+# existing checkpoint templates, including custom tool formats, always win.
+_CHAT_TEMPLATE = """{%- if tools|default([]) -%}{{ raise_exception('A checkpoint chat template is required for DeepSeek V4 tool calling.') }}{%- endif -%}{{ bos_token }}{% for message in messages %}
+{%- if message['role'] == 'system' -%}{{ message['content'] }}
+{%- elif message['role'] == 'user' -%}{{ '<｜User｜>' + message['content'] }}
+{%- elif message['role'] == 'assistant' -%}{{ '<｜Assistant｜></think>' + message['content'] + eos_token }}
+{%- else -%}{{ raise_exception('This DeepSeek V4 fallback supports system, user and assistant text messages only; provide a checkpoint chat template for tools.') }}
+{%- endif -%}{% endfor %}
+{%- if add_generation_prompt -%}{{ '<｜Assistant｜>' }}
+{%- if enable_thinking|default(false) or thinking_mode|default('chat') == 'thinking' -%}{{ '<think>' }}
+{%- else -%}{{ '</think>' }}{%- endif -%}{%- endif -%}"""
+
+
+def install_deepseek_v4_tokenizer_compat(model: Any, tokenizer: Any) -> bool:
+    if getattr(model, "model_type", None) != "deepseek_v4" or tokenizer is None:
+        return False
+    if getattr(tokenizer, "has_chat_template", False) or getattr(tokenizer, "chat_template", None):
+        return False
+    required = {"<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>", "<｜User｜>", "<｜Assistant｜>", "<think>", "</think>"}
+    if not required.issubset(tokenizer.get_vocab()):
+        raise RuntimeError("DeepSeek V4 tokenizer is missing required chat tokens; use a complete checkpoint.")
+    tokenizer.chat_template = _CHAT_TEMPLATE
+    tokenizer.has_chat_template = True
+    logging.warning("Tokenity supplied the missing DeepSeek V4 text chat template in memory.")
+    return True
+
+
 def install_deepseek_v4_server_compat(server: Any) -> bool:
     """Disable MLX-LM batch generation for the PR's hybrid cache model."""
 
@@ -252,6 +279,7 @@ def install_deepseek_v4_server_compat(server: Any) -> bool:
         original_load(self, model_path, adapter_path, draft_model_path)
         if getattr(self.model, "model_type", None) == "deepseek_v4":
             self.is_batchable = False
+            install_deepseek_v4_tokenizer_compat(self.model, getattr(self, "tokenizer", None))
 
     provider._load = load_without_unsafe_batching
     setattr(provider, _MARKER, UPSTREAM_COMMIT)

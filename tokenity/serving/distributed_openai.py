@@ -40,6 +40,7 @@ from tokenity.inference.native_mtp.runtime import (
 )
 from tokenity.model_inspection import (
     distributed_model_issue,
+    model_backend,
     read_model_config,
     standalone_model_issue,
 )
@@ -58,12 +59,16 @@ class ChatCompletionRequest(BaseModel):
     top_k: int | None = Field(default=None, ge=0)
     min_p: float | None = Field(default=None, ge=0, le=1)
     presence_penalty: float | None = Field(default=None, ge=-2, le=2)
+    frequency_penalty: float | None = Field(default=None, ge=-2, le=2)
     repetition_penalty: float | None = Field(default=None, ge=0, le=2)
     stop: str | list[str] | None = None
     seed: int | None = None
     logprobs: bool | None = None
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
     tools: list[Any] | None = None
+    tool_choice: Any = None
+    parallel_tool_calls: bool | None = None
+    response_format: dict[str, Any] | None = None
     role_mapping: dict[str, Any] | None = None
     chat_template_kwargs: dict[str, Any] | None = None
 
@@ -960,6 +965,7 @@ class TokenityDistributedRuntime:
         self.decode_concurrency = decode_concurrency
         self.prompt_concurrency = prompt_concurrency
         self.execution_mode = execution_mode
+        self.inference_backend = model_backend(model)
         self.warmup_timeout = warmup_timeout
         self.state.execution_mode = execution_mode
         self.native_mtp = NativeMTPRuntimeController(
@@ -1069,7 +1075,7 @@ class TokenityDistributedRuntime:
 
         self.state.rank = 0
         self.state.world_size = 1
-        self.state.backend = "single"
+        self.state.backend = "mlx-vlm" if self.inference_backend == "mlx-vlm" else "single"
         self.state.transition(
             ReadinessPhase.LOADING_MODEL,
             message="Loading model metadata on one Mac without distributed initialization.",
@@ -1080,20 +1086,30 @@ class TokenityDistributedRuntime:
             import mlx.core as mx  # type: ignore
             from mlx.utils import tree_flatten  # type: ignore
 
-            _install_model_compatibility(self.model)
-            from mlx_lm import load  # type: ignore
-
             _configure_mlx_wired_memory(
                 mx,
                 model=self.model,
                 execution_mode=self.execution_mode,
                 connection_mode=self.state.connection_mode,
             )
-            self._single_model, self._single_tokenizer = load(
-                self.model,
-                tokenizer_config={"trust_remote_code": True if self.trust_remote_code else None},
-                lazy=True,
-            )
+            if self.inference_backend == "mlx-vlm":
+                from .mlx_vlm_openai import load_model
+
+                self._single_model, self._single_tokenizer = load_model(
+                    self.model, trust_remote_code=self.trust_remote_code,
+                    native_mtp_mode=self.native_mtp.config.mode,
+                )
+            else:
+                _install_model_compatibility(self.model)
+                from mlx_lm import load  # type: ignore
+                from tokenity.mlx.deepseek_v4_compat import install_deepseek_v4_tokenizer_compat
+
+                self._single_model, self._single_tokenizer = load(
+                    self.model,
+                    tokenizer_config={"trust_remote_code": True if self.trust_remote_code else None},
+                    lazy=True,
+                )
+                install_deepseek_v4_tokenizer_compat(self._single_model, self._single_tokenizer)
             self.state.tokenizer_identity = type(self._single_tokenizer).__name__
             self.state.message = "Materializing local model weights."
             self.state.progress = 0.1
@@ -1443,7 +1459,7 @@ class TokenityDistributedRuntime:
                         discard_remaining = True
                         continue
                     break
-                tokens += 1
+                tokens += getattr(item, "token_count", 1)
                 item_state = getattr(item, "state", None)
                 if item_state == "tool":
                     tool_text += getattr(item, "text", "")
@@ -1729,7 +1745,7 @@ class TokenityDistributedRuntime:
                         discard_remaining = True
                         continue
                     break
-                tokens += 1
+                tokens += getattr(item, "token_count", 1)
                 generated_items.append(item)
                 finish_reason = item.finish_reason or finish_reason
                 if item.state == "reasoning":
@@ -1812,6 +1828,10 @@ class TokenityDistributedRuntime:
             raise RuntimeError("Tokenity single-node runtime has not started.")
         if not self.accepts_model(request.model):
             raise ValueError(f"Model is not loaded: {request.model}")
+        if self.inference_backend == "mlx-vlm":
+            from .mlx_vlm_openai import begin_generation
+
+            return begin_generation(self, request)
         if not self._single_generation_lock.acquire(timeout=600):
             raise TimeoutError("Single-node generation queue did not become available before its deadline.")
         try:
@@ -2272,6 +2292,13 @@ def create_app(
             if request.stream:
                 return StreamingResponse(_stream_skeleton(state), media_type="text/event-stream")
             return _skeleton_completion(model=request.model)
+        if runtime.inference_backend == "mlx-vlm":
+            from .mlx_vlm_openai import validate_request
+
+            try:
+                validate_request(request)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         if request.stream:
             return _TimelineStreamingResponse(
                 runtime.stream(request, request_id=request_id, accepted_at=accepted_at),

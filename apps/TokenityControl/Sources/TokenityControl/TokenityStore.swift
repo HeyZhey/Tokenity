@@ -307,6 +307,7 @@ final class TokenityStore: ObservableObject {
     @Published private(set) var videoRuntimeState: VideoRuntimeState = .stopped
     @Published private(set) var videoRuntimeInstanceID: String?
     @Published private(set) var videoRuntimeLoadProgress: Double?
+    @Published private(set) var videoTurboReadiness: H3TurboReadiness?
     @Published private(set) var isVideoGenerating = false
     @Published private(set) var videoProgress: Double = 0
     @Published private(set) var videoProgressStage = "Waiting for a MiniMax H3 runtime"
@@ -948,6 +949,13 @@ final class TokenityStore: ObservableObject {
                 ))
             }
         }
+        if videoNodes.count == 2, videoRequest.turbo {
+            issues.append(.init(
+                state: .highSpeedConnectionUnavailable,
+                message: "Turbo currently supports Single Mac only; TP2 is not supported.",
+                action: .useOneMac
+            ))
+        }
         if videoNodes.count == 2, !Self.nodesHaveCompatibleRDMA(videoNodes) {
             issues.append(.init(
                 state: .highSpeedConnectionUnavailable,
@@ -963,6 +971,22 @@ final class TokenityStore: ObservableObject {
 
     var videoRuntimeReadinessIssues: [String] {
         videoReadiness.map(\.message)
+    }
+
+    func setVideoTurbo(_ enabled: Bool) {
+        guard !isVideoGenerating else { return }
+        videoRequest.setTurbo(enabled)
+    }
+
+    var videoTurboReadinessIssues: [String] {
+        guard videoRequest.turbo else { return [] }
+        if videoNodes.count > 1 {
+            return ["Turbo currently supports Single Mac only. Stop TP2 and configure one execution node."]
+        }
+        guard let readiness = videoTurboReadiness else {
+            return ["Start or refresh the runtime to verify Turbo on the execution node."]
+        }
+        return readiness.ready ? [] : (readiness.issues.isEmpty ? ["Turbo readiness was not confirmed by the execution node."] : readiness.issues)
     }
 
     var videoTopologySummary: String {
@@ -990,6 +1014,7 @@ final class TokenityStore: ObservableObject {
         videoRuntimeState = .starting
         videoRuntimeLoadProgress = 0.02
         videoGenerationError = nil
+        videoTurboReadiness = nil
         videoProgressStage = "Validating MiniMax H3 topology"
         appendLog("Validating MiniMax H3 video topology.")
         await refreshVideoNodes()
@@ -1061,7 +1086,8 @@ final class TokenityStore: ObservableObject {
             request.timeoutInterval = 300
             let (data, response) = try await dataTransport(request)
             try validate(response, data: data)
-            let started = try JSONDecoder().decode(AgentStartModelResponse.self, from: data)
+            let started = try JSONDecoder().decode(H3VideoRuntimeResponse.self, from: data)
+            videoTurboReadiness = started.turbo
             guard let startedID = started.instanceID, !startedID.isEmpty else {
                 throw TokenityTransportError.invalidResponse
             }
@@ -1111,6 +1137,7 @@ final class TokenityStore: ObservableObject {
             if let instanceID {
                 try await stopVideoInstance(instanceID)
             }
+            videoTurboReadiness = nil
             appendLog("MiniMax H3 video runtime stopped.")
             videoRuntimeInstanceID = nil
             videoRuntimeState = .stopped
@@ -1152,6 +1179,10 @@ final class TokenityStore: ObservableObject {
             videoGenerationError = "Start the MiniMax H3 runtime before generating video."
             return
         }
+        guard videoTurboReadinessIssues.isEmpty else {
+            videoGenerationError = videoTurboReadinessIssues.joined(separator: " ")
+            return
+        }
         var generation = videoRequest.validated()
         guard !generation.prompt.isEmpty else {
             videoGenerationError = "Enter a video prompt first."
@@ -1180,7 +1211,8 @@ final class TokenityStore: ObservableObject {
         videoProgress = 0
         videoProgressStage = "Submitting request"
         videoGenerationError = nil
-        appendLog("Generating MiniMax H3 video on \(videoTopologySummary).")
+        let generationStarted = Date()
+        appendLog("Generating MiniMax H3 video on \(videoTopologySummary): turbo=\(generation.turbo), steps=\(generation.steps), fast=\(generation.fast).")
         var didComplete = false
         defer { isVideoGenerating = false }
 
@@ -1212,10 +1244,15 @@ final class TokenityStore: ObservableObject {
                 case .complete(let payload):
                     videoProgressStage = "Saving video"
                     videoProgress = 0.99
+                    let saveStarted = Date()
                     let artifact = try await videoArtifactTransport(payload, generation)
                     generatedVideoArtifact = artifact
                     recentVideoArtifacts.removeAll { $0.id == artifact.id }
                     recentVideoArtifacts.insert(artifact, at: 0)
+                    appendLog(String(format: "Video timing: gateway stream %.3fs, save %.3fs, total %.3fs.",
+                                     saveStarted.timeIntervalSince(generationStarted),
+                                     Date().timeIntervalSince(saveStarted),
+                                     Date().timeIntervalSince(generationStarted)))
                     videoProgress = 1
                     videoProgressStage = "Complete"
                     didComplete = true
@@ -1224,6 +1261,7 @@ final class TokenityStore: ObservableObject {
                     )
                 }
             }
+            try Task.checkCancellation()
             guard didComplete else { throw H3VideoContractError.invalidEvent }
         } catch {
             if Task.isCancelled {
@@ -1576,6 +1614,7 @@ final class TokenityStore: ObservableObject {
                 shardCount: modelEntries.compactMap(\.shardCount).max(),
                 nativeMTP: nativeMTP,
                 modelType: modelEntries.compactMap(\.modelType).first,
+                inferenceBackend: modelEntries.compactMap(\.inferenceBackend).first,
                 revision: modelEntries.compactMap(\.revision).first,
                 standaloneLoadable: draftOnlyEntry == nil,
                 loadBlockReason: draftOnlyEntry?.loadBlockReason ?? (draftOnlyEntry == nil ? nil : "Qwen3.5 MTP weights are a speculative-decoding draft model and cannot be loaded as a standalone chat model. Load the matching Qwen3.5 base model instead."),
@@ -1752,6 +1791,18 @@ final class TokenityStore: ObservableObject {
         videoNodes = sampledNodes
         synchronizeVideoRuntime(from: sampledNodes)
         await refreshVideoRuntimeQuorumIfNeeded()
+        if isVideoRuntimeReady, !isVideoGenerating, let instanceID = videoRuntimeInstanceID,
+           let baseURL = videoControlBaseURL() {
+            do {
+                var request = URLRequest(url: baseURL.appendingPathComponent("/v1/node/instances/\(instanceID)/h3-turbo"))
+                request.timeoutInterval = 10
+                let (data, response) = try await dataTransport(request)
+                try validate(response, data: data)
+                videoTurboReadiness = try JSONDecoder().decode(H3TurboReadiness.self, from: data)
+            } catch {
+                videoTurboReadiness = H3TurboReadiness(ready: false, issues: [userFacingMessage(for: error)])
+            }
+        }
         if validateRuntime, videoRuntimeState != .ready, videoReadiness.isEmpty {
             await refreshVideoPreflight()
         }
@@ -4797,11 +4848,11 @@ final class TokenityStore: ObservableObject {
 
     private func validate(_ response: HTTPURLResponse, data: Data = Data()) throws {
         guard (200..<300).contains(response.statusCode) else {
-            throw TokenityTransportError.httpStatus(response.statusCode, errorDetail(from: data, status: response.statusCode))
+            throw TokenityTransportError.httpStatus(response.statusCode, Self.errorDetail(from: data, status: response.statusCode))
         }
     }
 
-    private func errorDetail(from data: Data, status: Int) -> String? {
+    private nonisolated static func errorDetail(from data: Data, status: Int) -> String? {
         guard !data.isEmpty else { return nil }
         if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             if let detail = object["detail"] as? String {
@@ -4837,7 +4888,7 @@ final class TokenityStore: ObservableObject {
         return String(data: data, encoding: .utf8)
     }
 
-    private func structuredErrorDetail(_ detail: [String: Any]) -> String? {
+    private nonisolated static func structuredErrorDetail(_ detail: [String: Any]) -> String? {
         var parts: [String] = []
         if let stage = detail["stage"] as? String, !stage.isEmpty {
             parts.append(stage.replacingOccurrences(of: "_", with: " "))
@@ -5918,7 +5969,15 @@ final class TokenityStore: ObservableObject {
                         throw TokenityTransportError.invalidResponse
                     }
                     guard (200..<300).contains(httpResponse.statusCode) else {
-                        throw TokenityTransportError.httpStatus(httpResponse.statusCode, nil)
+                        var body = Data()
+                        for try await byte in bytes {
+                            body.append(byte)
+                            if body.count >= 65_536 { break }
+                        }
+                        throw TokenityTransportError.httpStatus(
+                            httpResponse.statusCode,
+                            errorDetail(from: body, status: httpResponse.statusCode)
+                        )
                     }
                     guard httpResponse.value(forHTTPHeaderField: "Content-Type")?
                         .lowercased()

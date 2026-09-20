@@ -11,6 +11,7 @@ import platform
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -110,13 +111,13 @@ def remove_transient_files(root: Path) -> None:
                 candidate.unlink(missing_ok=True)
 
 
-def normalize_entrypoint_shebangs(bin_directory: Path) -> None:
+def normalize_entrypoint_shebangs(bin_directory: Path, backend_path: str = "current") -> None:
     if any(character.isspace() for character in str(EXPECTED_INSTALL_ROOT)):
         raise RuntimeValidationError(
             "TOKENITY_RUNTIME_ROOT cannot contain whitespace because packaged "
             "entrypoint shebangs must be directly executable"
         )
-    expected = f"#!{EXPECTED_INSTALL_ROOT}/current/.venv/bin/python\n".encode()
+    expected = f"#!{EXPECTED_INSTALL_ROOT}/{backend_path}/.venv/bin/python\n".encode()
     for path in sorted(bin_directory.iterdir()):
         if not path.is_file() or path.is_symlink():
             continue
@@ -125,8 +126,7 @@ def normalize_entrypoint_shebangs(bin_directory: Path) -> None:
         if (
             separator
             and first_line.startswith(b"#!")
-            and b"TokenityRuntime/" in first_line
-            and first_line.endswith(b"/.venv/bin/python")
+            and re.search(rb"/python(?:3(?:\.12)?)?$", first_line)
             and first_line + b"\n" != expected
         ):
             path.write_bytes(expected + remainder)
@@ -134,7 +134,7 @@ def normalize_entrypoint_shebangs(bin_directory: Path) -> None:
     wheel_entrypoint = bin_directory / "wheel"
     if wheel_entrypoint.is_file():
         wheel_entrypoint.write_text(
-            f"#!{EXPECTED_INSTALL_ROOT}/current/.venv/bin/python\n"
+            f"#!{EXPECTED_INSTALL_ROOT}/{backend_path}/.venv/bin/python\n"
             "import sys\n"
             "from wheel._commands import main\n"
             "\n"
@@ -160,28 +160,37 @@ def normalize_runtime(root: Path, lock: dict[str, Any]) -> None:
 
     replace_symlink(root / "current", f"backends/{backend_name}")
     replace_symlink(root / "pythons" / python_alias_name, python_release_name)
-    replace_symlink(
-        backend / ".venv" / "bin" / "python",
-        f"../../../../pythons/{python_alias_name}/bin/python3.12",
-    )
-    replace_symlink(backend / ".venv" / "bin" / "python3", "python")
-    replace_symlink(backend / ".venv" / "bin" / "python3.12", "python")
+    backends = [(backend, "current")]
+    if vlm := lock.get("vlm_backend"):
+        relative = f"backends/{vlm['backend_name']}"
+        backends.append((root / relative, relative))
+    for backend, relative in backends:
+        if not (backend / ".venv").is_dir():
+            raise RuntimeValidationError(f"missing runtime backend: {backend}")
+        replace_symlink(
+            backend / ".venv/bin/python",
+            f"../../../../pythons/{python_alias_name}/bin/python3.12",
+        )
+        replace_symlink(backend / ".venv/bin/python3", "python")
+        replace_symlink(backend / ".venv/bin/python3.12", "python")
+        (backend / ".venv/pyvenv.cfg").write_text(
+            "include-system-site-packages = false\n", encoding="utf-8"
+        )
+        site_packages = backend / ".venv/lib/python3.12/site-packages"
+        (site_packages / "tokenity-code.pth").write_text(
+            f"{TOKENITY_CODE_PATH}\n", encoding="utf-8"
+        )
+        normalize_entrypoint_shebangs(backend / ".venv/bin", relative)
 
-    site_packages = backend / ".venv" / "lib" / "python3.12" / "site-packages"
-    (site_packages / "tokenity-code.pth").write_text(
-        f"{TOKENITY_CODE_PATH}\n", encoding="utf-8"
-    )
-    normalize_entrypoint_shebangs(backend / ".venv" / "bin")
 
-
-def runtime_python(root: Path) -> Path:
-    executable = root / "current" / ".venv" / "bin" / "python"
+def runtime_python(root: Path, backend_path: str = "current") -> Path:
+    executable = root / backend_path / ".venv" / "bin" / "python"
     if not executable.is_file() or not os.access(executable, os.X_OK):
         raise RuntimeValidationError(f"runtime Python is missing or not executable: {executable}")
     return executable
 
 
-def inspect_python(root: Path, lock: dict[str, Any]) -> dict[str, Any]:
+def inspect_python(root: Path, lock: dict[str, Any], backend_path: str = "current") -> dict[str, Any]:
     package_names = sorted(str(name) for name in lock["packages"])
     program = """
 import json
@@ -199,7 +208,7 @@ print(json.dumps({
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     environment["PYTHONNOUSERSITE"] = "1"
     completed = subprocess.run(
-        [str(runtime_python(root)), "-c", program],
+        [str(runtime_python(root, backend_path)), "-c", program],
         check=True,
         capture_output=True,
         text=True,
@@ -213,20 +222,38 @@ def version_tuple(value: str) -> tuple[int, ...]:
 
 
 def macho_minimum_macos(path: Path) -> str:
-    completed = subprocess.run(
-        ["/usr/bin/otool", "-l", str(path)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    versions = re.findall(r"^\s*minos\s+([0-9.]+)\s*$", completed.stdout, re.MULTILINE)
+    # Read load commands directly: installer hosts do not need Xcode's otool.
+    with path.open("rb") as handle:
+        header = handle.read(32)
+        if len(header) != 32:
+            raise RuntimeValidationError(f"truncated Mach-O header: {path}")
+        magic, cpu, _, _, count, size, _, _ = struct.unpack("<8I", header)
+        if magic != 0xFEEDFACF or cpu != 0x0100000C:
+            raise RuntimeValidationError(f"{path} is not an arm64 Mach-O binary")
+        commands = handle.read(size)
+    offset = 0
+    versions = []
+    for _ in range(count):
+        if offset + 8 > len(commands):
+            raise RuntimeValidationError(f"truncated Mach-O commands: {path}")
+        command, length = struct.unpack_from("<II", commands, offset)
+        if length < 8 or offset + length > len(commands):
+            raise RuntimeValidationError(f"invalid Mach-O command length: {path}")
+        if command == 0x32 and length >= 24:  # LC_BUILD_VERSION
+            platform_id, minimum = struct.unpack_from("<II", commands, offset + 8)
+            if platform_id == 1:  # macOS
+                versions.append(minimum)
+        elif command == 0x24 and length >= 16:  # LC_VERSION_MIN_MACOSX
+            versions.append(struct.unpack_from("<I", commands, offset + 8)[0])
+        offset += length
     if not versions:
-        raise RuntimeValidationError(f"LC_BUILD_VERSION minos is missing from {path}")
-    return max(versions, key=version_tuple)
+        raise RuntimeValidationError(f"macOS minimum version is missing from {path}")
+    value = max(versions)
+    return f"{value >> 16}.{(value >> 8) & 255}" + (f".{value & 255}" if value & 255 else "")
 
 
-def inspect_mlx_binaries(root: Path) -> dict[str, Any]:
-    backend = root / "current"
+def inspect_mlx_binaries(root: Path, backend_path: str = "current") -> dict[str, Any]:
+    backend = root / backend_path
     site_packages = backend / ".venv" / "lib" / "python3.12" / "site-packages"
     candidates = [
         *site_packages.glob("mlx/core*.so"),
@@ -239,14 +266,6 @@ def inspect_mlx_binaries(root: Path) -> dict[str, Any]:
 
     minimum_versions: dict[str, str] = {}
     for binary in sorted(binaries):
-        file_output = subprocess.run(
-            ["/usr/bin/file", str(binary)],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
-        if "Mach-O" not in file_output or "arm64" not in file_output:
-            raise RuntimeValidationError(f"{binary} is not an arm64 Mach-O binary")
         minimum_versions[str(binary.relative_to(root))] = macho_minimum_macos(binary)
     return {
         "minimum_macos": max(minimum_versions.values(), key=version_tuple),
@@ -258,20 +277,27 @@ def inspect_native_h3(root: Path, lock: dict[str, Any]) -> dict[str, Any]:
     expected = lock.get("native_h3")
     if not isinstance(expected, dict):
         raise RuntimeValidationError("the Runtime lock must pin native_h3")
-    relative = str(expected.get("binary", ""))
-    binary = root / relative
-    if not binary.is_file() or not os.access(binary, os.X_OK):
-        raise RuntimeValidationError(
-            f"native MiniMax H3 runtime is missing or not executable: {binary}"
-        )
-    file_output = subprocess.run(
-        ["/usr/bin/file", str(binary)],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    if "Mach-O" not in file_output or "arm64" not in file_output:
-        raise RuntimeValidationError(f"{binary} is not an arm64 Mach-O binary")
+    binary = root / expected["binary"]
+    backend = binary.parent.parent
+    required = [binary, *[backend / relative for relative in (
+        "lib/mlx/lib/libmlx.dylib", "lib/mlx/lib/libmlxc.dylib",
+        "lib/mlx/lib/libjaccl.dylib", "lib/mlx/lib/mlx.metallib",
+        "lib/llama/lib/libllama.dylib", "lib/libwebp.7.dylib",
+    )]]
+    if any(not path.is_file() for path in required) or not os.access(binary, os.X_OK):
+        raise RuntimeValidationError("native H3 binary/dylib/metallib bundle is incomplete")
+    env = {**os.environ, "DYLD_LIBRARY_PATH": os.pathsep.join([
+        str(backend / "lib"), str(backend / "lib/llama/lib"), str(backend / "lib/mlx/lib"),
+    ])}
+    probe = subprocess.run([str(binary), "--h3-capabilities"], check=True,
+                           capture_output=True, text=True, timeout=15, env=env)
+    try:
+        capabilities = json.loads(probe.stdout)
+    except ValueError as exc:
+        raise RuntimeValidationError("native H3 has no valid Turbo capability declaration") from exc
+    for key in ("turbo_protocol_version", "modules", "strength"):
+        if capabilities.get(key) != expected[key]:
+            raise RuntimeValidationError(f"native H3 capability {key} does not match the runtime lock")
     completed = subprocess.run(
         [str(binary), "--help"],
         check=False,
@@ -295,13 +321,20 @@ def inspect_native_h3(root: Path, lock: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeValidationError(
             f"native MiniMax H3 runtime does not advertise distributed protocol {protocol}"
         )
+    minimum_versions = {}
+    for path in required:
+        if path.suffix == ".metallib":
+            continue
+        minimum_versions[str(path.relative_to(root))] = macho_minimum_macos(path)
+    minimum = max(minimum_versions.values(), key=version_tuple)
+    if version_tuple(minimum) > version_tuple(lock["minimum_macos"]):
+        raise RuntimeValidationError(f"native H3 requires macOS {minimum}, above the runtime lock")
     return {
-        "runtime_id": str(expected["runtime_id"]),
-        "binary": relative,
-        "distributed_protocol": protocol,
-        "size_bytes": binary.stat().st_size,
-        "sha256": sha256_file(binary),
-        "minimum_macos": macho_minimum_macos(binary),
+        **expected, "minimum_macos": minimum,
+        "sha256": sha256_file(binary), "size_bytes": binary.stat().st_size,
+        "artifacts": {str(path.relative_to(root)): {
+            "size_bytes": path.stat().st_size, "sha256": sha256_file(path),
+        } for path in required},
     }
 
 
@@ -375,6 +408,19 @@ def build_runtime_manifest(root: Path, lock: dict[str, Any]) -> dict[str, Any]:
             f"{mlx_binaries['minimum_macos']}, above lock {lock['minimum_macos']}"
         )
 
+    vlm_observed = None
+    if vlm := lock.get("vlm_backend"):
+        relative = f"backends/{vlm['backend_name']}"
+        vlm_observed = inspect_python(root, vlm, relative)
+        if (vlm_observed["packages"] != vlm["packages"]
+                or vlm_observed["architecture"] != lock["architecture"]
+                or vlm_observed["python_version"] != lock["python_version"]):
+            raise RuntimeValidationError(f"MLX-VLM backend mismatch: {vlm_observed}")
+        vlm_binaries = inspect_mlx_binaries(root, relative)
+        if version_tuple(vlm_binaries["minimum_macos"]) > version_tuple(str(lock["minimum_macos"])):
+            raise RuntimeValidationError("MLX-VLM binaries exceed the locked minimum macOS")
+        vlm_observed["backend_name"] = vlm["backend_name"]
+
     native_h3 = inspect_native_h3(root, lock)
     if version_tuple(native_h3["minimum_macos"]) > version_tuple(
         str(lock["minimum_macos"])
@@ -396,6 +442,7 @@ def build_runtime_manifest(root: Path, lock: dict[str, Any]) -> dict[str, Any]:
         "backend_name": lock["backend_name"],
         "packages": observed["packages"],
         "native_h3": native_h3,
+        **({"vlm_backend": vlm_observed} if vlm_observed is not None else {}),
         "payload": tree_identity(root),
     }
 

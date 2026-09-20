@@ -38,6 +38,45 @@ final class VideoGenerationContractTests: XCTestCase {
         XCTAssertEqual(history.interruptedCount, 2)
     }
 
+    func testTurboDefaultsSerializationAndModeRoundTripsPreserveExplicitChoices() throws {
+        var request = H3VideoGenerationRequest.default
+        let normal = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any])
+        XCTAssertEqual(normal["steps"] as? Int, 28)
+        XCTAssertEqual(normal["fast"] as? Bool, false)
+        XCTAssertEqual(normal["turbo"] as? Bool, false)
+        request.steps = 32
+        request.fast = true
+        request.setTurbo(true)
+        XCTAssertEqual(request.steps, 6)
+        XCTAssertFalse(request.fast)
+        for steps in [4, 6, 8, 7] {
+            request.steps = steps
+            request = request.validated()
+            request.setTurbo(true)
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any])
+            XCTAssertEqual(body["steps"] as? Int, steps)
+            XCTAssertEqual(body["turbo"] as? Bool, true)
+            XCTAssertEqual(body["fast"] as? Bool, false)
+            XCTAssertNil(body["ordinarySteps"])
+            request.setTurbo(false)
+            XCTAssertEqual(request.steps, 32)
+            XCTAssertTrue(request.fast)
+            request.setTurbo(true)
+            XCTAssertEqual(request.steps, steps)
+        }
+        request.fast = true
+        XCTAssertFalse(request.validated().fast)
+        XCTAssertEqual(request.validated().steps, 7)
+    }
+
+    func testTurboServerProgressAndSSEErrorAreNotIgnored() throws {
+        XCTAssertEqual(try H3VideoSSEParser.parse(line: #"data: {"type":"progress","stage":"Generating","step":2,"total":6}"#),
+                       .progress(stage: "Generating", step: 2, total: 6))
+        XCTAssertThrowsError(try H3VideoSSEParser.parse(line: #"data: {"type":"error","message":"Turbo LoRA incomplete: expected all 259 target modules"}"#)) { error in
+            XCTAssertEqual(error.localizedDescription, "Turbo LoRA incomplete: expected all 259 target modules")
+        }
+    }
+
     func testVideoWorkspaceIsAFirstClassClusterSection() {
         XCTAssertTrue(AppSection.allCases.contains(.video))
         XCTAssertEqual(AppSection.video.title, "Video")
@@ -160,6 +199,8 @@ final class VideoGenerationContractTests: XCTestCase {
         request.width = width
         request.height = height
         request.numFrames = frames
+        request.setTurbo(true)
+        request.steps = 8
 
         let artifact = try await H3VideoArtifactWriter.write(
             payload: payload,
@@ -171,6 +212,12 @@ final class VideoGenerationContractTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: artifact.rawVideoURL.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: try XCTUnwrap(artifact.waveURL).path))
         XCTAssertTrue(artifact.hasMuxedAudio)
+        let metadata = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: artifact.directoryURL.appendingPathComponent("metadata.json"))) as? [String: Any])
+        XCTAssertEqual(metadata["turbo"] as? Bool, true)
+        XCTAssertEqual(metadata["steps"] as? Int, 8)
+        XCTAssertEqual(metadata["fast"] as? Bool, false)
+        XCTAssertEqual(metadata["turbo_strength"] as? Double, 1.0)
+        XCTAssertGreaterThan(metadata["save_seconds"] as? Double ?? 0, 0)
         let asset = AVURLAsset(url: artifact.movieURL)
         let videoTracks = try await asset.loadTracks(withMediaType: .video)
         let audioTracks = try await asset.loadTracks(withMediaType: .audio)
@@ -697,6 +744,82 @@ final class VideoGenerationContractTests: XCTestCase {
         XCTAssertFalse(message.contains("Internal Server Error"))
         XCTAssertNil(store.videoRuntimeInstanceID)
         XCTAssertFalse(store.canStopVideoRuntime)
+    }
+
+    @MainActor
+    func testTurboStoreBlocksUnknownRuntimeAndTP2ButKeepsNormalAvailable() async throws {
+        let store = turboTestStore(ready: nil) { _ in
+            AsyncThrowingStream { $0.finish() }
+        }
+        store.h3WorkerAgentURL = ""
+        await store.startVideoRuntime()
+        XCTAssertTrue(store.isVideoRuntimeReady)
+        store.setVideoTurbo(true)
+        await store.generateVideo()
+        XCTAssertTrue(store.videoGenerationError?.contains("verify Turbo") == true)
+        XCTAssertFalse(store.isVideoGenerating)
+        store.setVideoTurbo(false)
+        XCTAssertEqual(store.videoRequest.steps, 28)
+        XCTAssertTrue(store.videoTurboReadinessIssues.isEmpty)
+        store.h3WorkerAgentURL = "http://198.51.100.75:9200"
+        await store.refreshVideoNodes()
+        store.setVideoTurbo(true)
+        XCTAssertTrue(store.videoTurboReadinessIssues.joined().contains("Single Mac"))
+    }
+
+    @MainActor
+    func testTurboStoreFailureCancellationAndRepeatedClicksReleaseUIState() async throws {
+        var calls = 0
+        var pending: AsyncThrowingStream<ChatStreamEvent, Error>.Continuation?
+        let store = turboTestStore(ready: true) { request in
+            calls += 1
+            let body = try! JSONSerialization.jsonObject(with: request.httpBody!) as! [String: Any]
+            XCTAssertEqual(body["turbo"] as? Bool, true)
+            XCTAssertEqual(body["steps"] as? Int, 4)
+            XCTAssertEqual(body["fast"] as? Bool, false)
+            return AsyncThrowingStream { continuation in
+                if calls == 1 {
+                    continuation.yield(.line(#"data: {"type":"error","message":"Turbo LoRA corrupt or incompatible"}"#))
+                    continuation.finish()
+                } else {
+                    pending = continuation
+                }
+            }
+        }
+        store.h3WorkerAgentURL = ""
+        await store.startVideoRuntime()
+        store.setVideoTurbo(true)
+        store.videoRequest.steps = 4
+        await store.generateVideo()
+        XCTAssertEqual(store.videoGenerationError, "Turbo LoRA corrupt or incompatible")
+        XCTAssertFalse(store.isVideoGenerating)
+        store.beginVideoGeneration()
+        store.beginVideoGeneration()
+        for _ in 0..<100 where calls < 2 { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(calls, 2)
+        XCTAssertTrue(store.isVideoGenerating)
+        store.cancelVideoGeneration()
+        pending?.finish(throwing: CancellationError())
+        for _ in 0..<100 where store.isVideoGenerating { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertFalse(store.isVideoGenerating)
+        XCTAssertEqual(store.videoProgressStage, "Cancelled")
+        XCTAssertNil(store.videoGenerationError)
+        await store.stopVideoRuntime()
+    }
+
+    @MainActor
+    private func turboTestStore(ready: Bool?, stream: @escaping TokenityStore.LineStreamTransport) -> TokenityStore {
+        TokenityStore(dataTransport: { request in
+            let payload: String
+            if request.url?.path == "/v1/node/info" {
+                payload = Self.h3NodeInfoPayload(for: request)
+            } else if request.url?.path == "/v1/node/start-minimax-h3-video" {
+                payload = ready == nil ? #"{"instance_id":"h3-test-single"}"# : #"{"instance_id":"h3-test-single","turbo":{"ready":true,"issues":[]}}"#
+            } else {
+                payload = #"{}"#
+            }
+            return (Data(payload.utf8), HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: [:])!)
+        }, lineStreamTransport: stream)
     }
 
     private static func h3NodeInfoPayload(for request: URLRequest) -> String {

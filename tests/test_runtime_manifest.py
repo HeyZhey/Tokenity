@@ -93,3 +93,64 @@ def test_artifact_catalog_rejects_unlocked_filename(tmp_path: Path) -> None:
         pass
     else:
         raise AssertionError("Expected an unlocked artifact filename to fail")
+
+
+def test_native_bundle_must_include_libraries_and_locked_turbo_contract(tmp_path, monkeypatch):
+    import subprocess
+    import pytest
+    binary = tmp_path / "current/bin/mlx-serve"
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"binary")
+    binary.chmod(0o755)
+    lock = {"minimum_macos": "26.2", "native_h3": {"binary": "current/bin/mlx-serve", "distributed_protocol": 1, "turbo_protocol_version": 1, "modules": 259, "strength": 1.0}}
+    with pytest.raises(runtime_manifest.RuntimeValidationError, match="incomplete"):
+        runtime_manifest.inspect_native_h3(tmp_path, lock)
+    for relative in ("lib/mlx/lib/libmlx.dylib", "lib/mlx/lib/libmlxc.dylib", "lib/mlx/lib/libjaccl.dylib", "lib/mlx/lib/mlx.metallib", "lib/llama/lib/libllama.dylib", "lib/libwebp.7.dylib"):
+        path = tmp_path / "current" / relative; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b"library")
+    declared = dict(turbo_protocol_version=1, modules=259, strength=1.0)
+    def probe(command, **kwargs):
+        output = ("--h3-distributed-rank --h3-distributed-world-size --h3-distributed-protocol 1"
+                  if command[-1] == "--help" else json.dumps(declared))
+        return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+    monkeypatch.setattr(subprocess, "run", probe)
+    monkeypatch.setattr(subprocess, "check_output", lambda *args, **kwargs: "Mach-O arm64")
+    monkeypatch.setattr(runtime_manifest, "macho_minimum_macos", lambda path: "26.2")
+    observed = runtime_manifest.inspect_native_h3(tmp_path, lock)
+    assert len(observed["artifacts"]) == 7
+    declared["modules"] = 258
+    with pytest.raises(runtime_manifest.RuntimeValidationError, match="modules"):
+        runtime_manifest.inspect_native_h3(tmp_path, lock)
+
+
+def test_macos_minimum_is_read_without_developer_tools(tmp_path):
+    import struct
+    import pytest
+    binary = tmp_path / "runtime"
+    def macho(cpu=0x0100000C, version=0x1A0200, command=0x32):
+        load = (struct.pack("<6I", command, 24, 1, version, version, 0)
+                if command == 0x32 else struct.pack("<4I", command, 16, version, version))
+        return struct.pack("<8I", 0xFEEDFACF, cpu, 0, 2, 1, len(load), 0, 0) + load
+    binary.write_bytes(macho())
+    assert runtime_manifest.macho_minimum_macos(binary) == "26.2"
+    binary.write_bytes(macho(version=0x0E0001, command=0x24))
+    assert runtime_manifest.macho_minimum_macos(binary) == "14.0.1"
+    binary.write_bytes(macho(cpu=0x01000007))
+    with pytest.raises(runtime_manifest.RuntimeValidationError, match="arm64"):
+        runtime_manifest.macho_minimum_macos(binary)
+    binary.write_bytes(macho()[:-4])
+    with pytest.raises(runtime_manifest.RuntimeValidationError, match="length"):
+        runtime_manifest.macho_minimum_macos(binary)
+
+
+def test_python_entrypoints_are_relocated_from_any_previous_install(tmp_path, monkeypatch):
+    monkeypatch.setattr(runtime_manifest, "EXPECTED_INSTALL_ROOT", Path("/Library/Tokenity/Runtime"))
+    script = tmp_path / "mlx_lm.generate"
+    script.write_bytes(b"#!/old/runtime/current/.venv/bin/python\nprint('ok')\n")
+    shell = tmp_path / "shell"
+    shell.write_bytes(b"#!/bin/sh\necho ok\n")
+    runtime_manifest.normalize_entrypoint_shebangs(tmp_path)
+    expected = b"#!/Library/Tokenity/Runtime/current/.venv/bin/python\nprint('ok')\n"
+    assert script.read_bytes() == expected
+    runtime_manifest.normalize_entrypoint_shebangs(tmp_path)
+    assert script.read_bytes() == expected
+    assert shell.read_bytes() == b"#!/bin/sh\necho ok\n"

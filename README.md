@@ -316,9 +316,13 @@ Build the full installer after importing the validated runtime:
 ./scripts/package-tokenity-dmg.sh
 ```
 
-Model weights are excluded by default. The current build is ad-hoc signed and
-the pkg is unsigned; public distribution still requires Developer ID signing,
-notarization, and stapling. See
+Version **0.1.2 (build 4)** includes DeepSeek V4, GLM 5.3 / Qwen4 via MLX-VLM,
+and MiniMax H3 Turbo (4/6/8 steps). See [release notes](docs/release-0.1.2.md).
+
+Model weights are excluded by default. The full PKG includes Python and both
+MLX backends; it requires Apple silicon and macOS 26.2+. This release is
+unsigned and not notarized. If macOS blocks a download, approve that installer
+in **System Settings → Privacy & Security → Open Anyway**. See
 [Installer and runtime distribution](docs/installer-dmg.md).
 
 ## Verification baseline

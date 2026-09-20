@@ -42,12 +42,21 @@ The installed Runtime uses MLX 0.32.0 and MLX-LM 0.31.3. Validation covered:
   `DeepSeek-V4-Flash-4bit` checkpoints, including the hybrid MXFP4 expert
   metadata, tokenizer, 43-layer configuration, and all 33 weight shards.
 
+When a DeepSeek V4 export omits its chat template, Tokenity supplies the verified
+V4 text-message delimiters in memory after checking the tokenizer vocabulary.
+Existing templates and other architectures are preserved. The fallback supports
+system/user/assistant text messages and thinking mode; tool calling requires a
+checkpoint-provided template. This avoids treating chat requests as plain-text
+continuations. Both the single-host runtime and server provider apply the fix.
+
 The local checkpoint contains about 151.5 GB of weight data. Lazy loading
 validates model resolution, configuration, tokenizer, shard indexes, weight
 names, sanitization, and quantization setup without materializing the complete
-checkpoint in Metal memory. A full-checkpoint hardware generation run should be
-performed on a host with sufficient free unified memory before treating that
-specific conversion as a production baseline.
+checkpoint in Metal memory. In the 0.1.2 merged runtime, the full `DeepSeek-V4-Flash-4bit` checkpoint also
+completed a short greedy generation on M3 Ultra (512 GiB), returning the expected
+`OK` response with approximately 151.34 GB peak MLX memory. The mixed 8-bit checkpoint also returned
+`OK` with the missing-template fix, using approximately 154.80 GB peak MLX memory. This is a functional
+smoke test, not a throughput benchmark or validation of every checkpoint.
 
 ## Provenance
 

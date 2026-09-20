@@ -608,6 +608,7 @@ struct ModelEntry: Codable, Hashable, Identifiable {
     var shardCount: Int? = nil
     var nativeMTP: NativeMTPCapability? = nil
     var modelType: String? = nil
+    var inferenceBackend: String? = nil
     var standaloneLoadable: Bool? = nil
     var loadBlockReason: String? = nil
     var distributedLoadable: Bool? = nil
@@ -621,6 +622,7 @@ struct ModelEntry: Codable, Hashable, Identifiable {
         case shardCount = "shard_count"
         case nativeMTP = "native_mtp"
         case modelType = "model_type"
+        case inferenceBackend = "inference_backend"
         case standaloneLoadable = "standalone_loadable"
         case loadBlockReason = "load_block_reason"
         case distributedLoadable = "distributed_loadable"
@@ -920,7 +922,7 @@ struct TokenityNode: Identifiable, Hashable {
                 pythonPath: TokenityDeploymentConfiguration.runtimePythonPath,
                 mlxVersion: "-",
                 mlxLMVersion: "-",
-                tokenityVersion: "0.1.0",
+                tokenityVersion: "0.1.2",
                 rdma: .empty,
                 roles: [],
                 memory: .unknown,
@@ -937,7 +939,7 @@ struct TokenityNode: Identifiable, Hashable {
                 pythonPath: TokenityDeploymentConfiguration.runtimePythonPath,
                 mlxVersion: "-",
                 mlxLMVersion: "-",
-                tokenityVersion: "0.1.0",
+                tokenityVersion: "0.1.2",
                 rdma: .empty,
                 roles: [],
                 memory: .unknown,
@@ -954,7 +956,7 @@ struct TokenityNode: Identifiable, Hashable {
                 pythonPath: TokenityDeploymentConfiguration.runtimePythonPath,
                 mlxVersion: "-",
                 mlxLMVersion: "-",
-                tokenityVersion: "0.1.0",
+                tokenityVersion: "0.1.2",
                 rdma: .empty,
                 roles: [],
                 memory: .unknown,
@@ -999,6 +1001,7 @@ struct ModelLibraryRow: Identifiable, Hashable {
     var shardCount: Int?
     var nativeMTP: NativeMTPCapability?
     var modelType: String?
+    var inferenceBackend: String? = nil
     var revision: String? = nil
     var standaloneLoadable: Bool
     var loadBlockReason: String?

@@ -289,8 +289,13 @@ python -m pip install -e ".[dev]"
 ./scripts/package-tokenity-dmg.sh
 ```
 
-模型权重默认不包含在安装包中。当前 App 使用 ad-hoc 签名，pkg 尚未签名；公开
-分发仍需要 Developer ID 签名、公证和 stapling。详见
+**0.1.2（build 4）** 包含 DeepSeek V4、通过 MLX-VLM 接入的 GLM 5.3 / Qwen4，
+以及 MiniMax H3 Turbo（4/6/8 步）。详见[版本说明](docs/release-0.1.2.md)。
+
+完整 PKG 内置 Python 和两个 MLX 后端，需 Apple silicon 与 macOS 26.2+，
+模型权重单独放置。此版本无需 Developer ID 签名或公证即可由管理员安装；
+如 macOS 拦截下载的安装包，请到“系统设置 → 隐私与安全性 → 仍要打开”允许。
+首次启动 App 时也可能需要允许。无需另行安装开发工具。详见
 [安装与 Runtime 分发](docs/installer-dmg.md)。
 
 ## 验证基线

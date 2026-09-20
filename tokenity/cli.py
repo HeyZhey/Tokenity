@@ -53,7 +53,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--execution-mode",
         choices=("single", "distributed"),
         default="distributed",
-        help="Use a local mlx_lm.load path or an MLX distributed data plane.",
+        help="Use the model's local MLX-LM/MLX-VLM backend or an MLX distributed data plane.",
     )
     distributed_serve.add_argument("--warmup-timeout", type=float, default=120.0)
     distributed_serve.add_argument(

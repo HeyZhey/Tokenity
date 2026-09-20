@@ -164,12 +164,47 @@ struct VideoGenerationPage: View {
                 }
             }
 
+            InfoRow(label: "Mode") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Picker("Generation mode", selection: Binding(
+                        get: { store.videoRequest.turbo },
+                        set: { store.setVideoTurbo($0) }
+                    )) {
+                        Text("Normal").tag(false)
+                        Text("Turbo LoRA").tag(true)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 330)
+                    if store.videoRequest.turbo {
+                        HStack(spacing: 8) {
+                            ForEach(H3TurboPreset.allCases) { preset in
+                                Button(preset.title) { store.videoRequest.steps = preset.rawValue }
+                                    .tint(store.videoRequest.steps == preset.rawValue ? theme.controlAccent : nil)
+                            }
+                        }
+                        Text("Single Mac · strength 1.0 · Fewer sampling steps for faster generation. Quality varies by scene; 8 steps may not improve every result.")
+                            .font(.tokenityText(11))
+                            .foregroundStyle(theme.secondaryText)
+                    }
+                }
+                .disabled(store.isVideoGenerating)
+            }
+
+            if !store.videoTurboReadinessIssues.isEmpty {
+                InfoRow(label: "Turbo readiness") {
+                    Text(store.videoTurboReadinessIssues.joined(separator: " "))
+                        .foregroundStyle(theme.warning)
+                        .textSelection(.enabled)
+                }
+            }
+
             InfoRow(label: "Sampling") {
                 HStack(spacing: 18) {
                     numericField("Frames", value: $store.videoRequest.numFrames, range: 5...345, step: 17)
                     numericField("Steps", value: $store.videoRequest.steps, range: 1...50, step: 1)
                     numericField("Seed", value: $store.videoRequest.seed, range: 0...Int.max, step: 1)
                     Toggle("Fast", isOn: $store.videoRequest.fast)
+                        .disabled(store.videoRequest.turbo || store.isVideoGenerating)
                         .toggleStyle(.switch)
                         .help("Fast uses the H3 step-cache and attention broadcast recipe. Turn it off for final-quality renders.")
                     Spacer(minLength: 0)
@@ -214,7 +249,7 @@ struct VideoGenerationPage: View {
                         }
                         .buttonStyle(.borderedProminent)
                         .tint(theme.controlAccent)
-                        .disabled(!store.isVideoRuntimeReady || store.videoRequest.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .disabled(!store.isVideoRuntimeReady || !store.videoTurboReadinessIssues.isEmpty || store.videoRequest.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
                     Text("Frames are snapped upward to MiniMax H3's 17k+5 ladder.")
                         .font(.tokenityText(11))

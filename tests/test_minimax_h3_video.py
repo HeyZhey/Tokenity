@@ -394,3 +394,49 @@ def test_exec_adapter_replaces_process_without_a_shell(tmp_path: Path):
     assert argv[1:3] == ["--model", str(model)]
     assert "--serve" in argv
     assert env["MLX_METAL_FAST_SYNCH"] == "1"
+
+
+def test_turbo_probe_requires_native_declaration_not_help_or_version(tmp_path):
+    binary = _binary(tmp_path)
+    def runner(argv, **kwargs):
+        text = "--h3-capabilities v26.8.2" if argv[-1] == "--help" else json.dumps({"turbo_protocol_version": 1, "modules": 259, "strength": 1.0})
+        return subprocess.CompletedProcess(argv, 0, stdout=text, stderr="")
+    assert probe_h3_backend(binary, runner=runner).supports_turbo_h3
+    for declaration in ({}, {"turbo_protocol_version": 1, "modules": 258, "strength": 1.0}, {"turbo_protocol_version": 2, "modules": 259, "strength": 1.0}):
+        def invalid(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 0, stdout="--h3-capabilities" if argv[-1] == "--help" else json.dumps(declaration), stderr="")
+        assert not probe_h3_backend(binary, runner=invalid).supports_turbo_h3
+
+
+def test_turbo_runtime_checks_actual_process_topology_and_environment():
+    from tokenity.serving.minimax_h3_video import h3_turbo_runtime_issues
+    ready = dict(turbo_protocol_version=1, modules=259, strength=1.0, pid=123, world_size=1, step_cache="0", attn_bcast="0")
+    assert h3_turbo_runtime_issues(ready, pid=123) == []
+    for key, value, reason in [("pid", 456, "process"), ("world_size", 2, "Single Mac"),
+                               ("step_cache", "0.05", "MINIMAX_H3_STEP_CACHE"), ("attn_bcast", "2", "MINIMAX_H3_ATTN_BCAST"),
+                               ("step_cache", "nan", "MINIMAX_H3_STEP_CACHE"), ("attn_bcast", "unknown", "MINIMAX_H3_ATTN_BCAST"),
+                               ("modules", 258, "unknown Turbo")]:
+        assert any(reason in issue for issue in h3_turbo_runtime_issues(ready | {key: value}, pid=123))
+
+
+def test_turbo_adapter_hash_is_checked_once_and_invalidated_on_change(tmp_path, monkeypatch):
+    import tokenity.serving.minimax_h3_video as h3
+    path = tmp_path / "turbo_lora.safetensors"
+    assert "missing" in str(h3.h3_turbo_lora_readiness(tmp_path)["issues"])
+    path.write_bytes(b"valid-test-adapter")
+    monkeypatch.setattr(h3, "H3_TURBO_LORA_BYTES", path.stat().st_size)
+    monkeypatch.setattr(h3, "H3_TURBO_LORA_SHA256", hashlib.sha256(path.read_bytes()).hexdigest())
+    calls = []
+    original = h3._sha256_file
+    def hashed(path):
+        calls.append(path)
+        return original(path)
+    monkeypatch.setattr(h3, "_sha256_file", hashed)
+    assert h3.h3_turbo_lora_readiness(tmp_path)["issues"] == []
+    assert h3.h3_turbo_lora_readiness(tmp_path)["issues"] == []
+    assert len(calls) == 1
+    path.write_bytes(b"wrong-test-adapter")
+    assert "SHA-256 mismatch" in str(h3.h3_turbo_lora_readiness(tmp_path)["issues"])
+    assert len(calls) == 2
+    path.write_bytes(b"incomplete")
+    assert "incomplete" in str(h3.h3_turbo_lora_readiness(tmp_path)["issues"])

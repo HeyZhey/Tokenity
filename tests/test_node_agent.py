@@ -1426,6 +1426,38 @@ def test_h3_two_mac_dry_run_preflights_the_remote_rank_without_launching(
     assert supervisor.starts == []
 
 
+
+@pytest.mark.parametrize("world_size", [1, 2])
+def test_h3_binary_symlink_is_pinned_only_for_single_mac(tmp_path, world_size):
+    model, binary = _create_h3_fixture(tmp_path)
+    alias = tmp_path / "runtime-current"
+    alias.symlink_to(binary)
+    _add_h3_tp2_fixture(model)
+    client = TestClient(create_app(
+        rdma_probe_fn=fake_rdma_probe,
+        h3_runtime_preflight_fn=lambda **kwargs: ([], _h3_distributed_capabilities(alias)),
+        get_json_fn=lambda url, timeout: {"agent_contract": {"capabilities": [
+            "cluster_runtime", "instance_quorum", "instance_runtimes", "managed_instances",
+            "minimax_h3_video", "memory_admission",
+        ]}},
+        post_json_fn=lambda url, payload, timeout: {"dry_run": True, "preflight": {"status": "ready"}},
+    ))
+    response = client.post("/v1/node/start-minimax-h3-video", json={
+        "model": str(model), "binary": str(alias), "dry_run": True,
+        "connection_mode": "jaccl-ring",
+        "nodes": [{"id": f"mac-{rank}", "agent_url": f"http://198.51.100.{rank + 1}:9100",
+                   "lan_ip": f"198.51.100.{rank + 1}", "rdma_ip": f"203.0.113.{rank + 1}",
+                   "rdma_devices": [f"rdma_en{rank + 4}"]} for rank in range(world_size)],
+    })
+    assert response.status_code == 200, response.text
+    ranks = response.json()["launch_plan"]["ranks"]
+    assert len(ranks) == world_size
+    for rank in ranks:
+        command = rank["command"]
+        expected = binary.resolve() if world_size == 1 else alias
+        assert command[command.index("--binary") + 1] == str(expected)
+
+
 def test_h3_two_mac_start_fails_closed_without_native_tp_protocol(tmp_path: Path):
     model, binary = _create_h3_fixture(tmp_path)
     client = TestClient(
@@ -1584,6 +1616,14 @@ def test_h3_two_mac_start_launches_worker_then_reports_tp2_ready(
     assert worker_requests[0][0].endswith("/v1/node/start-minimax-h3-video-rank")
     assert worker_requests[0][1]["rank"] == 1
     assert worker_requests[0][1]["coordinator"] is False
+
+    turbo = client.post("/v1/video/generations", json={
+        "model": "h3-tp2-live-instance", "prompt": "test", "turbo": True,
+        "steps": 6, "fast": False, "stream": True,
+    })
+    assert turbo.status_code == 412
+    assert "Single Mac" in turbo.text
+    assert client.get("/v1/node/instances/h3-tp2-live-instance/h3-turbo").json()["ready"] is False
 
     stopped = client.post(
         "/v1/node/instances/h3-tp2-live-instance/stop",
@@ -4174,3 +4214,59 @@ def test_distributed_runtime_configuration_is_validated():
     )
 
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize("stream,upstream_error", [(False, False), (True, False), (False, True), (True, True)])
+def test_turbo_gateway_preserves_contract_and_releases_resources_on_native_errors(tmp_path, monkeypatch, stream, upstream_error):
+    model, binary = _create_h3_fixture(tmp_path)
+    monkeypatch.setattr(agent_module, "_tcp_port_available", lambda port: True)
+    monkeypatch.setattr(agent_module, "h3_turbo_lora_readiness", lambda model: {"issues": [], "sha256": "test"})
+    opened = []
+    def gateway(url, body, headers, timeout):
+        opened.append(json.loads(body))
+        payload = b'data: {"type":"error","message":"Turbo LoRA incomplete: expected all 259 target modules"}\n\n' if upstream_error and stream else b'{"error":{"message":"Turbo LoRA corrupt or incompatible"}}' if upstream_error else b'data: {"type":"complete"}\n\n' if stream else b'{"ok":true}'
+        return _FakeGatewayConnection(), _FakeGatewayResponse(payload, content_type="text/event-stream" if stream else "application/json", status=500 if upstream_error and not stream else 200)
+    caps = dict(turbo_protocol_version=1, modules=259, strength=1.0, world_size=1, pid=123, step_cache="0", attn_bcast="0")
+    client = TestClient(create_app(rdma_probe_fn=fake_rdma_probe, supervisor=_FakeSupervisor(),
+        h3_runtime_preflight_fn=lambda **kwargs: ([], H3BackendCapabilities(str(binary), True, True, None, turbo_protocol_version=1)),
+        h3_ready_fn=lambda *args: True, get_json_fn=lambda *args: caps, gateway_open_fn=gateway))
+    started = client.post("/v1/node/start-minimax-h3-video", json=dict(model=str(model), binary=str(binary), dry_run=False,
+        instance_id="h3-turbo-test", operation_id="h3-turbo-operation", port=24200, memory_reservation_bytes=1))
+    assert started.status_code == 200, started.text
+    assert started.json()["turbo"]["ready"] is True
+    for steps in (4, 6, 8):
+        response = client.post("/v1/video/generations", json=dict(model="h3-turbo-test", prompt="test", turbo=True, steps=steps, fast=False, stream=stream))
+        assert response.status_code == (500 if upstream_error and not stream else 200), response.text
+        if upstream_error: assert "Turbo LoRA" in response.text
+        assert opened[-1] == dict(prompt="test", turbo=True, steps=steps, fast=False, stream=stream)
+        state = client.get("/v1/node/instances/h3-turbo-test").json()["instance"]
+        assert state["active_request_count"] == 0
+        assert client.get("/v1/gateway/routes").json()["data"] == []
+    caps["attn_bcast"] = "2"
+    response = client.post("/v1/video/generations", json=dict(model="h3-turbo-test", prompt="test", turbo=True, steps=6, fast=False))
+    assert response.status_code == 412
+    assert "MINIMAX_H3_ATTN_BCAST" in response.text
+    assert len(opened) == 3
+    assert client.get("/v1/node/instances/h3-turbo-test").json()["instance"]["active_request_count"] == 0
+    response = client.post("/v1/video/generations", json=dict(model="h3-turbo-test", prompt="test", turbo=False, steps=28, fast=False, stream=stream))
+    assert response.status_code == (500 if upstream_error and not stream else 200)
+    assert opened[-1]["turbo"] is False
+
+
+def test_old_h3_runtime_rejects_turbo_before_acquiring_resources(tmp_path, monkeypatch):
+    model, binary = _create_h3_fixture(tmp_path)
+    monkeypatch.setattr(agent_module, "_tcp_port_available", lambda port: True)
+    client = TestClient(create_app(rdma_probe_fn=fake_rdma_probe, supervisor=_FakeSupervisor(),
+        h3_runtime_preflight_fn=lambda **kwargs: ([], _h3_single_capabilities(binary)), h3_ready_fn=lambda *args: True,
+        gateway_open_fn=lambda *args: (_ for _ in ()).throw(AssertionError("Turbo must not reach an old runtime"))))
+    started = client.post("/v1/node/start-minimax-h3-video", json=dict(model=str(model), binary=str(binary), dry_run=False,
+        instance_id="h3-old-runtime", operation_id="h3-old-operation", port=24200, memory_reservation_bytes=1))
+    assert started.status_code == 200
+    assert started.json()["turbo"]["ready"] is False
+    response = client.post("/v1/video/generations", json=dict(model="h3-old-runtime", prompt="test", turbo=True, steps=6, fast=False))
+    assert response.status_code == 412
+    assert "unknown Turbo" in response.text
+    for invalid in ({"turbo": "true"}, {"turbo": True, "fast": True, "steps": 6}, {"turbo": True}):
+        response = client.post("/v1/video/generations", json={"model": "h3-old-runtime", "prompt": "test", **invalid})
+        assert response.status_code == 400
+    assert client.get("/v1/node/instances/h3-old-runtime").json()["instance"]["active_request_count"] == 0

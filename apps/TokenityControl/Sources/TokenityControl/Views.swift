@@ -1052,6 +1052,9 @@ private struct ModelLoadRow: View {
                     if let quantization = row.quantization {
                         StatusPill(text: quantization, tone: .accent)
                     }
+                    if let backend = row.inferenceBackend {
+                        StatusPill(text: backend.uppercased(), tone: .neutral)
+                    }
                     Text(row.sizeText)
                     if let architecture = row.architecture {
                         Text("· \(architecture)")

@@ -7,6 +7,7 @@ from typing import Any, Mapping
 
 DRAFT_ONLY_MODEL_TYPES = frozenset({"qwen3_5_mtp"})
 DISTRIBUTED_QUARANTINED_MODEL_TYPES = frozenset({"qwen3_moe"})
+MLX_VLM_MODEL_TYPES = frozenset({"glm5_next", "qwen4_exp"})
 QWEN35_MTP_LOAD_BLOCK_REASON = (
     "Qwen3.5 MTP weights are a speculative-decoding draft model and cannot be "
     "loaded as a standalone chat model. Load the matching Qwen3.5 base model instead."
@@ -26,6 +27,11 @@ def read_model_config(model: str | Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError, TypeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def model_backend(model: str | Path, *, config: Mapping[str, Any] | None = None) -> str:
+    payload = config if config is not None else read_model_config(model)
+    return "mlx-vlm" if payload.get("model_type") in MLX_VLM_MODEL_TYPES else "mlx-lm"
 
 
 def standalone_model_issue(
@@ -56,6 +62,12 @@ def distributed_model_issue(
     model_type = str(payload.get("model_type", "")).strip().lower()
     if model_type in DISTRIBUTED_QUARANTINED_MODEL_TYPES:
         return QWEN3_MOE_DISTRIBUTED_LOAD_BLOCK_REASON
+    if model_type in MLX_VLM_MODEL_TYPES:
+        return (
+            "This model uses Tokenity's MLX-VLM backend, which currently supports "
+            "one Mac. Choose Load on one Mac; distributed sharding is not enabled "
+            "for this architecture."
+        )
     return None
 
 
@@ -65,6 +77,7 @@ def model_usage_metadata(config: Mapping[str, Any]) -> dict[str, object]:
     distributed_issue = distributed_model_issue("", config=config)
     return {
         "model_type": model_type,
+        "inference_backend": model_backend("", config=config),
         "standalone_loadable": issue is None,
         "load_block_reason": issue,
         "distributed_loadable": distributed_issue is None,

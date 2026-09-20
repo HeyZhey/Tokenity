@@ -28,7 +28,7 @@ if [[ "$INSTALL_ROOT" != /* || "$INSTALL_ROOT" =~ [[:space:]\<\>\&] ||
   echo "TOKENITY_INSTALL_ROOT must be an absolute path without whitespace or XML metacharacters." >&2
   exit 1
 fi
-VERSION="${TOKENITY_VERSION:-0.1.0}"
+VERSION="${TOKENITY_VERSION:-0.1.2}"
 DIST_DIR="$ROOT/dist"
 WORK_DIR="$DIST_DIR/package-work"
 PAYLOAD_DIR="$WORK_DIR/payload"
@@ -655,7 +655,7 @@ if [[ -n "$TB_INTERFACE" ]]; then
   configure_thunderbolt_keepalive "$TB_INTERFACE" "$TB_LOCAL_IP" "$TB_PEER_IP"
 fi
 
-/usr/bin/python3 "$CODE_ROOT/scripts/tokenity-runtime-manifest.py" verify \
+"$RUNTIME_STAGE_ROOT/current/.venv/bin/python" "$CODE_ROOT/scripts/tokenity-runtime-manifest.py" verify \
   "$RUNTIME_STAGE_ROOT" \
   --lock "$CODE_ROOT/packaging/runtime/runtime-lock.json" \
   --manifest "$RUNTIME_STAGE_ROOT/runtime-manifest.json"
@@ -700,6 +700,17 @@ if observed != required:
 mx.eval(mx.array([1], dtype=mx.int32))
 print(f"Validated installed Tokenity Runtime: {observed}")
 PY
+  VLM_BACKEND="$("$PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["vlm_backend"]["backend_name"])' "$CODE_ROOT/packaging/runtime/runtime-lock.json")"
+  PYTHONPATH="$CODE_ROOT" PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 \
+  "$RUNTIME_ROOT/backends/$VLM_BACKEND/.venv/bin/python" - <<'PYVLM'
+from tokenity.mlx.vlm_runtime import validate_packages
+validate_packages()
+import mlx.core as mx
+from mlx_vlm.models.glm5_next import Model as GLM
+from mlx_vlm.models.qwen4_exp import Model as Qwen
+mx.eval(mx.array([1], dtype=mx.int32))
+print("Validated isolated MLX-VLM runtime.")
+PYVLM
   h3_help="$("$H3_BINARY" --help 2>&1)" || {
     echo "The installed MiniMax H3 runtime could not be started." >&2
     exit 1
@@ -817,8 +828,22 @@ fi
 SCRIPT
 /bin/chmod 755 "$APP_SCRIPTS_DIR/preinstall"
 
+# Always install in /Applications, even if Spotlight finds a development copy
+# or the user has moved an older app to another directory.
+APP_COMPONENT_PLIST="$WORK_DIR/AppComponent.plist"
+cat > "$APP_COMPONENT_PLIST" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><array><dict>
+  <key>RootRelativeBundlePath</key><string>Tokenity.app</string>
+  <key>BundleIsRelocatable</key><false/>
+  <key>BundleHasStrictIdentifier</key><true/>
+  <key>BundleOverwriteAction</key><string>upgrade</string>
+</dict></array></plist>
+PLIST
 pkgbuild \
-  --component "$APP_BUNDLE" \
+  --root "$(dirname "$APP_BUNDLE")" \
+  --component-plist "$APP_COMPONENT_PLIST" \
   --install-location /Applications \
   --scripts "$APP_SCRIPTS_DIR" \
   --identifier ai.tokenity.app \
@@ -826,7 +851,18 @@ pkgbuild \
   "$APP_COMPONENT_PKG"
 if [[ "$BUILD_NODE_AGENT_PACKAGE" == "1" ]]; then
   DISTRIBUTION_XML="$WORK_DIR/Distribution.xml"
+  REQUIREMENTS_PLIST="$WORK_DIR/Requirements.plist"
+  cat > "$REQUIREMENTS_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>arch</key><array><string>arm64</string></array>
+  <key>os</key><array><string>$RUNTIME_MINIMUM_MACOS</string></array>
+  <key>home</key><false/>
+</dict></plist>
+PLIST
   productbuild --synthesize \
+    --product "$REQUIREMENTS_PLIST" \
     --package "$APP_COMPONENT_PKG" \
     --package "$PKG_PATH" \
     "$DISTRIBUTION_XML"
@@ -842,7 +878,10 @@ fi
   shasum -a 256 "$(basename "$INSTALLER_PKG")" > "$(basename "$INSTALLER_CHECKSUM_PATH")"
 )
 cp "$INSTALLER_PKG" "$DMG_ROOT/Install Tokenity.pkg"
-cp "$INSTALLER_CHECKSUM_PATH" "$DMG_ROOT/Tokenity Installer.sha256"
+(
+  cd "$DMG_ROOT"
+  shasum -a 256 "Install Tokenity.pkg" > "Tokenity Installer.sha256"
+)
 if [[ "$BUILD_NODE_AGENT_PACKAGE" == "1" ]]; then
   cp "$RUNTIME_CATALOG_PATH" "$DMG_ROOT/Runtime Catalog.json"
 fi
@@ -887,6 +926,28 @@ The first-launch guide in Tokenity explains the Cluster -> Models -> Chat
 workflow.
 README
 fi
+
+cat >> "$DMG_ROOT/README.txt" <<'README'
+
+Unsigned community distribution / 未签名分发
+
+No Apple Developer account, Xcode, Homebrew, or separate Python installation
+is needed. Approve the normal administrator prompt in Installer.app.
+The PKG is unsigned and not notarized. The app uses a local ad-hoc signature.
+If macOS blocks the downloaded installer, open System Settings > Privacy &
+Security and choose Open Anyway for this installer, then open it again.
+The same approval may be needed for Tokenity's first launch.
+
+无需 Apple 开发者账号、Xcode、Homebrew 或另行安装 Python。
+双击安装包并输入本机管理员密码。如提示无法验证开发者，请前往
+“系统设置 > 隐私与安全性”，为此安装包选择“仍要打开”，然后重新打开。
+首次启动 Tokenity 时也可能需要相同的允许操作。
+
+Check the installer in this mounted image with:
+  shasum -a 256 -c "Tokenity Installer.sha256"
+SHA-256 checks file integrity; it does not authenticate the publisher.
+Apple instructions: https://support.apple.com/guide/mac-help/mh40616/mac
+README
 
 echo "Creating DMG..."
 hdiutil create \

@@ -18,7 +18,7 @@ The release lock is:
 packaging/runtime/runtime-lock.json
 ```
 
-Runtime `2026.07.26.1` pins:
+Runtime `2026.09.15.2` pins:
 
 | Component | Value |
 | --- | --- |
@@ -30,6 +30,9 @@ Runtime `2026.07.26.1` pins:
 | FastAPI | 0.139.0 |
 | Uvicorn | 0.50.2 |
 | Native MiniMax H3 protocol | 1 |
+| H3 Turbo protocol / presets | 1 / 4, 6, 8 steps |
+| Isolated MLX-VLM / MLX | 0.7.1 / 0.32.2 |
+| VLM Transformers | 5.16.1 |
 
 The macOS requirement is not an arbitrary app setting. The validated
 `mlx/core`, `libmlx.dylib`, and `libjaccl.dylib` binaries report `minos 26.2`.
@@ -80,13 +83,13 @@ producing a controller-only image when the Runtime is absent or invalid.
 Outputs:
 
 ```text
-dist/Tokenity-0.1.0.dmg
-dist/Tokenity-0.1.0.dmg.sha256
-dist/Tokenity-0.1.0-macos-arm64.pkg
-dist/Tokenity-0.1.0-macos-arm64.pkg.sha256
-dist/Tokenity-NodeAgent-Runtime-2026.07.26.1-macos-arm64.pkg
-dist/Tokenity-NodeAgent-Runtime-2026.07.26.1-macos-arm64.pkg.sha256
-dist/Tokenity-RuntimeCatalog-2026.07.26.1.json
+dist/Tokenity-0.1.2.dmg
+dist/Tokenity-0.1.2.dmg.sha256
+dist/Tokenity-0.1.2-macos-arm64.pkg
+dist/Tokenity-0.1.2-macos-arm64.pkg.sha256
+dist/Tokenity-NodeAgent-Runtime-2026.09.15.2-macos-arm64.pkg
+dist/Tokenity-NodeAgent-Runtime-2026.09.15.2-macos-arm64.pkg.sha256
+dist/Tokenity-RuntimeCatalog-2026.09.15.2.json
 ```
 
 Mounted layout:
@@ -106,12 +109,17 @@ second installer.
 
 On every Mac that will execute models:
 
-1. Open the full DMG.
-2. Open `Install Tokenity.pkg`.
+1. Download the full `Tokenity-0.1.2-macos-arm64.pkg`, or open the full DMG.
+2. Open the PKG (`Install Tokenity.pkg` inside the DMG).
 3. Approve the installation in Installer.app.
 4. Place compatible MLX model folders under
-   `${TOKENITY_MODEL_ROOT}`.
+   `/Library/Tokenity/Models`, or select a model folder in the app.
 5. Open Tokenity and confirm the component readiness checks pass.
+
+If macOS blocks the downloaded installer, follow the unsigned installation
+steps below. The app is always installed at `/Applications/Tokenity.app`, even
+when another copy has been moved elsewhere. Xcode, Homebrew and a separate
+Python installation are not required.
 
 The first-launch guide locates and verifies the embedded package. It never
 invokes `sudo` or bypasses Installer.app.
@@ -133,7 +141,7 @@ Tokenity does not use a mutable `latest` URL.
 The catalog currently points to:
 
 ```text
-https://github.com/HeyZhey/Tokenity/releases/download/runtime-2026.07.26.1/
+https://github.com/HeyZhey/Tokenity/releases/download/runtime-2026.09.15.2/
 ```
 
 Before distributing a thin/controller-only build, publish the pkg at the URL
@@ -143,7 +151,7 @@ recorded in the catalog. The offline DMG does not depend on that URL.
 location when packaging:
 
 ```bash
-TOKENITY_RUNTIME_DOWNLOAD_BASE_URL=https://downloads.example.com/tokenity/runtime-2026.07.26.1 \
+TOKENITY_RUNTIME_DOWNLOAD_BASE_URL=https://downloads.example.com/tokenity/runtime-2026.09.15.2 \
 ./scripts/package-tokenity-dmg.sh
 ```
 
@@ -222,28 +230,60 @@ TOKENITY_MODEL_SOURCE=/path/to/model \
 ./scripts/package-tokenity-dmg.sh
 ```
 
-## Signing status
+## Installing the unsigned release
 
-The current app is ad-hoc signed and the pkg is unsigned. This is suitable for
-internal validation only. Public distribution still requires:
+Tokenity 0.1.2 is distributed without Developer ID certificates or Apple
+notarization. The app has an ad-hoc signature for executable integrity. Users
+do not need an Apple Developer account to install it. The PKG includes the
+runtime and uses the ordinary macOS Installer with administrator approval.
 
-- Developer ID Application signing
-- Developer ID Installer signing
-- notarization and stapling of the final DMG
+A browser download may trigger Gatekeeper. On a Mac where local policy allows
+exceptions:
+
+1. Try opening the downloaded PKG once.
+2. Open **System Settings → Privacy & Security** and choose **Open Anyway**
+   for that installer (on some macOS versions, choose **Open** first).
+3. Authenticate and reopen the PKG. After installation, launch Tokenity from
+   Applications. If macOS also blocks the app, repeat the same per-app approval.
+
+This is Apple's documented [unknown-developer opening procedure](https://support.apple.com/guide/mac-help/mh40616/mac).
+It does not provide a guarantee of zero prompts on every Mac; organization
+policies may prohibit unsigned software. The package does not change Gatekeeper
+or SIP settings.
+
+The packaging approach uses Apple's `pkgbuild` / `productbuild`, as do
+[Munki's packaging tools](https://github.com/munki/munki-pkg/blob/main/README.md).
+Munki makes signing and notarization optional (`--skip-signing` and
+`--skip-notarization`). This is a packaging option, not a Gatekeeper exemption.
+No additional packaging framework is needed for Tokenity.
+
+Keep the `.sha256` file beside the downloaded package, then verify:
+
+```bash
+shasum -a 256 -c Tokenity-0.1.2-macos-arm64.pkg.sha256
+```
+
+For the renamed PKG inside the DMG, run this from the mounted image:
+
+```bash
+shasum -a 256 -c "Tokenity Installer.sha256"
+```
 
 SHA-256 detects corruption; it does not replace publisher identity signing.
+`pkgutil --check-signature` reporting "no signature" is expected for this
+release. The installed app must still pass `codesign --verify --deep --strict`.
 
 ## Verification
 
 ```bash
-hdiutil verify dist/Tokenity-0.1.0.dmg
+hdiutil verify dist/Tokenity-0.1.2.dmg
 ./scripts/tokenity-runtime-manifest.py verify-artifact \
-  --catalog dist/Tokenity-RuntimeCatalog-2026.07.26.1.json \
-  --artifact dist/Tokenity-NodeAgent-Runtime-2026.07.26.1-macos-arm64.pkg
+  --catalog dist/Tokenity-RuntimeCatalog-2026.09.15.2.json \
+  --artifact dist/Tokenity-NodeAgent-Runtime-2026.09.15.2-macos-arm64.pkg
 pkgutil --check-signature \
-  dist/Tokenity-0.1.0-macos-arm64.pkg
+  dist/Tokenity-0.1.2-macos-arm64.pkg
 pkgutil --payload-files \
-  dist/Tokenity-NodeAgent-Runtime-2026.07.26.1-macos-arm64.pkg
+  dist/Tokenity-NodeAgent-Runtime-2026.09.15.2-macos-arm64.pkg
 ```
 
 After installing on a compatible test Mac:

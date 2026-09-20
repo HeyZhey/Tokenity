@@ -5,6 +5,7 @@ import hashlib
 import os
 import subprocess
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
@@ -12,6 +13,10 @@ from tokenity.paths import h3_binary
 
 
 H3_MODEL_TYPE = "minimax_h3"
+H3_TURBO_PROTOCOL_VERSION = 1
+H3_TURBO_LORA_REVISION = "43a74557ac3f6539db8e0f2a959d03feb7a81480"
+H3_TURBO_LORA_SHA256 = "5f3a626cd72c93a8b9318d6760c510bc5092d2ab13aaba1f932c5bab07a416d3"
+H3_TURBO_LORA_BYTES = 779849816
 H3_DISTRIBUTED_PROTOCOL_VERSION = 1
 H3_DISTRIBUTED_HELP_MARKERS = (
     "--h3-distributed-rank",
@@ -179,13 +184,21 @@ class H3BackendCapabilities:
     help_available: bool
     distributed_protocol_version: int | None
     detail: str | None = None
+    turbo_protocol_version: int | None = None
+
+    @property
+    def supports_turbo_h3(self) -> bool:
+        return self.turbo_protocol_version == H3_TURBO_PROTOCOL_VERSION
 
     @property
     def supports_distributed_h3(self) -> bool:
         return self.distributed_protocol_version == H3_DISTRIBUTED_PROTOCOL_VERSION
 
     def to_dict(self) -> dict[str, object]:
-        return asdict(self) | {"supports_distributed_h3": self.supports_distributed_h3}
+        return asdict(self) | {
+            "supports_distributed_h3": self.supports_distributed_h3,
+            "supports_turbo_h3": self.supports_turbo_h3,
+        }
 
 
 def native_h3_environment(
@@ -428,6 +441,20 @@ def probe_h3_backend(
         )
     help_text = f"{completed.stdout}\n{completed.stderr}"
     supports_protocol = all(marker in help_text for marker in H3_DISTRIBUTED_HELP_MARKERS)
+    turbo_protocol = None
+    if completed.returncode == 0 and "--h3-capabilities" in help_text:
+        try:
+            probe = runner(
+                [str(path), "--h3-capabilities"], check=False, capture_output=True,
+                text=True, timeout=10, env=native_h3_environment(path),
+            )
+            declared = json.loads(probe.stdout)
+            if (probe.returncode == 0 and isinstance(declared, dict)
+                    and declared.get("turbo_protocol_version") == H3_TURBO_PROTOCOL_VERSION
+                    and declared.get("modules") == 259 and declared.get("strength") == 1.0):
+                turbo_protocol = H3_TURBO_PROTOCOL_VERSION
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+            pass  # Older/unknown binaries remain usable for ordinary sampling.
     return H3BackendCapabilities(
         binary=str(path),
         executable=True,
@@ -435,6 +462,7 @@ def probe_h3_backend(
         distributed_protocol_version=(
             H3_DISTRIBUTED_PROTOCOL_VERSION if supports_protocol else None
         ),
+        turbo_protocol_version=turbo_protocol,
         detail=(
             None
             if supports_protocol
@@ -501,3 +529,52 @@ def exec_native_h3(
     env.setdefault("MLX_METAL_FAST_SYNCH", "1")
     exec_fn(binary, command, env)
     raise RuntimeError("Native MiniMax H3 exec unexpectedly returned.")
+
+
+@lru_cache(maxsize=8)
+def _turbo_lora_sha256(path: str, identity: tuple[int, ...]) -> str:
+    # Cache only the adapter hash, invalidated by file identity/size/timestamps.
+    # The native loader still validates all 259 modules on every generation.
+    return _sha256_file(Path(path))
+
+
+def h3_turbo_lora_readiness(model: str | Path) -> dict[str, object]:
+    path = Path(model).resolve() / "turbo_lora.safetensors"
+    artifact: dict[str, object] = {
+        "path": str(path), "revision": H3_TURBO_LORA_REVISION,
+        "expected_sha256": H3_TURBO_LORA_SHA256, "sha256": None,
+        "size_bytes": None,
+    }
+    issues = []
+    try:
+        info = path.stat()
+        artifact["size_bytes"] = info.st_size
+        if not path.is_file() or info.st_size != H3_TURBO_LORA_BYTES:
+            issues.append("Turbo LoRA corrupt or incomplete: turbo_lora.safetensors must be the pinned v4 EMA adapter (779849816 bytes).")
+        else:
+            identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+            artifact["sha256"] = _turbo_lora_sha256(str(path), identity)
+            if artifact["sha256"] != H3_TURBO_LORA_SHA256:
+                issues.append("Turbo LoRA SHA-256 mismatch: restore the pinned v4 EMA turbo_lora.safetensors; ordinary sampling was not substituted.")
+    except OSError as exc:
+        issues.append(f"turbo_lora.safetensors missing or unreadable on the execution node: {exc}")
+    return artifact | {"issues": issues}
+
+
+def h3_turbo_runtime_issues(runtime: Mapping[str, object], *, pid: int | None) -> list[str]:
+    issues = []
+    if (runtime.get("turbo_protocol_version") != H3_TURBO_PROTOCOL_VERSION
+            or runtime.get("modules") != 259 or runtime.get("strength") != 1.0):
+        issues.append("The running native backend has unknown Turbo capability; start a verified Turbo runtime.")
+    if pid is None or runtime.get("pid") != pid:
+        issues.append("Turbo capability response does not match the launched native process.")
+    if runtime.get("world_size") != 1:
+        issues.append("MiniMax H3 Turbo currently supports Single Mac only; the running instance is distributed or unknown.")
+    for key, variable in (("step_cache", "MINIMAX_H3_STEP_CACHE"), ("attn_bcast", "MINIMAX_H3_ATTN_BCAST")):
+        try:
+            zero = float(str(runtime[key])) == 0.0
+        except (KeyError, ValueError, TypeError):
+            zero = False
+        if not zero:
+            issues.append(f"Turbo requires {variable}=0 or unset in the running native process; remove the forced override and restart this instance.")
+    return issues

@@ -1,4 +1,6 @@
+import plistlib
 import subprocess
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
@@ -36,7 +38,7 @@ def test_dmg_exposes_one_installer_with_app_and_runtime_components():
     assert 'TOKENITY_BUNDLE_NAME=Tokenity' in source
     assert 'cp "$INSTALLER_PKG" "$DMG_ROOT/Install Tokenity.pkg"' in source
     assert "productbuild --synthesize" in source
-    assert '--component "$APP_BUNDLE"' in source
+    assert '--component-plist "$APP_COMPONENT_PLIST"' in source
     assert '--package "$PKG_PATH"' in source
     assert 'Applications -> /Applications' not in source
     assert 'Install Tokenity Node Agent.pkg' not in source
@@ -151,3 +153,50 @@ def test_agent_update_revision_covers_every_runtime_entrypoint():
     assert '"agent.py"' in source
     assert '"distributed_openai.py"' in source
     assert '"minimax_h3_video.py"' in source
+
+
+def test_postinstall_uses_embedded_python_without_command_line_tools():
+    source = (ROOT / "scripts/package-tokenity-dmg.sh").read_text()
+    start = source.index('RUNTIME_EXPECTED_H3_PROTOCOL=')
+    end = source.index('} > "$SCRIPTS_DIR/postinstall"', start)
+    postinstall = source[start:end]
+    assert '\n/usr/bin/python3 "$CODE_ROOT/' not in postinstall
+    assert '"$RUNTIME_STAGE_ROOT/current/.venv/bin/python" "$CODE_ROOT/scripts/tokenity-runtime-manifest.py" verify' in postinstall
+
+
+def test_product_checks_architecture_and_os_before_installing_components():
+    source = (ROOT / "scripts/package-tokenity-dmg.sh").read_text()
+    assert '--product "$REQUIREMENTS_PLIST"' in source
+    assert '<key>arch</key><array><string>arm64</string></array>' in source
+    assert '<key>os</key><array><string>$RUNTIME_MINIMUM_MACOS</string></array>' in source
+
+
+def test_app_package_cannot_relocate_to_a_development_copy(tmp_path):
+    source = (ROOT / "scripts/package-tokenity-dmg.sh").read_text()
+    start = source.index('APP_COMPONENT_PLIST="$WORK_DIR/AppComponent.plist"')
+    end = source.index('\nif [[ "$BUILD_NODE_AGENT_PACKAGE"', start)
+    app = tmp_path / "app/Tokenity.app"
+    (app / "Contents").mkdir(parents=True)
+    (tmp_path / "scripts").mkdir()
+    (app / "Contents/Info.plist").write_bytes(plistlib.dumps({
+        "CFBundleIdentifier": "ai.tokenity.control",
+        "CFBundleName": "Tokenity",
+        "CFBundlePackageType": "APPL",
+        "CFBundleVersion": "4",
+        "CFBundleShortVersionString": "0.1.2",
+    }))
+    subprocess.run([
+        "/bin/bash", "-eu", "-c",
+        'WORK_DIR="$1"\nAPP_BUNDLE="$1/app/Tokenity.app"\n'
+        'APP_SCRIPTS_DIR="$1/scripts"\nAPP_COMPONENT_PKG="$1/app.pkg"\n'
+        'VERSION=0.1.2\n' + source[start:end],
+        "test-package", str(tmp_path),
+    ], check=True, capture_output=True, text=True)
+    expanded = tmp_path / "expanded"
+    subprocess.run(["/usr/sbin/pkgutil", "--expand", str(tmp_path / "app.pkg"),
+                    str(expanded)], check=True, capture_output=True)
+    info = ET.parse(expanded / "PackageInfo").getroot()
+    assert info.get("install-location") == "/Applications"
+    assert info.get("relocatable") == "false"
+    assert info.findall("relocate/bundle") == []
+    assert info.find("bundle").get("path").removeprefix("./") == "Tokenity.app"

@@ -16,7 +16,7 @@ if [[ "$INSTALL_ROOT" != /* || "$INSTALL_ROOT" =~ [[:space:]\<\>\&] ||
   echo "TOKENITY_INSTALL_ROOT must be an absolute path without whitespace or XML metacharacters." >&2
   exit 1
 fi
-VERSION="${TOKENITY_VERSION:-0.1.0}"
+VERSION="${TOKENITY_VERSION:-0.1.2}"
 DIST_DIR="$ROOT/dist"
 WORK_DIR="$DIST_DIR/agent-update-work"
 PAYLOAD_DIR="$WORK_DIR/payload"
@@ -47,6 +47,12 @@ EXPECTED_REVISION="$(
     /bin/cat "$ROOT/tokenity/serving/distributed_openai.py"
     /usr/bin/printf '%s' "minimax_h3_video.py"
     /bin/cat "$ROOT/tokenity/serving/minimax_h3_video.py"
+    /usr/bin/printf '%s' "mlx_vlm_openai.py"
+    /bin/cat "$ROOT/tokenity/serving/mlx_vlm_openai.py"
+    /usr/bin/printf '%s' "vlm_runtime.py"
+    /bin/cat "$ROOT/tokenity/mlx/vlm_runtime.py"
+    /usr/bin/printf '%s' "model_inspection.py"
+    /bin/cat "$ROOT/tokenity/model_inspection.py"
   } | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}'
 )"
 

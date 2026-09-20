@@ -67,6 +67,7 @@ from tokenity.mlx.hostfile import (
 )
 from tokenity.mlx.rdma_probe import RDMAProbeResult, probe_rdma
 from tokenity.model_inspection import (
+    model_backend,
     distributed_model_issue,
     model_usage_metadata,
     standalone_model_issue,
@@ -86,6 +87,8 @@ from tokenity.serving.minimax_h3_video import (
     h3_optimization_environment,
     h3_runtime_fingerprint,
     h3_runtime_preflight,
+    h3_turbo_lora_readiness,
+    h3_turbo_runtime_issues,
 )
 
 
@@ -2682,6 +2685,40 @@ def create_app(
             ),
         )
 
+    def h3_turbo_readiness(instance) -> dict[str, object]:
+        evidence = instance.readiness_evidence
+        backend = evidence.get("backend", {})
+        fingerprint = evidence.get("runtime_fingerprint", {})
+        binary = fingerprint.get("artifacts", {}).get("binary", {})
+        issues = []
+        runtime = {}
+        lora = {}
+        if instance.world_size != 1 or instance.execution_mode != "single":
+            issues.append("MiniMax H3 Turbo currently supports Single Mac only; TP2 is not supported.")
+        elif backend.get("supports_turbo_h3") is not True or not binary.get("sha256"):
+            issues.append("The selected native binary has unknown Turbo capability; start a verified Turbo runtime.")
+        else:
+            try:
+                runtime = get_json(f"http://127.0.0.1:{instance.http_port}/v1/h3/capabilities", 3.0)
+                issues.extend(h3_turbo_runtime_issues(
+                    runtime, pid=instance.process_identities.get(instance.coordinator),
+                ))
+            except Exception as exc:
+                issues.append(f"Could not confirm Turbo capability from the running native process: {exc}")
+            lora = h3_turbo_lora_readiness(instance.resolved_path)
+            issues.extend(lora["issues"])
+        return {
+            "ready": not issues, "issues": issues, "runtime": runtime,
+            "binary": binary, "lora": lora,
+        }
+
+    @app.get("/v1/node/instances/{instance_id}/h3-turbo")
+    def h3_turbo_status(instance_id: str) -> dict[str, object]:
+        instance = instances.get(instance_id)
+        if instance is None or instance_roles.get(instance_id) != "minimax-h3-video":
+            raise HTTPException(status_code=404, detail="Unknown MiniMax H3 instance.")
+        return h3_turbo_readiness(instance)
+
     @app.post("/v1/video/generations")
     async def gateway_video_generations(request: FastAPIRequest) -> Response:
         try:
@@ -2693,6 +2730,14 @@ def create_app(
             ) from exc
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
+
+        if "turbo" in payload and not isinstance(payload["turbo"], bool):
+            raise HTTPException(status_code=400, detail="turbo must be a JSON boolean.")
+        if payload.get("turbo") is True:
+            if payload.get("fast", False) is not False:
+                raise HTTPException(status_code=400, detail="Turbo requires fast=false; cache optimizations cannot be combined.")
+            if type(payload.get("steps")) is not int or not 1 <= payload["steps"] <= 50:
+                raise HTTPException(status_code=400, detail="Turbo requires explicit steps between 1 and 50 (4/6/8 presets).")
 
         requested_target = payload.get("tokenity_instance_id") or payload.get("model")
         candidates = []
@@ -2728,6 +2773,16 @@ def create_app(
         selected = instances.get(str(candidates[0]["instance_id"]))
         if selected is None:
             raise HTTPException(status_code=409, detail="Selected H3 instance disappeared.")
+        if payload.get("turbo") is True:
+            turbo = await run_in_threadpool(h3_turbo_readiness, selected)
+            if not turbo["ready"]:
+                raise HTTPException(status_code=412, detail={"stage": "minimax_h3_turbo_readiness", **turbo})
+            logging.info(
+                "H3 generation instance=%s turbo=true steps=%s fast=false strength=1.0 world_size=1 binary=%s sha256=%s cache=%s bcast=%s",
+                selected.instance_id, payload["steps"], turbo["binary"].get("path"),
+                turbo["binary"].get("sha256"), turbo["runtime"].get("step_cache"),
+                turbo["runtime"].get("attn_bcast"),
+            )
         quorum = instance_quorum(selected.instance_id)
         if quorum.get("ready") is not True:
             raise HTTPException(
@@ -2931,6 +2986,9 @@ def create_app(
                 detail="MiniMax H3 startup must use the coordinator Agent's installed Python runtime.",
             )
         nodes = _h3_request_nodes(request)
+        if len(nodes) == 1:
+            # Pin the local file; TP2 keeps each node's existing path semantics.
+            request.binary = str(Path(request.binary).resolve())
         instance_id = request.instance_id or uuid.uuid4().hex
         operation_id = request.operation_id or uuid.uuid4().hex
         request.instance_id = instance_id
@@ -3381,6 +3439,10 @@ def create_app(
                 "all_ranks_healthy": True,
                 "native_video_health": True,
                 "distributed_protocol": None,
+                "backend": _h3_capabilities_payload(capabilities),
+                "runtime_fingerprint": runtime_fingerprint,
+                "optimization_profile": request.optimization_profile,
+                "optimization_flags": h3_optimization_environment(request.optimization_profile),
             },
         )
         instance.health_ready = True
@@ -3395,6 +3457,8 @@ def create_app(
             "launch_plan": plan,
             "backend": _h3_capabilities_payload(capabilities),
             "status": status.__dict__,
+            "runtime_fingerprint": runtime_fingerprint,
+            "turbo": h3_turbo_readiness(instance),
         }
 
     @app.post("/v1/node/start-minimax-h3-video-rank")
@@ -4464,6 +4528,10 @@ def _infer_gateway_model_profile(
         or bool(config.get("supports_tools"))
     )
     supports_json = supports_tools or "json" in identity or bool(config.get("supports_json"))
+    uses_vlm = model_backend(resolved_path, config=config) == "mlx-vlm"
+    if uses_vlm:
+        supports_tools = False
+        supports_json = False
     sampling_defaults: dict[str, object] = {"temperature": 0.7, "top_p": 0.9}
     if "qwen3" in identity:
         sampling_defaults = {
@@ -4508,6 +4576,12 @@ def _infer_gateway_model_profile(
             supported_runtime_parameters.add("response_format")
         if "qwen3" in identity or chat_template_defaults:
             supported_runtime_parameters.add("chat_template_kwargs")
+    if uses_vlm:
+        supported_runtime_parameters.difference_update({
+            "tools", "tool_choice", "parallel_tool_calls", "response_format",
+            "logprobs", "top_logprobs",
+        })
+        supported_runtime_parameters.add("chat_template_kwargs")
     configured_template_parameters = config.get(
         "tokenity_supported_chat_template_parameters"
     )
@@ -5453,8 +5527,13 @@ def _rank_process_command(request: RankStartRequest) -> list[str]:
 
 
 def _rank_command(request: RankStartRequest) -> list[str]:
+    python = request.python
+    if request.world_size == 1 and model_backend(request.model) == "mlx-vlm":
+        from tokenity.mlx.vlm_runtime import runtime_python
+
+        python = runtime_python(python)
     command = [
-        request.python,
+        python,
         "-m",
         "tokenity",
         "distributed-openai",
@@ -5669,6 +5748,21 @@ def _runtime_preflight(
     if mlx_lm_version is None or _version_release(mlx_lm_version) < (0, 31, 3):
         issues.append(f"mlx-lm >= 0.31.3 is required; found {mlx_lm_version or 'not installed'}.")
 
+    if model_backend(model) == "mlx-vlm":
+        from tokenity.mlx.vlm_runtime import runtime_python
+
+        try:
+            vlm_python = runtime_python(python)
+            probe = subprocess.run(
+                [vlm_python, "-c", "from tokenity.mlx.vlm_runtime import validate_packages; validate_packages()"],
+                env={**os.environ, "PYTHONPATH": _distributed_code_root(), "PYTHONNOUSERSITE": "1"},
+                capture_output=True, text=True, timeout=20, check=False,
+            )
+            if probe.returncode:
+                issues.append(f"MLX-VLM runtime validation failed: {probe.stderr.strip()[-2000:]}")
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            issues.append(str(exc))
+
     model_path = Path(model)
     if not model_path.is_dir():
         issues.append(f"Model directory does not exist: {model}")
@@ -5730,6 +5824,9 @@ def _tokenity_code_revision() -> str | None:
         Path(__file__),
         Path(__file__).parents[1] / "serving" / "distributed_openai.py",
         Path(__file__).parents[1] / "serving" / "minimax_h3_video.py",
+        Path(__file__).parents[1] / "serving" / "mlx_vlm_openai.py",
+        Path(__file__).parents[1] / "mlx" / "vlm_runtime.py",
+        Path(__file__).parents[1] / "model_inspection.py",
     ]
     try:
         for path in paths:

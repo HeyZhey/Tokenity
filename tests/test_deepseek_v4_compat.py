@@ -213,3 +213,39 @@ def test_server_patch_forces_deepseek_v4_to_sequential_generation():
     qwen = Provider()
     qwen._load("qwen3_5")
     assert qwen.is_batchable is True
+
+
+def test_missing_chat_template_is_model_scoped_and_preserves_user_template():
+    tokens = {"<｜begin▁of▁sentence｜>": 0, "<｜end▁of▁sentence｜>": 1,
+              "<｜User｜>": 2, "<｜Assistant｜>": 3, "<think>": 4, "</think>": 5}
+    tokenizer = SimpleNamespace(chat_template=None, has_chat_template=False, get_vocab=lambda: tokens)
+    assert not compat.install_deepseek_v4_tokenizer_compat(SimpleNamespace(model_type="qwen"), tokenizer)
+    model = SimpleNamespace(model_type="deepseek_v4")
+    assert compat.install_deepseek_v4_tokenizer_compat(model, tokenizer)
+    assert tokenizer.has_chat_template
+    assert not compat.install_deepseek_v4_tokenizer_compat(model, tokenizer)
+    tokenizer.chat_template = "custom"
+    assert not compat.install_deepseek_v4_tokenizer_compat(model, tokenizer)
+    assert tokenizer.chat_template == "custom"
+
+
+def test_v4_chat_fallback_formats_messages_and_thinking_without_plain_text_roles():
+    jinja = pytest.importorskip("jinja2")
+    template = jinja.Environment().from_string(compat._CHAT_TEMPLATE)
+    kwargs = dict(bos_token="<｜begin▁of▁sentence｜>", eos_token="<｜end▁of▁sentence｜>",
+                  messages=[{"role": "user", "content": "Hello"}], add_generation_prompt=True)
+    assert template.render(**kwargs) == "<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜></think>"
+    assert template.render(**kwargs, enable_thinking=True).endswith("<｜Assistant｜><think>")
+    assert template.render(**kwargs, thinking_mode="thinking").endswith("<｜Assistant｜><think>")
+    kwargs["messages"] = [{"role": "system", "content": "Be brief."},
+                          {"role": "user", "content": "Hello"},
+                          {"role": "assistant", "content": "Hi"},
+                          {"role": "user", "content": "Again"}]
+    assert template.render(**kwargs) == "<｜begin▁of▁sentence｜>Be brief.<｜User｜>Hello<｜Assistant｜></think>Hi<｜end▁of▁sentence｜><｜User｜>Again<｜Assistant｜></think>"
+
+
+def test_v4_missing_template_rejects_unknown_token_vocabulary():
+    tokenizer = SimpleNamespace(chat_template=None, has_chat_template=False, get_vocab=lambda: {})
+    with pytest.raises(RuntimeError, match="missing required chat tokens"):
+        compat.install_deepseek_v4_tokenizer_compat(SimpleNamespace(model_type="deepseek_v4"), tokenizer)
+    assert tokenizer.chat_template is None

@@ -111,6 +111,36 @@ struct AgentStartH3VideoRequest: Encodable {
     }
 }
 
+struct H3TurboReadiness: Decodable {
+    var ready: Bool
+    var issues: [String]
+}
+
+struct H3VideoRuntimeResponse: Decodable {
+    var instanceID: String?
+    var turbo: H3TurboReadiness?
+
+    enum CodingKeys: String, CodingKey {
+        case instanceID = "instance_id"
+        case turbo
+    }
+}
+
+enum H3TurboPreset: Int, CaseIterable, Identifiable {
+    case preview = 4
+    case balanced = 6
+    case detail = 8
+
+    var id: Int { rawValue }
+    var title: String {
+        switch self {
+        case .preview: return "4 steps · Preview"
+        case .balanced: return "6 steps · Balanced"
+        case .detail: return "8 steps · Detail"
+        }
+    }
+}
+
 struct H3VideoGenerationRequest: Encodable, Equatable {
     var model: String? = nil
     var prompt: String
@@ -120,7 +150,49 @@ struct H3VideoGenerationRequest: Encodable, Equatable {
     var steps: Int
     var seed: Int
     var fast: Bool
+    var turbo: Bool = false
     var stream: Bool
+
+    // Mode preferences belong to this request editor, not the wire contract.
+    private var ordinarySteps = 28
+    private var ordinaryFast = false
+    private var turboSteps = 6
+
+    init(model: String? = nil, prompt: String, width: Int, height: Int,
+         numFrames: Int, steps: Int, seed: Int, fast: Bool,
+         turbo: Bool = false, stream: Bool) {
+        self.model = model
+        self.prompt = prompt
+        self.width = width
+        self.height = height
+        self.numFrames = numFrames
+        self.steps = steps
+        self.seed = seed
+        self.fast = turbo ? false : fast
+        self.turbo = turbo
+        self.stream = stream
+        if turbo {
+            turboSteps = steps
+        } else {
+            ordinarySteps = steps
+            ordinaryFast = fast
+        }
+    }
+
+    mutating func setTurbo(_ enabled: Bool) {
+        guard enabled != turbo else { return }
+        if enabled {
+            ordinarySteps = steps
+            ordinaryFast = fast
+            steps = turboSteps
+            fast = false
+        } else {
+            turboSteps = steps
+            steps = ordinarySteps
+            fast = ordinaryFast
+        }
+        turbo = enabled
+    }
 
     static let `default` = H3VideoGenerationRequest(
         prompt: "A cinematic tracking shot follows a weathered paper boat through a rain-soaked neon night market; the camera begins at water level, glides past steaming food stalls and pedestrians beneath translucent umbrellas, then rises into a wide overhead reveal as reflections ripple across the street, with realistic lighting, shallow depth of field, and natural motion.",
@@ -134,7 +206,7 @@ struct H3VideoGenerationRequest: Encodable, Equatable {
     )
 
     enum CodingKeys: String, CodingKey {
-        case model, prompt, width, height, steps, seed, fast, stream
+        case model, prompt, width, height, steps, seed, fast, turbo, stream
         case numFrames = "num_frames"
     }
 
@@ -145,6 +217,7 @@ struct H3VideoGenerationRequest: Encodable, Equatable {
         copy.height = Self.validatedDimension(height)
         copy.numFrames = Self.validatedFrameCount(numFrames)
         copy.steps = min(max(steps, 1), 50)
+        if copy.turbo { copy.fast = false }
         copy.stream = true
         return copy
     }
@@ -181,6 +254,7 @@ enum H3VideoSSEEvent: Equatable {
 
 enum H3VideoContractError: LocalizedError {
     case invalidEvent
+    case server(String)
     case unsupportedFormat(String)
     case invalidVideoLength(expected: Int, actual: Int)
     case invalidBase64(String)
@@ -190,6 +264,8 @@ enum H3VideoContractError: LocalizedError {
         switch self {
         case .invalidEvent:
             return "The MiniMax H3 server returned an unreadable video event."
+        case .server(let message):
+            return message
         case .unsupportedFormat(let format):
             return "The generated video uses unsupported format \(format)."
         case .invalidVideoLength(let expected, let actual):
@@ -205,6 +281,10 @@ enum H3VideoContractError: LocalizedError {
 enum H3VideoSSEParser {
     private struct Kind: Decodable {
         var type: String
+    }
+
+    private struct ServerError: Decodable {
+        var message: String
     }
 
     private struct Progress: Decodable {
@@ -243,6 +323,8 @@ enum H3VideoSSEParser {
         }
         let decoder = JSONDecoder()
         switch try decoder.decode(Kind.self, from: encoded).type {
+        case "error":
+            throw H3VideoContractError.server(try decoder.decode(ServerError.self, from: encoded).message)
         case "progress":
             let event = try decoder.decode(Progress.self, from: encoded)
             return .progress(stage: event.stage, step: event.step, total: event.total)
@@ -322,6 +404,7 @@ enum H3VideoArtifactWriter {
         request: H3VideoGenerationRequest,
         rootDirectory: URL? = nil
     ) async throws -> GeneratedVideoArtifact {
+        let saveStarted = Date()
         let id = UUID()
         let root = rootDirectory ?? defaultRootDirectory()
         let directory = root.appendingPathComponent(id.uuidString, isDirectory: true)
@@ -372,6 +455,9 @@ enum H3VideoArtifactWriter {
             seed: request.seed,
             steps: request.steps,
             fast: request.fast,
+            turbo: request.turbo,
+            turboStrength: request.turbo ? 1.0 : nil,
+            saveSeconds: Date().timeIntervalSince(saveStarted),
             frames: payload.frames,
             width: payload.width,
             height: payload.height,
@@ -404,6 +490,9 @@ enum H3VideoArtifactWriter {
         var seed: Int
         var steps: Int
         var fast: Bool
+        var turbo: Bool?
+        var turboStrength: Double?
+        var saveSeconds: Double?
         var frames: Int
         var width: Int
         var height: Int
@@ -411,7 +500,9 @@ enum H3VideoArtifactWriter {
         var hasMuxedAudio: Bool
 
         enum CodingKeys: String, CodingKey {
-            case prompt, seed, steps, fast, frames, width, height, fps
+            case prompt, seed, steps, fast, turbo, frames, width, height, fps
+            case turboStrength = "turbo_strength"
+            case saveSeconds = "save_seconds"
             case hasMuxedAudio = "has_muxed_audio"
         }
     }
