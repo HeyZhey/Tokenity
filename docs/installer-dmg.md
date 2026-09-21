@@ -116,8 +116,8 @@ On every Mac that will execute models:
    `/Library/Tokenity/Models`, or select a model folder in the app.
 5. Open Tokenity and confirm the component readiness checks pass.
 
-If macOS blocks the downloaded installer, follow the unsigned installation
-steps below. The app is always installed at `/Applications/Tokenity.app`, even
+The published v0.1.2 PKG is Developer ID signed and Apple notarized, with its
+notarization ticket stapled. The app is always installed at `/Applications/Tokenity.app`, even
 when another copy has been moved elsewhere. Xcode, Homebrew and a separate
 Python installation are not required.
 
@@ -230,12 +230,26 @@ TOKENITY_MODEL_SOURCE=/path/to/model \
 ./scripts/package-tokenity-dmg.sh
 ```
 
-## Installing the unsigned release
+## Signed v0.1.2 release
 
-Tokenity 0.1.2 is distributed without Developer ID certificates or Apple
-notarization. The app has an ad-hoc signature for executable integrity. Users
-do not need an Apple Developer account to install it. The PKG includes the
-runtime and uses the ordinary macOS Installer with administrator approval.
+Download `Tokenity-0.1.2-macos-arm64.pkg` and its `.sha256` file from the
+[v0.1.2 Release](https://github.com/HeyZhey/Tokenity/releases/tag/v0.1.2).
+The release app/runtime use Developer ID Application signatures and the PKG
+uses Developer ID Installer signing. Apple notarization is accepted and its
+ticket is stapled to the installer. Users do not need an Apple Developer account.
+
+The final package passed a standard installation on a separate M5 Ultra with
+256 GiB memory and macOS 27.0, including Gatekeeper checks with a download
+quarantine attribute, ordinary-user permissions, LM/VLM short inference, and
+H3 startup/Turbo readiness. No installed-payload permission repair was needed.
+See [release notes](release-0.1.2.md) for the precise test scope.
+
+## Unsigned development builds
+
+`scripts/package-tokenity-dmg.sh` produces an unsigned development package
+with an ad-hoc-signed app. Developer ID signing and notarization are separate
+release steps; running the source script alone does not produce the published
+notarized artifact. The following instructions apply only to such unsigned builds.
 
 A browser download may trigger Gatekeeper. On a Mac where local policy allows
 exceptions:
@@ -270,8 +284,10 @@ shasum -a 256 -c "Tokenity Installer.sha256"
 ```
 
 SHA-256 detects corruption; it does not replace publisher identity signing.
-`pkgutil --check-signature` reporting "no signature" is expected for this
-release. The installed app must still pass `codesign --verify --deep --strict`.
+`pkgutil --check-signature` reporting "no signature" is expected only for an
+unsigned development build. The published release reports a trusted Developer ID
+signature and Apple notarization. The installed app must also pass
+`codesign --verify --deep --strict`.
 
 ## Verification
 

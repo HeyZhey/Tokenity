@@ -24,6 +24,11 @@
 
 # Tokenity
 
+**Latest release: [v0.1.2 (Build 4)](https://github.com/HeyZhey/Tokenity/releases/tag/v0.1.2)** —
+GLM 5.3 Flash, DeepSeek V4 Flash, Qwen3.8-Next / Flash-Next, and MiniMax H3 Turbo.
+The release PKG is Developer ID signed, Apple notarized, and tested on another M5 Ultra.
+See the [supported-model table and release notes](docs/release-0.1.2.md).
+
 Tokenity turns Apple-silicon Macs on a local network into one managed AI
 cluster. Its native macOS app discovers machines, validates the high-speed data
 plane, starts distributed ranks, loads models, streams progress, and keeps the
@@ -165,8 +170,9 @@ benchmark harness, fingerprints, and reproducibility notes.
 | Cluster discovery | Finds Node Agents on the LAN, tracks each Mac by stable `machine_id`, and repairs address changes without confusing remote nodes with loopback. |
 | Operations | Memory admission, queues, timeouts, leases, health/readiness probes, resource ledgers, logs, watchdog restart, and upgrade-safe maintenance windows. |
 
-Current model coverage includes DeepSeek V4, GLM 5.2, Qwen-family MLX
-checkpoints, MiniMax H3, and other compatible MLX models selected through
+Current model coverage includes DeepSeek V4 Flash, GLM 5.3 Flash, GLM 5.2,
+Qwen3.8-Next / Flash-Next, Qwen3.5-family MLX checkpoints, MiniMax H3,
+and other compatible MLX models selected through
 metadata and runtime capabilities. Native MTP activation is guarded by
 checkpoint and backend evidence rather than model-name switches.
 
@@ -316,13 +322,14 @@ Build the full installer after importing the validated runtime:
 ./scripts/package-tokenity-dmg.sh
 ```
 
-Version **0.1.2 (build 4)** includes DeepSeek V4, GLM 5.3 / Qwen4 via MLX-VLM,
+Version **0.1.2 (build 4)** includes DeepSeek V4 Flash, GLM 5.3 / Qwen3.8-Next via MLX-VLM,
 and MiniMax H3 Turbo (4/6/8 steps). See [release notes](docs/release-0.1.2.md).
 
 Model weights are excluded by default. The full PKG includes Python and both
-MLX backends; it requires Apple silicon and macOS 26.2+. This release is
-unsigned and not notarized. If macOS blocks a download, approve that installer
-in **System Settings → Privacy & Security → Open Anyway**. See
+MLX backends; it requires Apple silicon and macOS 26.2+. The published release
+PKG is Developer ID signed and Apple notarized, with the notarization ticket
+stapled. Install it with the normal macOS Installer and local administrator approval.
+The source packaging script produces an unsigned development build unless signed separately. See
 [Installer and runtime distribution](docs/installer-dmg.md).
 
 ## Verification baseline

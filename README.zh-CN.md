@@ -24,6 +24,11 @@
 
 # Tokenity
 
+**最新版本：[v0.1.2（Build 4）](https://github.com/HeyZhey/Tokenity/releases/tag/v0.1.2)** ——
+支持 **GLM 5.3 Flash、DeepSeek V4 Flash、Qwen3.8-Next / Flash-Next、MiniMax H3 Turbo**。
+发布版 PKG 已完成 Developer ID 签名和 Apple 公证，并在另一台 M5 Ultra 上验证安装。
+完整模型列表、运行方式及限制见[版本说明](docs/release-0.1.2.md)。
+
 Tokenity 将局域网内的 Apple 芯片 Mac 组成一个可管理的 AI 集群。原生 macOS
 应用负责发现机器、检查高速数据面、启动分布式 rank、加载模型、显示实时进度，
 并将工作负载的完整生命周期集中到一个控制面中。
@@ -148,7 +153,8 @@ TP2 通过 Thunderbolt RDMA 使用 JACCL；两个 rank 最终均以 code 0 退�
 | 集群发现 | 自动发现局域网 Agent，通过稳定 `machine_id` 跟踪 Mac，并在地址变化后修复连接。 |
 | 运行维护 | 内存准入、队列、超时、lease、健康/readiness、资源账本、日志、watchdog 和升级维护窗口。 |
 
-当前模型覆盖包括 DeepSeek V4、GLM 5.2、Qwen 系列 MLX checkpoint、MiniMax H3，
+当前模型覆盖包括 DeepSeek V4 Flash、GLM 5.3 Flash、GLM 5.2、
+Qwen3.8-Next / Flash-Next、Qwen3.5 系列 MLX checkpoint、MiniMax H3，
 以及其他由元数据与 Runtime 能力确认兼容的 MLX 模型。Native MTP 也依据
 checkpoint 和后端证据安全启用，而不是写死模型名称。
 
@@ -289,13 +295,13 @@ python -m pip install -e ".[dev]"
 ./scripts/package-tokenity-dmg.sh
 ```
 
-**0.1.2（build 4）** 包含 DeepSeek V4、通过 MLX-VLM 接入的 GLM 5.3 / Qwen4，
+**0.1.2（build 4）** 包含 DeepSeek V4 Flash、通过 MLX-VLM 接入的 GLM 5.3 / Qwen3.8-Next，
 以及 MiniMax H3 Turbo（4/6/8 步）。详见[版本说明](docs/release-0.1.2.md)。
 
 完整 PKG 内置 Python 和两个 MLX 后端，需 Apple silicon 与 macOS 26.2+，
-模型权重单独放置。此版本无需 Developer ID 签名或公证即可由管理员安装；
-如 macOS 拦截下载的安装包，请到“系统设置 → 隐私与安全性 → 仍要打开”允许。
-首次启动 App 时也可能需要允许。无需另行安装开发工具。详见
+模型权重单独放置。发布版 PKG 已完成 Developer ID 签名、Apple 公证及票据附加，
+可通过正常 macOS 安装器安装，按提示输入本机管理员密码。无需另行安装开发工具。
+源码中的打包脚本默认生成未单独签名的开发构建，正式发布包另行完成签名和公证。详见
 [安装与 Runtime 分发](docs/installer-dmg.md)。
 
 ## 验证基线
